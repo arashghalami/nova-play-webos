@@ -1,0 +1,12 @@
+{
+  "id": "com.arash.novaplay",
+  "version": "1.0.0",
+  "vendor": "Arash",
+  "type": "web",
+  "main": "index.html",
+  "title": "Nova Play",
+  "icon": "icon.svg",
+  "largeIcon": "icon.svg",
+  "bgColor": "#06101f",
+  "resolution": "1920x1080"
+}
