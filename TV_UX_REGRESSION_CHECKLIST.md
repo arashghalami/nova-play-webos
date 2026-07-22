@@ -51,13 +51,15 @@ Verify each Back spelling emitted by the target: `Back`, `GoBack`, `BrowserBack`
 
 Run with at least two complete rows and one incomplete final row.
 
-- **Right** moves across the current row; on its last item it moves to the first item of the next row.
-- **Left** moves across the current row; on its first item it moves to the last item of the previous row.
-- **Down** and **Up** choose the nearest matching column in the adjacent row.
+- **Right** moves across the current visual row; on the final item it wraps to the first item of that **same row**.
+- **Left** moves across the current visual row; on the first item it wraps to the final item of that **same row**.
+- **Down** and **Up** choose the nearest matching column in the adjacent row; at a grid boundary they enter the closest intended navigation zone rather than an unrelated control.
 - Incomplete rows use the nearest available column without skipping to the top bar.
+- On Home, verify the explicit rail order: Hero actions → Continue Watching (when present) → Watch TV/Movies/Series/Favorites. In particular, **Up** from the Home cards must enter Continue Watching and must not skip directly to TV Guide.
 - The behavior remains correct at 1920×1080 and at narrower simulator/browser widths that change column counts.
-- Categories, content cards, Continue Watching, Favorites groups, search groups, and the channel overlay all follow the same predictable row behavior.
+- Categories, content cards, Continue Watching, Favorites groups, search groups, settings sections, player controls, and the channel overlay all follow the same predictable zone behavior.
 - The open channel overlay confines arrow navigation to its own controls.
+- At every zone boundary, no arrow key may jump to an unrelated toolbar, top-bar control, or hidden background element.
 
 ## Async and state-change checks
 

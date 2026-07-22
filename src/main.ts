@@ -741,7 +741,7 @@ function renderHome(): void {
         <h1>What would you like to watch?</h1>
         <p>${escape(expiry)}${escape(connectionSummary)}</p>
       </div>
-      <div class="hero-actions">
+      <div class="hero-actions" data-nav-zone="home-hero">
         <button class="secondary-button" data-action="open-guide" data-focus-id="home-guide">TV Guide</button>
         <button class="secondary-button" data-action="refresh-account" data-focus-id="home-refresh">Refresh account</button>
       </div>
@@ -750,13 +750,13 @@ function renderHome(): void {
       continueEntries.length
         ? `<section class="home-rail">
             <div class="rail-heading"><div><p class="eyebrow">Continue watching</p><h2>Pick up where you left off</h2></div></div>
-            <section class="content-grid continue-grid" aria-label="Continue watching">
+            <section class="content-grid continue-grid" data-nav-zone="home-continue" aria-label="Continue watching">
               ${continueEntries.map((entry) => streamCard(entry.stream!, entry)).join('')}
             </section>
           </section>`
         : ''
     }
-    <section class="hub-grid">
+    <section class="hub-grid" data-nav-zone="home-hub">
       ${libraryCard('live', icon('live'), 'Watch TV channels now', 'Browse live channels, now and next information, and a TV guide.')}
       ${libraryCard('vod', icon('movie'), 'Movies on demand', 'Explore rich movie information, trailers, and resume playback.')}
       ${libraryCard('series', icon('series'), 'Series & episodes', 'Pick up a show where you left off, with next-episode playback.')}
@@ -1854,6 +1854,38 @@ function revealControls(): void {
 
 let delegatedEventsBound = false
 let liveLogoErrorHandlerBound = false
+let navigationZoneSequence = 0
+
+function assignNavigationZones(): void {
+  const zoneSelectors = [
+    '.topbar',
+    '.login-form',
+    '.profile-quick-switch',
+    '.hero-actions',
+    '.content-grid',
+    '.hub-grid',
+    '.catalog-tools',
+    '.category-grid',
+    '.catalog-pager',
+    '.action-row',
+    '.episodes',
+    '.guide-grid',
+    '.global-search-panel',
+    '.global-search-group',
+    '.settings-panel',
+    '.profile-list',
+    '#player-controls',
+    '#player-progress-wrap',
+    '#channel-overlay',
+  ].join(', ')
+
+  app.querySelectorAll<HTMLElement>(zoneSelectors).forEach((zone) => {
+    if (!zone.dataset.navZone) {
+      navigationZoneSequence += 1
+      zone.dataset.navZone = `zone-${navigationZoneSequence}`
+    }
+  })
+}
 
 function bindEvents(): void {
   invalidateSpatialLayout()
@@ -1922,6 +1954,8 @@ function bindEvents(): void {
       element.tabIndex = -1
     }
   })
+
+  assignNavigationZones()
 }
 
 async function handleAction(element: HTMLElement): Promise<void> {
@@ -3546,65 +3580,88 @@ function render(): void {
   else renderPlayer()
 }
 
-function gridNeighbor(origin: HTMLElement, direction: string): HTMLElement | null {
-  const scope =
-    origin.closest<HTMLElement>('#channel-overlay') ??
-    origin.closest<HTMLElement>('.content-grid, .category-grid, .hub-grid')
+function navigationZone(element: HTMLElement): HTMLElement | null {
+  return element.closest<HTMLElement>('[data-nav-zone]')
+}
 
-  if (!scope) {
-    return null
-  }
+function navigationItems(zone: HTMLElement): HTMLElement[] {
+  return Array.from(
+    zone.querySelectorAll<HTMLElement>(
+      '[data-focus-id]:not([data-nav-skip="true"]):not([disabled])',
+    ),
+  ).filter((element) => navigationZone(element) === zone)
+}
 
-  const items = Array.from(
-    scope.querySelectorAll<HTMLElement>('[data-focus-id]:not([data-nav-skip="true"]):not([disabled])'),
-  ).filter((element) => element.closest('#channel-overlay, .content-grid, .category-grid, .hub-grid') === scope)
-
-  const index = items.indexOf(origin)
-  if (index < 0 || items.length < 2) {
-    return null
-  }
-
+function navigationRows(items: HTMLElement[]): HTMLElement[][] {
   const rows: HTMLElement[][] = []
-  items.forEach((element) => {
-    const row = rows[rows.length - 1]
-    const rect = element.getBoundingClientRect()
-    const rowTop = row?.[0].getBoundingClientRect().top
 
-    if (!row || Math.abs(rect.top - rowTop) > Math.max(8, rect.height * 0.35)) {
-      rows.push([element])
-    } else {
-      row.push(element)
-    }
-  })
-  rows.forEach((row) => row.sort((left, right) => left.getBoundingClientRect().left - right.getBoundingClientRect().left))
+  items
+    .slice()
+    .sort((left, right) => {
+      const leftRect = left.getBoundingClientRect()
+      const rightRect = right.getBoundingClientRect()
+      return leftRect.top - rightRect.top || leftRect.left - rightRect.left
+    })
+    .forEach((element) => {
+      const row = rows[rows.length - 1]
+      const rect = element.getBoundingClientRect()
+      const rowTop = row?.[0].getBoundingClientRect().top
 
-  const rowIndex = rows.findIndex((row) => row.includes(origin))
-  const row = rows[rowIndex]
-  const column = row.indexOf(origin)
+      if (!row || Math.abs(rect.top - rowTop) > Math.max(8, rect.height * 0.35)) {
+        rows.push([element])
+      } else {
+        row.push(element)
+      }
+    })
 
-  if (direction === 'ArrowRight') {
-    return row[column + 1] ?? rows[rowIndex + 1]?.[0] ?? null
-  }
+  rows.forEach((row) =>
+    row.sort((left, right) => left.getBoundingClientRect().left - right.getBoundingClientRect().left),
+  )
+  return rows
+}
 
-  if (direction === 'ArrowLeft') {
-    const previousRow = rows[rowIndex - 1]
-    return row[column - 1] ?? (previousRow ? previousRow[previousRow.length - 1] : null)
-  }
+function closestColumn(items: HTMLElement[], origin: HTMLElement): HTMLElement | null {
+  const originRect = origin.getBoundingClientRect()
+  const originX = originRect.left + originRect.width / 2
 
-  const adjacentRow = rows[rowIndex + (direction === 'ArrowDown' ? 1 : -1)]
-  if (!adjacentRow) {
-    return null
-  }
-
-  const originX = origin.getBoundingClientRect().left + origin.getBoundingClientRect().width / 2
-  return adjacentRow
-    .map((element) => ({
-      element,
-      distance: Math.abs(
-        element.getBoundingClientRect().left + element.getBoundingClientRect().width / 2 - originX,
-      ),
-    }))
+  return items
+    .map((element) => {
+      const rect = element.getBoundingClientRect()
+      return { element, distance: Math.abs(rect.left + rect.width / 2 - originX) }
+    })
     .sort((left, right) => left.distance - right.distance)[0]?.element ?? null
+}
+
+function adjacentZone(originZone: HTMLElement, direction: 'ArrowUp' | 'ArrowDown'): HTMLElement | null {
+  const overlay = document.querySelector<HTMLElement>('#channel-overlay')
+  const zones = Array.from(
+    (overlay ?? app).querySelectorAll<HTMLElement>('[data-nav-zone]'),
+  ).filter((zone) => zone !== originZone && navigationItems(zone).length > 0)
+
+  const originRect = originZone.getBoundingClientRect()
+  const originY = originRect.top + originRect.height / 2
+
+  return zones
+    .map((zone) => {
+      const rect = zone.getBoundingClientRect()
+      const centerY = rect.top + rect.height / 2
+      const isInDirection =
+        direction === 'ArrowUp' ? centerY < originY - 4 : centerY > originY + 4
+
+      if (!isInDirection) {
+        return null
+      }
+
+      return { zone, distance: Math.abs(centerY - originY) }
+    })
+    .filter((candidate): candidate is { zone: HTMLElement; distance: number } => Boolean(candidate))
+    .sort((left, right) => left.distance - right.distance)[0]?.zone ?? null
+}
+
+function moveFocus(target: HTMLElement): void {
+  target.focus({ preventScroll: true })
+  target.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  invalidateSpatialLayout()
 }
 
 function handleSpatialNavigation(event: KeyboardEvent): boolean {
@@ -3613,7 +3670,6 @@ function handleSpatialNavigation(event: KeyboardEvent): boolean {
   }
 
   const active = document.activeElement
-
   if (
     (active instanceof HTMLInputElement || active instanceof HTMLSelectElement) &&
     (event.key === 'ArrowLeft' || event.key === 'ArrowRight') &&
@@ -3623,83 +3679,39 @@ function handleSpatialNavigation(event: KeyboardEvent): boolean {
   }
 
   const origin = active instanceof HTMLElement ? active : null
+  const zone = origin ? navigationZone(origin) : null
 
-  if (!origin) {
+  if (!origin || !zone) {
     return false
   }
 
-  const scopedNeighbor = gridNeighbor(origin, event.key)
-  if (scopedNeighbor) {
-    event.preventDefault()
-    scopedNeighbor.focus({ preventScroll: true })
-    scopedNeighbor.scrollIntoView({ block: 'nearest', inline: 'nearest' })
-    return true
+  const items = navigationItems(zone)
+  const rows = navigationRows(items)
+  const rowIndex = rows.findIndex((row) => row.includes(origin))
+  const row = rows[rowIndex]
+  const column = row?.indexOf(origin) ?? -1
+  let target: HTMLElement | null = null
+
+  if (event.key === 'ArrowRight' && row?.length) {
+    target = row[(column + 1) % row.length]
+  } else if (event.key === 'ArrowLeft' && row?.length) {
+    target = row[(column - 1 + row.length) % row.length]
+  } else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+    const nextRow = rows[rowIndex + (event.key === 'ArrowUp' ? -1 : 1)]
+    target = nextRow ? closestColumn(nextRow, origin) : null
+
+    if (!target) {
+      const nextZone = adjacentZone(zone, event.key)
+      target = nextZone ? closestColumn(navigationItems(nextZone), origin) : null
+    }
   }
 
-  const overlay = document.querySelector<HTMLElement>('#channel-overlay')
-  const navigationRoot = overlay ?? app
-  const layout = Array.from(
-    navigationRoot.querySelectorAll<HTMLElement>(
-      '[data-focus-id]:not([data-nav-skip="true"]):not([disabled])',
-    ),
-  )
-    .map((element) => ({ element, rect: element.getBoundingClientRect() }))
-    .filter(({ rect }) => rect.width > 0 && rect.height > 0)
-
-  const candidates = layout.filter(({ element }) => element !== origin)
-  const originRect = origin.getBoundingClientRect()
-  const originX = originRect.left + originRect.width / 2
-  const originY = originRect.top + originRect.height / 2
-  const direction = event.key
-
-  const candidate = candidates
-    .map(({ element, rect }) => {
-      const x = rect.left + rect.width / 2
-      const y = rect.top + rect.height / 2
-      const dx = x - originX
-      const dy = y - originY
-      const inDirection =
-        (direction === 'ArrowLeft' && dx < -4) ||
-        (direction === 'ArrowRight' && dx > 4) ||
-        (direction === 'ArrowUp' && dy < -4) ||
-        (direction === 'ArrowDown' && dy > 4)
-
-      if (!inDirection) {
-        return null
-      }
-
-      const primary = direction === 'ArrowLeft' || direction === 'ArrowRight' ? Math.abs(dx) : Math.abs(dy)
-      const secondary = direction === 'ArrowLeft' || direction === 'ArrowRight' ? Math.abs(dy) : Math.abs(dx)
-
-      return {
-        element,
-        score: primary + secondary * 3.25,
-      }
-    })
-    .filter((candidate): candidate is { element: HTMLElement; score: number } => Boolean(candidate))
-    .sort((left, right) => left.score - right.score)[0]
-
-  if (!candidate) {
-    if (direction === 'ArrowUp' || direction === 'ArrowDown') {
-      const before = window.scrollY
-      scrollDocumentBy(
-        (direction === 'ArrowDown' ? 1 : -1) *
-          Math.max(180, Math.round(window.innerHeight * 0.62)),
-      )
-
-      if (window.scrollY !== before) {
-        event.preventDefault()
-        return true
-      }
-    }
-
+  if (!target || target === origin) {
     return false
   }
 
   event.preventDefault()
-  candidate.element.focus({ preventScroll: true })
-  candidate.element.scrollIntoView({ block: 'center', inline: 'nearest' })
-  invalidateSpatialLayout()
+  moveFocus(target)
   return true
 }
 
