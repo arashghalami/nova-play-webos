@@ -71,6 +71,7 @@ type CachedStreams = {
 type FocusSnapshot = {
   id: string | null
   scrollY: number
+  view: AppView
 }
 
 type ViewReturnPoint = {
@@ -135,6 +136,7 @@ let settings: AppSettings = profile
     }
 let account: AccountSummary | null = null
 let view: AppView = profile ? 'home' : 'login'
+let renderedView: AppView | null = null
 let catalog: CatalogState | null = null
 let selectedItem: StreamItem | null = null
 let selectedSeries: SeriesDetails | null = null
@@ -488,6 +490,7 @@ function snapshotFocus(): FocusSnapshot {
         ? focused.dataset.focusId ?? null
         : null,
     scrollY: window.scrollY,
+    view: renderedView ?? view,
   }
 }
 
@@ -521,6 +524,39 @@ function finishTextEditing(input = editingInput): boolean {
 function captureReturnPoint(): ViewReturnPoint {
   return { view, focus: snapshotFocus() }
 }
+
+function defaultFocusTarget(): HTMLElement | null {
+  const selectors =
+    view === 'home'
+      ? ['[data-focus-id="home-guide"]', '[data-focus-id="home-live"]']
+      : view === 'catalog'
+        ? [
+            '.category-grid [data-focus-id]',
+            '.content-grid [data-focus-id]',
+            '.catalog-tools [data-focus-id]',
+          ]
+        : view === 'details'
+          ? ['[data-focus-id="detail-play"]', '.episodes [data-focus-id]']
+          : view === 'guide'
+            ? ['.guide-grid [data-focus-id]', '.catalog-tools [data-focus-id]']
+            : view === 'search'
+              ? ['[data-focus-id="global-search-input"]', '.global-search-controls [data-focus-id]']
+              : view === 'settings'
+                ? ['[data-focus-id="settings-add-profile"]', '.settings-panel [data-focus-id]']
+                : view === 'player'
+                  ? ['[data-focus-id="player-close"]', '#player-controls [data-focus-id]']
+                  : ['[autofocus]', '.login-form [data-focus-id]']
+
+  for (const selector of selectors) {
+    const target = document.querySelector<HTMLElement>(selector)
+    if (target && !target.matches('[disabled], [data-nav-skip="true"]')) {
+      return target
+    }
+  }
+
+  return null
+}
+
 function restoreFocus(snapshot: FocusSnapshot | null): void {
   const requested = pendingFocus
   pendingFocus = null
@@ -529,12 +565,15 @@ function restoreFocus(snapshot: FocusSnapshot | null): void {
     const requestedTarget = requested?.id
       ? document.querySelector<HTMLElement>(`[data-focus-id="${cssEscape(requested.id)}"]`)
       : null
-    const snapshotTarget = snapshot?.id
-      ? document.querySelector<HTMLElement>(`[data-focus-id="${cssEscape(snapshot.id)}"]`)
-      : null
-    const fallback = document.querySelector<HTMLElement>(
-      '[autofocus], [data-focus-id]:not([data-nav-skip="true"]):not([disabled])',
-    )
+    const snapshotTarget =
+      snapshot?.view === view && snapshot.id
+        ? document.querySelector<HTMLElement>(`[data-focus-id="${cssEscape(snapshot.id)}"]`)
+        : null
+    const fallback =
+      defaultFocusTarget() ??
+      document.querySelector<HTMLElement>(
+        '[autofocus], [data-focus-id]:not([data-nav-skip="true"]):not([disabled])',
+      )
     const focusTarget =
       (requestedTarget?.matches(':not([disabled])') ? requestedTarget : null) ??
       (snapshotTarget?.matches(':not([disabled])') ? snapshotTarget : null) ??
@@ -600,6 +639,7 @@ function renderShell(content: string, title = currentViewTitle()): void {
   `
   invalidateSpatialLayout()
   bindEvents()
+  renderedView = view
   restoreFocus(snapshot)
 }
 
@@ -662,11 +702,11 @@ function renderLogin(): void {
             : ''
         }
         <form id="login-form" class="login-form">
-          <label>Playlist name<input name="name" autocomplete="off" maxlength="60" placeholder="My IPTV" autofocus required /></label>
-          <label>Server URL<input name="serverUrl" autocomplete="url" inputmode="url" placeholder="https://provider.example:8080" required /></label>
+          <label>Playlist name<input name="name" autocomplete="off" maxlength="60" placeholder="My IPTV" readonly autofocus required aria-label="Playlist name. Press OK to type." /></label>
+          <label>Server URL<input name="serverUrl" autocomplete="url" inputmode="url" placeholder="https://provider.example:8080" readonly required aria-label="Server URL. Press OK to type." /></label>
           <div class="form-grid">
-            <label>Username<input name="username" autocomplete="username" required /></label>
-            <label>Password<input name="password" type="password" autocomplete="current-password" required /></label>
+            <label>Username<input name="username" autocomplete="username" readonly required aria-label="Username. Press OK to type." /></label>
+            <label>Password<input name="password" type="password" autocomplete="current-password" readonly required aria-label="Password. Press OK to type." /></label>
           </div>
           <p id="login-error" class="form-error" role="alert"></p>
           <button class="primary-button" type="submit" data-focus-id="login-connect">Connect securely</button>
@@ -729,6 +769,7 @@ function renderLogin(): void {
   })
 
   bindEvents()
+  renderedView = view
   restoreFocus(snapshot)
 }
 
@@ -878,7 +919,7 @@ function scheduleCatalogSearch(value: string): void {
 
     catalog.query = value
     catalog.page = 0
-    requestFocus({ id: 'catalog-search', scrollY: window.scrollY })
+    requestFocus({ id: 'catalog-search', scrollY: window.scrollY, view: 'catalog' })
     renderCatalog()
 
     if (wasEditing) {
@@ -1443,7 +1484,7 @@ function renderSettings(): void {
           <option value="12h" ${settings.timeFormat === '12h' ? 'selected' : ''}>12-hour</option>
         </select></label>
         <label class="setting-row"><span>Hide adult categories</span><input id="setting-hide-adult" data-focus-id="setting-hide-adult" type="checkbox" ${settings.hideAdultContent ? 'checked' : ''} /></label>
-        <label class="setting-row"><span>Parental PIN <small>Device-local deterrent</small></span><input id="setting-parental-pin" data-focus-id="setting-parental-pin" type="password" inputmode="numeric" maxlength="8" value="${escape(settings.parentalPin ?? '')}" placeholder="Optional PIN" /></label>
+        <label class="setting-row"><span>Parental PIN <small>Device-local deterrent</small></span><input id="setting-parental-pin" data-focus-id="setting-parental-pin" type="password" inputmode="numeric" maxlength="8" value="${escape(settings.parentalPin ?? '')}" placeholder="Optional PIN" readonly aria-label="Parental PIN. Press OK to type." /></label>
         <button class="primary-button" data-action="save-settings" data-focus-id="settings-save">Save settings</button>
       </section>
       <section class="settings-panel">
@@ -1757,6 +1798,7 @@ function renderPlayer(): void {
   document.addEventListener('mousemove', revealControls)
   document.addEventListener('keydown', revealControls)
   revealControls()
+  renderedView = view
   restoreFocus(snapshot)
   watchForVideoTrack()
 
