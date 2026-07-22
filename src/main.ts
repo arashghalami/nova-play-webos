@@ -3008,6 +3008,7 @@ async function showEpg(
 
     if (isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
       panel.innerHTML = renderEpg(stream, programs, showCatchupActions)
+      bindEvents()
     }
   } catch {
     if (isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
