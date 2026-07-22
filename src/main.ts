@@ -78,6 +78,13 @@ type ViewReturnPoint = {
   view: AppView
   focus: FocusSnapshot
 }
+
+type ZoneTransition = {
+  fromZoneId: string
+  toZoneId: string
+  fromFocusId: string
+  direction: NavigationDirection
+}
 const CATALOG_PAGE_SIZE = 60
 const SEARCH_DEBOUNCE_MS = 180
 const NUMERIC_CHANNEL_TIMEOUT_MS = 1600
@@ -172,6 +179,7 @@ let pendingFocus: FocusSnapshot | null = null
 let detailReturnPoint: ViewReturnPoint | null = null
 let playerReturnPoint: ViewReturnPoint | null = null
 let editingInput: HTMLInputElement | HTMLTextAreaElement | null = null
+let lastZoneTransition: ZoneTransition | null = null
 const expandedGlobalSearchSections = new Set<LibrarySection>()
 let favorites = profile ? loadFavorites(profile.id) : new Map()
 let resumeEntries = profile ? loadResume(profile.id) : new Map<string, ResumeEntry>()
@@ -1909,7 +1917,6 @@ function assignNavigationZones(): void {
     '.login-form',
     '.profile-quick-switch',
     '.hero-actions',
-    '.catalog-heading',
     '.content-grid',
     '.hub-grid',
     '.catalog-tools',
@@ -2009,6 +2016,10 @@ function bindEvents(): void {
 }
 
 async function handleAction(element: HTMLElement): Promise<void> {
+  if (editingInput && !element.contains(editingInput)) {
+    finishTextEditing()
+  }
+
   const action = element.dataset.action
 
   if (action === 'home') {
@@ -3675,6 +3686,18 @@ function moveFocus(target: HTMLElement): void {
   invalidateSpatialLayout()
 }
 
+function isReverseDirection(
+  direction: NavigationDirection,
+  previousDirection: NavigationDirection,
+): boolean {
+  return (
+    (direction === 'ArrowUp' && previousDirection === 'ArrowDown') ||
+    (direction === 'ArrowDown' && previousDirection === 'ArrowUp') ||
+    (direction === 'ArrowLeft' && previousDirection === 'ArrowRight') ||
+    (direction === 'ArrowRight' && previousDirection === 'ArrowLeft')
+  )
+}
+
 function handleSpatialNavigation(event: KeyboardEvent): boolean {
   if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) {
     return false
@@ -3698,11 +3721,34 @@ function handleSpatialNavigation(event: KeyboardEvent): boolean {
   }
 
   const { items, elements } = navigationLayout()
-  const targetId = resolveNavigationTarget(items, origin.dataset.focusId!, direction)
+  const originFocusId = origin.dataset.focusId!
+  const originZoneId = zone.dataset.navZone!
+  const returningTarget =
+    lastZoneTransition &&
+    lastZoneTransition.toZoneId === originZoneId &&
+    isReverseDirection(direction, lastZoneTransition.direction)
+      ? elements.get(lastZoneTransition.fromFocusId) ?? null
+      : null
+  const targetId = returningTarget
+    ? returningTarget.dataset.focusId ?? null
+    : resolveNavigationTarget(items, originFocusId, direction)
   const target = targetId ? elements.get(targetId) ?? null : null
 
   if (!target) {
     return false
+  }
+
+  const targetZoneId = navigationZone(target)?.dataset.navZone
+
+  if (targetZoneId && targetZoneId !== originZoneId) {
+    lastZoneTransition = {
+      fromZoneId: originZoneId,
+      toZoneId: targetZoneId,
+      fromFocusId: originFocusId,
+      direction,
+    }
+  } else {
+    lastZoneTransition = null
   }
 
   event.preventDefault()
