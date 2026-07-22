@@ -85,6 +85,11 @@ type ZoneTransition = {
   fromFocusId: string
   direction: NavigationDirection
 }
+
+type AppHistoryState = {
+  novaPlay: true
+  depth: number
+}
 const CATALOG_PAGE_SIZE = 60
 const SEARCH_DEBOUNCE_MS = 180
 const NUMERIC_CHANNEL_TIMEOUT_MS = 1600
@@ -180,6 +185,7 @@ let detailReturnPoint: ViewReturnPoint | null = null
 let playerReturnPoint: ViewReturnPoint | null = null
 let editingInput: HTMLInputElement | HTMLTextAreaElement | null = null
 let lastZoneTransition: ZoneTransition | null = null
+let appHistoryDepth = 0
 const expandedGlobalSearchSections = new Set<LibrarySection>()
 let favorites = profile ? loadFavorites(profile.id) : new Map()
 let resumeEntries = profile ? loadResume(profile.id) : new Map<string, ResumeEntry>()
@@ -420,6 +426,44 @@ function cachedStreamsForSection(section: LibrarySection): StreamItem[] {
   })
 
   return [...streams.values()]
+}
+
+function isAppHistoryState(value: unknown): value is AppHistoryState {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (value as Partial<AppHistoryState>).novaPlay === true &&
+    typeof (value as Partial<AppHistoryState>).depth === 'number'
+  )
+}
+
+function initializeAppHistory(): void {
+  if (isAppHistoryState(history.state)) {
+    appHistoryDepth = history.state.depth
+    return
+  }
+
+  history.replaceState({ novaPlay: true, depth: 0 } satisfies AppHistoryState, '', location.href)
+}
+
+function pushAppHistory(): void {
+  appHistoryDepth += 1
+  history.pushState({ novaPlay: true, depth: appHistoryDepth } satisfies AppHistoryState, '', location.href)
+}
+
+function requestAppBack(): boolean {
+  if (appHistoryDepth > 0) {
+    history.back()
+    return true
+  }
+
+  return navigateBack()
+}
+
+function pushRouteHistory(): void {
+  if (view !== 'login') {
+    pushAppHistory()
+  }
 }
 
 function startNavigation(): { token: number; signal: AbortSignal } {
@@ -2035,17 +2079,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
   }
 
   if (action === 'choose-category' && catalog) {
-    startNavigation()
-    catalog = {
-      ...catalog,
-      category: null,
-      streams: [],
-      query: '',
-      page: 0,
-      isFavorites: false,
-      results: undefined,
-    }
-    renderCatalog()
+    requestAppBack()
     return
   }
 
@@ -2126,6 +2160,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
   if (action === 'global-search') {
     if (view !== 'search') {
       searchReturnView = view
+      pushRouteHistory()
     }
     startNavigation()
     view = 'search'
@@ -2211,6 +2246,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
     }
 
     playerReturnPoint = captureReturnPoint()
+    pushRouteHistory()
     startNavigation()
     playerCleanup?.()
     playerCleanup = null
@@ -2232,7 +2268,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
   }
 
   if (action === 'close-player') {
-    closePlayer()
+    requestAppBack()
     return
   }
 
@@ -2327,6 +2363,9 @@ async function handleAction(element: HTMLElement): Promise<void> {
   }
 
   if (action === 'settings') {
+    if (view !== 'settings') {
+      pushRouteHistory()
+    }
     startNavigation()
     view = 'settings'
     render()
@@ -2339,6 +2378,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
   }
 
   if (action === 'add-profile') {
+    pushRouteHistory()
     startNavigation()
     clearProfile()
     profile = null
@@ -2405,6 +2445,7 @@ async function openSection(section: LibrarySection): Promise<void> {
     return
   }
 
+  pushRouteHistory()
   const { token, signal } = startNavigation()
   renderLoading(`Loading ${labels[section].toLowerCase()}…`)
 
@@ -2484,6 +2525,7 @@ async function loadCategory(category: Category | null): Promise<void> {
     return
   }
 
+  pushRouteHistory()
   const { token, signal } = startNavigation()
   renderLoading(`Loading ${category.name}…`)
 
@@ -2534,6 +2576,7 @@ async function openDetails(stream: StreamItem): Promise<void> {
     return
   }
 
+  pushRouteHistory()
   const { token, signal } = startNavigation()
   rememberStreams([stream])
   selectedItem = stream
@@ -2587,6 +2630,9 @@ async function openDetails(stream: StreamItem): Promise<void> {
 }
 
 function openFavorites(): void {
+  if (!catalog?.isFavorites) {
+    pushRouteHistory()
+  }
   startNavigation()
   const streams = favoriteStreams(favorites).filter(visibleStream)
   rememberStreams(streams)
@@ -2611,6 +2657,9 @@ async function openGuide(refresh = false): Promise<void> {
     return
   }
 
+  if (view !== 'guide') {
+    pushRouteHistory()
+  }
   const { token, signal } = startNavigation()
   let streams = refresh ? null : liveQueue.length ? liveQueue : null
 
@@ -3163,6 +3212,7 @@ function updateNowNextCard(key: string, nowNext?: NowNext): void {
 function beginPlayback(item: StreamItem): void {
   if (view !== 'player') {
     playerReturnPoint = captureReturnPoint()
+    pushRouteHistory()
   }
   startNavigation()
 
@@ -3789,6 +3839,7 @@ function handleColorShortcut(event: KeyboardEvent): boolean {
     renderCatalog()
     showToast(`Sort: ${SORT_LABELS[catalog.sort]}`)
   } else if (color === 'blue') {
+    pushRouteHistory()
     startNavigation()
     view = 'settings'
     render()
@@ -3925,7 +3976,7 @@ window.addEventListener('keydown', (event) => {
       return
     }
 
-    if (navigateBack()) {
+    if (requestAppBack()) {
       event.preventDefault()
       event.stopImmediatePropagation()
     }
@@ -4052,6 +4103,21 @@ window.addEventListener(
   { passive: false },
 )
 
+window.addEventListener('popstate', (event) => {
+  if (!isAppHistoryState(event.state)) {
+    return
+  }
+
+  appHistoryDepth = event.state.depth
+
+  if (!navigateBack()) {
+    // A Back press can arrive while an async route is still showing its loading state.
+    // The history entry has already been consumed, so redraw the current root state
+    // instead of leaving a loading screen or allowing the platform to close the app.
+    render()
+  }
+})
+
 window.addEventListener('scroll', invalidateSpatialLayout, { passive: true })
 window.addEventListener('resize', invalidateSpatialLayout)
 
@@ -4061,5 +4127,6 @@ document.addEventListener('visibilitychange', () => {
   }
 })
 
+initializeAppHistory()
 render()
 void refreshAccount(true)
