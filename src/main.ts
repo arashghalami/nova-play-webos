@@ -38,6 +38,11 @@ import type {
   VodDetails,
   XtreamProfile,
 } from './types'
+import {
+  resolveNavigationTarget,
+  type NavigationDirection,
+  type NavigationItem,
+} from './navigation'
 import { XtreamClient } from './xtream-client'
 
 type CatalogResults = {
@@ -1862,6 +1867,7 @@ function assignNavigationZones(): void {
     '.login-form',
     '.profile-quick-switch',
     '.hero-actions',
+    '.catalog-heading',
     '.content-grid',
     '.hub-grid',
     '.catalog-tools',
@@ -1874,6 +1880,8 @@ function assignNavigationZones(): void {
     '.global-search-group',
     '.settings-panel',
     '.profile-list',
+    '#epg-panel',
+    '.status-page',
     '#player-controls',
     '#player-progress-wrap',
     '#channel-overlay',
@@ -3584,78 +3592,38 @@ function navigationZone(element: HTMLElement): HTMLElement | null {
   return element.closest<HTMLElement>('[data-nav-zone]')
 }
 
-function navigationItems(zone: HTMLElement): HTMLElement[] {
-  return Array.from(
-    zone.querySelectorAll<HTMLElement>(
+function navigationLayout(): { items: NavigationItem[]; elements: Map<string, HTMLElement> } {
+  const overlay = document.querySelector<HTMLElement>('#channel-overlay')
+  const root = overlay ?? app
+  const elements = new Map<string, HTMLElement>()
+
+  const items = Array.from(
+    root.querySelectorAll<HTMLElement>(
       '[data-focus-id]:not([data-nav-skip="true"]):not([disabled])',
     ),
-  ).filter((element) => navigationZone(element) === zone)
-}
-
-function navigationRows(items: HTMLElement[]): HTMLElement[][] {
-  const rows: HTMLElement[][] = []
-
-  items
-    .slice()
-    .sort((left, right) => {
-      const leftRect = left.getBoundingClientRect()
-      const rightRect = right.getBoundingClientRect()
-      return leftRect.top - rightRect.top || leftRect.left - rightRect.left
-    })
-    .forEach((element) => {
-      const row = rows[rows.length - 1]
-      const rect = element.getBoundingClientRect()
-      const rowTop = row?.[0].getBoundingClientRect().top
-
-      if (!row || Math.abs(rect.top - rowTop) > Math.max(8, rect.height * 0.35)) {
-        rows.push([element])
-      } else {
-        row.push(element)
-      }
-    })
-
-  rows.forEach((row) =>
-    row.sort((left, right) => left.getBoundingClientRect().left - right.getBoundingClientRect().left),
   )
-  return rows
-}
-
-function closestColumn(items: HTMLElement[], origin: HTMLElement): HTMLElement | null {
-  const originRect = origin.getBoundingClientRect()
-  const originX = originRect.left + originRect.width / 2
-
-  return items
+    .filter((element) => {
+      const zone = navigationZone(element)
+      return Boolean(zone && (!overlay || zone === overlay))
+    })
     .map((element) => {
       const rect = element.getBoundingClientRect()
-      return { element, distance: Math.abs(rect.left + rect.width / 2 - originX) }
-    })
-    .sort((left, right) => left.distance - right.distance)[0]?.element ?? null
-}
+      const id = element.dataset.focusId!
+      const zoneId = navigationZone(element)?.dataset.navZone
 
-function adjacentZone(originZone: HTMLElement, direction: 'ArrowUp' | 'ArrowDown'): HTMLElement | null {
-  const overlay = document.querySelector<HTMLElement>('#channel-overlay')
-  const zones = Array.from(
-    (overlay ?? app).querySelectorAll<HTMLElement>('[data-nav-zone]'),
-  ).filter((zone) => zone !== originZone && navigationItems(zone).length > 0)
-
-  const originRect = originZone.getBoundingClientRect()
-  const originY = originRect.top + originRect.height / 2
-
-  return zones
-    .map((zone) => {
-      const rect = zone.getBoundingClientRect()
-      const centerY = rect.top + rect.height / 2
-      const isInDirection =
-        direction === 'ArrowUp' ? centerY < originY - 4 : centerY > originY + 4
-
-      if (!isInDirection) {
-        return null
+      elements.set(id, element)
+      return {
+        id,
+        zoneId: zoneId ?? '',
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
       }
-
-      return { zone, distance: Math.abs(centerY - originY) }
     })
-    .filter((candidate): candidate is { zone: HTMLElement; distance: number } => Boolean(candidate))
-    .sort((left, right) => left.distance - right.distance)[0]?.zone ?? null
+    .filter((item) => item.width > 0 && item.height > 0)
+
+  return { items, elements }
 }
 
 function moveFocus(target: HTMLElement): void {
@@ -3669,6 +3637,7 @@ function handleSpatialNavigation(event: KeyboardEvent): boolean {
     return false
   }
 
+  const direction = event.key as NavigationDirection
   const active = document.activeElement
   if (
     (active instanceof HTMLInputElement || active instanceof HTMLSelectElement) &&
@@ -3685,28 +3654,11 @@ function handleSpatialNavigation(event: KeyboardEvent): boolean {
     return false
   }
 
-  const items = navigationItems(zone)
-  const rows = navigationRows(items)
-  const rowIndex = rows.findIndex((row) => row.includes(origin))
-  const row = rows[rowIndex]
-  const column = row?.indexOf(origin) ?? -1
-  let target: HTMLElement | null = null
+  const { items, elements } = navigationLayout()
+  const targetId = resolveNavigationTarget(items, origin.dataset.focusId!, direction)
+  const target = targetId ? elements.get(targetId) ?? null : null
 
-  if (event.key === 'ArrowRight' && row?.length) {
-    target = row[(column + 1) % row.length]
-  } else if (event.key === 'ArrowLeft' && row?.length) {
-    target = row[(column - 1 + row.length) % row.length]
-  } else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
-    const nextRow = rows[rowIndex + (event.key === 'ArrowUp' ? -1 : 1)]
-    target = nextRow ? closestColumn(nextRow, origin) : null
-
-    if (!target) {
-      const nextZone = adjacentZone(zone, event.key)
-      target = nextZone ? closestColumn(navigationItems(nextZone), origin) : null
-    }
-  }
-
-  if (!target || target === origin) {
+  if (!target) {
     return false
   }
 
