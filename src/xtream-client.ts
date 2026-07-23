@@ -821,8 +821,8 @@ export class XtreamClient {
     return `${this.baseUrl}/timeshift/${credentials}/${Math.max(1, Math.round(durationMinutes))}/${startTimestamp}/${encodeURIComponent(item.id)}.${item.containerExtension ?? 'ts'}`
   }
 
-  streamUrl(item: StreamItem): string {
-    if (item.directSource && /^https?:\/\//i.test(item.directSource)) {
+  streamUrl(item: StreamItem, preferDirectSource = true): string {
+    if (preferDirectSource && item.directSource && /^https?:\/\//i.test(item.directSource)) {
       return item.directSource
     }
 

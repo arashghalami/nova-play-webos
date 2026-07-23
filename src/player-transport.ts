@@ -1,5 +1,22 @@
 export const SEEK_DOUBLE_TAP_WINDOW_MS = 350
 
+export function hasVerifiedVideoFrame(
+  width: number,
+  height: number,
+  currentTime: number,
+  decodedFrameBaseline: number | null,
+  decodedFrames: number | null,
+): boolean {
+  return (
+    width > 0 &&
+    height > 0 &&
+    currentTime > 0 &&
+    decodedFrameBaseline !== null &&
+    decodedFrames !== null &&
+    decodedFrames > decodedFrameBaseline
+  )
+}
+
 export function seekStepForHold(heldMs: number): number {
   if (heldMs >= 5_000) {
     return 60

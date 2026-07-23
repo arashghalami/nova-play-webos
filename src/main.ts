@@ -1,4 +1,6 @@
+import { MediaPlayer as DashMediaPlayer } from 'dashjs'
 import Hls from 'hls.js'
+import Mpegts from 'mpegts.js'
 import './style.css'
 import {
   clearProfile,
@@ -45,10 +47,22 @@ import {
 } from './navigation'
 import {
   clampSeekPosition,
+  hasVerifiedVideoFrame,
   isDoubleSeekTap,
   seekFeedbackLabel,
   seekStepForHold,
 } from './player-transport'
+import {
+  describePlaybackFailure,
+  discoverPlaybackSources,
+  planPlaybackAttempts,
+  playbackDiagnosticLines,
+  type PlaybackAttempt,
+  type PlaybackCapabilities,
+  type PlaybackEvidence,
+  type PlaybackFailure,
+  type PlaybackFailureKind,
+} from './playback-fallback'
 import { XtreamClient } from './xtream-client'
 
 type CatalogResults = {
@@ -85,6 +99,11 @@ type ViewReturnPoint = {
   focus: FocusSnapshot
 }
 
+type CatalogReturnPoint = {
+  catalog: CatalogState
+  focus: FocusSnapshot
+}
+
 type ZoneTransition = {
   fromZoneId: string
   toZoneId: string
@@ -110,6 +129,7 @@ const GLOBAL_SEARCH_SECTION_RESULT_LIMIT = 60
 const GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT = 12
 const MIN_GLOBAL_SEARCH_LENGTH = 1
 const MAX_NOW_NEXT_ENTRIES = 600
+const PLAYBACK_ATTEMPT_TIMEOUT_MS = 12_000
 const AMPERSAND = String.fromCharCode(38)
 const ESCAPE_PATTERN = /[&<>"']/g
 const ESCAPED_CHARACTERS: Record<string, string> = {
@@ -172,6 +192,10 @@ let globalSearchDebounceTimer: number | null = null
 let numericChannelTimer: number | null = null
 let numericChannelBuffer = ''
 let activeHls: Hls | null = null
+let activeMpegts: ReturnType<typeof Mpegts.createPlayer> | null = null
+let activeDash: { reset: () => void } | null = null
+let playerDiagnostics: PlaybackFailure[] = []
+let playerDiagnosticsExpanded = false
 let playerMuted = false
 let playerPlaybackRate = 1
 let playerAspect: 'contain' | 'cover' = 'contain'
@@ -198,6 +222,7 @@ let globalSearchStatus = ''
 let searchReturnView: AppView = 'home'
 let pendingFocus: FocusSnapshot | null = null
 let detailReturnPoint: ViewReturnPoint | null = null
+let catalogReturnPoint: CatalogReturnPoint | null = null
 let playerReturnPoint: ViewReturnPoint | null = null
 let editingInput: HTMLInputElement | HTMLTextAreaElement | null = null
 let lastZoneTransition: ZoneTransition | null = null
@@ -661,10 +686,10 @@ function cssEscape(value: string): string {
   return value.replace(/["\\]/g, '\\$&')
 }
 
-function toHlsUrl(source: string): string {
+function replaceStreamExtension(source: string, extension: string): string {
   try {
     const url = new URL(source)
-    url.pathname = url.pathname.replace(/\.[^/.]+$/, '.m3u8')
+    url.pathname = url.pathname.replace(/\.[^/.]+$/, extension)
     return url.toString()
   } catch {
     const match = source.match(/^([^?#]*)([?#].*)?$/)
@@ -673,8 +698,16 @@ function toHlsUrl(source: string): string {
       return source
     }
 
-    return `${match[1].replace(/\.[^/.]+$/, '.m3u8')}${match[2] ?? ''}`
+    return `${match[1].replace(/\.[^/.]+$/, extension)}${match[2] ?? ''}`
   }
+}
+
+function toHlsUrl(source: string): string {
+  return replaceStreamExtension(source, '.m3u8')
+}
+
+function toTransportStreamUrl(source: string): string {
+  return replaceStreamExtension(source, '.ts')
 }
 
 function renderShell(content: string, title = currentViewTitle()): void {
@@ -917,12 +950,17 @@ function renderCatalog(): void {
     : catalog.category === null
       ? 'categories'
       : labels[catalog.section].toLowerCase()
+  const catalogNavigation = catalog.isFavorites
+    ? ''
+    : catalog.category === null
+      ? '<button class="secondary-button" data-action="home" data-focus-id="catalog-home">Home</button>'
+      : `<button class="secondary-button" data-action="return-to-library" data-focus-id="catalog-back" aria-label="Back to ${labels[catalog.section]}">← ${labels[catalog.section]}</button>`
 
   renderShell(`
     <section class="catalog-heading">
       <div><p class="eyebrow">${catalogLabel}</p><h1>${escape(activeCategory)}</h1></div>
       <div class="catalog-tools">
-        ${catalog.isFavorites ? '' : '<button class="secondary-button" data-action="choose-category" data-focus-id="catalog-categories">Categories</button>'}
+        ${catalogNavigation}
         ${
           catalog.category !== null
             ? `<button class="secondary-button" data-action="cycle-sort" data-focus-id="catalog-sort">Sort: ${SORT_LABELS[catalog.sort]}</button>`
@@ -1604,6 +1642,7 @@ function renderPlayer(): void {
     <main id="player-surface" class="player-page player-aspect-${playerAspect}" tabindex="0" aria-label="Video player. Press OK to show controls.">
       <video id="video-player" autoplay playsinline ${playerMuted ? 'muted' : ''}></video>
       <div id="player-message" class="player-message" hidden></div>
+      <section id="player-diagnostics" class="player-diagnostics" hidden aria-live="polite"></section>
       <div id="player-seek-feedback" class="player-seek-feedback" aria-live="polite" hidden></div>
       <div id="channel-number-overlay" class="channel-number-overlay" hidden></div>
       <div id="player-controls" class="player-controls ${playerControlsClass}">
@@ -1646,11 +1685,12 @@ function renderPlayer(): void {
 
   const video = document.querySelector<HTMLVideoElement>('#video-player')
   const message = document.querySelector<HTMLElement>('#player-message')
+  const diagnostics = document.querySelector<HTMLElement>('#player-diagnostics')
   const progress = document.querySelector<HTMLInputElement>('#player-progress')
   const currentTime = document.querySelector<HTMLElement>('#player-current')
   const duration = document.querySelector<HTMLElement>('#player-duration')
 
-  if (!video || !message || !progress || !currentTime || !duration) {
+  if (!video || !message || !diagnostics || !progress || !currentTime || !duration) {
     return
   }
 
@@ -1658,26 +1698,94 @@ function renderPlayer(): void {
   const activeItemKey = streamLookupKey(activeItem)
   const player = video
   const playerMessage = message
+  const playerDiagnosticsElement = diagnostics
   const playerProgress = progress
   const playerCurrentTime = currentTime
   const playerDuration = duration
   let lastResumeSaveAt = 0
   let videoDecodeWatchdog: number | null = null
-  let playbackWatchdog: number | null = window.setTimeout(() => {
-    if (player.readyState === HTMLMediaElement.HAVE_NOTHING) {
-      showPlayerMessage('This stream did not start. Try another stream format or channel.')
-    }
-  }, 15_000)
+  let playbackWatchdog: number | null = null
+  let visiblePlaybackConfirmed = false
+  let decodedFrameBaseline: number | null = null
+  let activeAttempt: PlaybackAttempt | null = null
+  let activeAttemptGeneration = 0
+  let nextAttemptIndex = 0
+  const playbackFailures: PlaybackFailure[] = []
+  const directUrl = playerSourceOverride ?? client.streamUrl(activeItem)
+  const declaredUrl = playerSourceOverride ?? client.streamUrl(activeItem, false)
+  const nativeHlsSupport = Boolean(
+    player.canPlayType('application/vnd.apple.mpegurl') ||
+      player.canPlayType('application/x-mpegURL'),
+  )
+  const isWebOsRuntime = Boolean(
+    (window as Window & { webOSSystem?: unknown }).webOSSystem ||
+      /web0s|webos/i.test(navigator.userAgent),
+  )
+  const mpegtsFeatures = Mpegts.isSupported() ? Mpegts.getFeatureList() : null
+  const playbackCapabilities: PlaybackCapabilities = {
+    nativeHls: nativeHlsSupport,
+    nativeTransportStream: Boolean(player.canPlayType('video/mp2t')) || isWebOsRuntime,
+    nativeVideo: true,
+    hlsJs: Hls.isSupported(),
+    mpegts: Boolean(mpegtsFeatures?.mseLivePlayback),
+    dash: typeof MediaSource !== 'undefined',
+    preferNativeTransport: isWebOsRuntime,
+  }
+  const playbackSources = discoverPlaybackSources({
+    isLive: activeItem.section === 'live',
+    directUrl,
+    declaredUrl,
+    hlsUrl:
+      activeItem.section === 'live' && !playerForceDirect
+        ? toHlsUrl(declaredUrl)
+        : undefined,
+    transportStreamUrl:
+      activeItem.section === 'live' && !playerForceDirect
+        ? toTransportStreamUrl(declaredUrl)
+        : undefined,
+    sourceOverride: playerSourceOverride ?? undefined,
+  })
+  const playbackAttempts = planPlaybackAttempts({
+    preferHls: settings.preferHls,
+    capabilities: playbackCapabilities,
+    sources: playbackSources,
+  })
+  playerDiagnostics = []
+  playerDiagnosticsExpanded = false
 
-  const cleanup = (): void => {
-    clearPlaybackWatchdog()
-    clearVideoDecodeWatchdog()
-
+  const cleanupActiveTransport = (): void => {
     activeHls?.destroy()
     activeHls = null
+
+    if (activeMpegts) {
+      try {
+        activeMpegts.pause()
+        activeMpegts.unload()
+        activeMpegts.detachMediaElement()
+        activeMpegts.destroy()
+      } catch {
+        // A partially initialized transport player may already be destroyed.
+      }
+      activeMpegts = null
+    }
+
+    try {
+      activeDash?.reset()
+    } catch {
+      // A partially initialized DASH player may already be reset.
+    }
+    activeDash = null
+
     player.pause()
     player.removeAttribute('src')
     player.load()
+  }
+
+  const cleanup = (): void => {
+    activeAttemptGeneration += 1
+    clearPlaybackWatchdog()
+    clearVideoDecodeWatchdog()
+    cleanupActiveTransport()
     document.removeEventListener('mousemove', revealControls)
     cancelPlayerSeek()
     void releaseKeepAwake()
@@ -1686,111 +1794,352 @@ function renderPlayer(): void {
   playerCleanup = cleanup
   void requestKeepAwake()
 
-  const directUrl = playerSourceOverride ?? client.streamUrl(activeItem)
-  const useHls = activeItem.section === 'live' && settings.preferHls && !playerForceDirect
-  const hlsUrl = toHlsUrl(directUrl)
-  let playbackCompatibilityMessage: string | null = null
+  function isActiveAttempt(attempt: PlaybackAttempt, generation: number): boolean {
+    return (
+      activeAttemptGeneration === generation &&
+      activeAttempt?.id === attempt.id &&
+      player.isConnected
+    )
+  }
 
-  if (useHls) {
-    const nativeHlsSupport =
-      player.canPlayType('application/vnd.apple.mpegurl') ||
-      player.canPlayType('application/x-mpegURL')
-
-    if (nativeHlsSupport) {
-      player.src = hlsUrl
-      player.load()
-    } else if (Hls.isSupported()) {
-      let mediaRecoveryAttempts = 0
-      let networkRecoveryAttempts = 0
-      const hls = new Hls({
-        enableWorker: false,
-        lowLatencyMode: false,
-        backBufferLength: settings.bufferSeconds,
-        maxBufferLength: settings.bufferSeconds,
-        maxMaxBufferLength: Math.max(40, settings.bufferSeconds * 2),
-        liveSyncDurationCount: 2,
-        liveMaxLatencyDurationCount: 5,
-      })
-      activeHls = hls
-      hls.attachMedia(player)
-      hls.on(Hls.Events.MEDIA_ATTACHED, () => {
-        if (activeHls === hls) {
-          hls.loadSource(hlsUrl)
-        }
-      })
-      hls.on(Hls.Events.BUFFER_CODECS, (_event, data) => {
-        if (activeHls !== hls) {
-          return
-        }
-
-        const unsupportedCodecs: string[] = []
-
-        ;[data.video, data.audio, data.audiovideo].forEach((track) => {
-          if (!track?.codec) {
-            return
-          }
-
-          const mimeType = `${track.container}; codecs="${track.codec}"`
-
-          if (!MediaSource.isTypeSupported(mimeType)) {
-            unsupportedCodecs.push(track.codec)
-          }
-        })
-
-        if (!unsupportedCodecs.length) {
-          return
-        }
-
-        const usesHevc = unsupportedCodecs.some((codec) => /^(hev1|hvc1|hevc)/i.test(codec))
-        playbackCompatibilityMessage = usesHevc
-          ? 'This channel uses HEVC/H.265, which the webOS Emulator cannot decode. Try another feed or test it on the physical LG TV.'
-          : `This channel uses an unsupported codec (${unsupportedCodecs.join(', ')}).`
-
-        clearPlaybackWatchdog()
-        hls.stopLoad()
-        showPlayerMessage(playbackCompatibilityMessage)
-      })
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        player.play().catch(() => showPlayerMessage('Press OK to start playback.'))
-      })
-      hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (activeHls !== hls || !data.fatal || playbackCompatibilityMessage) {
-          return
-        }
-
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRecoveryAttempts < 2) {
-          networkRecoveryAttempts += 1
-          hls.startLoad()
-          showPlayerMessage('The live stream was interrupted. Reconnecting…')
-        } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          hls.destroy()
-          activeHls = null
-          player.src = directUrl
-          player.load()
-          player.play().catch(() => showPlayerMessage('Press OK to start playback.'))
-          showPlayerMessage('HLS is unavailable. Trying the provider’s direct stream…')
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveryAttempts < 2) {
-          mediaRecoveryAttempts += 1
-          hls.recoverMediaError()
-          showPlayerMessage('Recovering the live stream…')
-        } else {
-          clearPlaybackWatchdog()
-          showPlayerMessage('This live stream could not be decoded by this device.')
-        }
-      })
-    } else {
-      player.src = hlsUrl
-      player.load()
+  function clearPlaybackWatchdog(): void {
+    if (playbackWatchdog !== null) {
+      window.clearTimeout(playbackWatchdog)
+      playbackWatchdog = null
     }
-  } else {
-    player.src = directUrl
+  }
+
+  function failAttempt(
+    attempt: PlaybackAttempt,
+    generation: number,
+    kind: PlaybackFailureKind,
+    evidence: PlaybackEvidence = {},
+  ): void {
+    if (!isActiveAttempt(attempt, generation)) {
+      return
+    }
+
+    const failure: PlaybackFailure = {
+      engine: attempt.engine,
+      source: attempt.source.kind,
+      kind,
+      evidence,
+    }
+    playbackFailures.push(failure)
+    playerDiagnostics = [...playbackFailures]
+    startNextAttempt()
+  }
+
+  function failActiveAttempt(
+    kind: PlaybackFailureKind,
+    evidence: PlaybackEvidence = {},
+  ): void {
+    if (!activeAttempt) {
+      return
+    }
+
+    failAttempt(activeAttempt, activeAttemptGeneration, kind, evidence)
+  }
+
+  function hlsFailureKind(detail: string): PlaybackFailureKind {
+    const normalized = detail.toLocaleLowerCase()
+
+    if (normalized.includes('manifest') || normalized.includes('playlist')) {
+      return 'manifest'
+    }
+
+    if (normalized.includes('timeout')) {
+      return 'timeout'
+    }
+
+    return 'network'
+  }
+
+  function mpegtsFailureKind(detail: string): PlaybackFailureKind {
+    if (detail === Mpegts.ErrorDetails.MEDIA_FORMAT_UNSUPPORTED) {
+      return 'unsupported'
+    }
+
+    if (detail === Mpegts.ErrorDetails.MEDIA_CODEC_UNSUPPORTED) {
+      return 'codec'
+    }
+
+    if (
+      detail === Mpegts.ErrorDetails.MEDIA_FORMAT_ERROR ||
+      detail === Mpegts.ErrorDetails.MEDIA_MSE_ERROR
+    ) {
+      return 'media-source'
+    }
+
+    if (detail === Mpegts.ErrorDetails.NETWORK_TIMEOUT) {
+      return 'timeout'
+    }
+
+    if (
+      detail === Mpegts.ErrorDetails.NETWORK_EXCEPTION ||
+      detail === Mpegts.ErrorDetails.NETWORK_STATUS_CODE_INVALID ||
+      detail === Mpegts.ErrorDetails.NETWORK_UNRECOVERABLE_EARLY_EOF
+    ) {
+      return 'network'
+    }
+
+    return 'unknown'
+  }
+
+  function renderPlayerDiagnostics(forceVisible: boolean): void {
+    const lines = playbackDiagnosticLines(playerDiagnostics)
+
+    if (!lines.length) {
+      playerDiagnosticsElement.hidden = true
+      playerDiagnosticsElement.innerHTML = ''
+      return
+    }
+
+    const visibleLines = playerDiagnosticsExpanded || forceVisible ? lines : lines.slice(-1)
+    playerDiagnosticsElement.innerHTML = `
+      <p>${forceVisible ? 'Playback diagnostics' : 'Fallback status'}</p>
+      <ul>${visibleLines.map((line) => `<li>${escape(line)}</li>`).join('')}</ul>
+      ${
+        forceVisible
+          ? '<div class="player-diagnostic-actions"><button class="secondary-button" data-action="retry-player" data-focus-id="player-retry">Retry</button><button class="secondary-button" data-action="close-player" data-focus-id="player-diagnostic-back">Back to channels</button></div>'
+          : ''
+      }
+    `
+    playerDiagnosticsElement.hidden = false
+    bindEvents()
+
+    if (forceVisible) {
+      window.setTimeout(() => {
+        setPlayerUiMode('focused')
+        playerDiagnosticsElement
+          .querySelector<HTMLElement>('[data-focus-id="player-retry"]')
+          ?.focus({ preventScroll: true })
+      }, 0)
+    }
+  }
+
+  function sourceEvidence(detail?: string): PlaybackEvidence {
+    return detail ? { detail } : {}
+  }
+
+  function startNextAttempt(): void {
+    clearPlaybackWatchdog()
+    activeAttemptGeneration += 1
+    cleanupActiveTransport()
+
+    const attempt = playbackAttempts[nextAttemptIndex]
+    nextAttemptIndex += 1
+
+    if (!attempt) {
+      activeAttempt = null
+      showPlayerMessage(describePlaybackFailure(playbackFailures))
+      renderPlayerDiagnostics(true)
+      return
+    }
+
+    activeAttempt = attempt
+    visiblePlaybackConfirmed = false
+    decodedFrameBaseline = decodedVideoFrames()
+    const generation = activeAttemptGeneration
+    const fallback = nextAttemptIndex > 1 ? ' fallback' : ''
+    showPlayerMessage(`Checking ${attempt.label}${fallback}…`)
+    renderPlayerDiagnostics(false)
+
+    playbackWatchdog = window.setTimeout(() => {
+      failAttempt(attempt, generation, 'timeout', {
+        detail: 'No visible playback before the startup deadline.',
+      })
+    }, PLAYBACK_ATTEMPT_TIMEOUT_MS)
+
+    if (attempt.engine === 'hls') {
+      startHlsAttempt(attempt, generation)
+    } else if (attempt.engine === 'mpegts') {
+      startMpegtsAttempt(attempt, generation)
+    } else if (attempt.engine === 'dash') {
+      startDashAttempt(attempt, generation)
+    } else {
+      startNativeAttempt(attempt, generation)
+    }
+  }
+
+  function startHlsAttempt(attempt: PlaybackAttempt, generation: number): void {
+    if (!Hls.isSupported()) {
+      failAttempt(attempt, generation, 'unsupported', sourceEvidence('HLS MediaSource is unavailable.'))
+      return
+    }
+
+    let networkRecoveryAttempts = 0
+    let mediaRecoveryAttempts = 0
+    const hls = new Hls({
+      enableWorker: false,
+      lowLatencyMode: false,
+      backBufferLength: settings.bufferSeconds,
+      maxBufferLength: settings.bufferSeconds,
+      maxMaxBufferLength: Math.max(40, settings.bufferSeconds * 2),
+      liveSyncDurationCount: 2,
+      liveMaxLatencyDurationCount: 5,
+    })
+    activeHls = hls
+    hls.attachMedia(player)
+    hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+      if (isActiveAttempt(attempt, generation) && activeHls === hls) {
+        hls.loadSource(attempt.url)
+      }
+    })
+    hls.on(Hls.Events.BUFFER_CODECS, (_event, data) => {
+      if (!isActiveAttempt(attempt, generation) || activeHls !== hls) {
+        return
+      }
+
+      const videoCodec = data.video?.codec
+      const audioCodec = data.audio?.codec
+      const unsupported = [data.video, data.audio, data.audiovideo].find((track) => {
+        if (!track?.codec) {
+          return false
+        }
+
+        return !MediaSource.isTypeSupported(`${track.container}; codecs="${track.codec}"`)
+      })
+
+      if (unsupported) {
+        failAttempt(attempt, generation, 'codec', {
+          detail: 'The HLS manifest declared a MediaSource-incompatible codec.',
+          videoCodec,
+          audioCodec,
+        })
+      }
+    })
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      if (isActiveAttempt(attempt, generation)) {
+        void player.play().catch(() => {
+          failAttempt(attempt, generation, 'decode', sourceEvidence('The HLS media element rejected playback.'))
+        })
+      }
+    })
+    hls.on(Hls.Events.ERROR, (_event, data) => {
+      if (!isActiveAttempt(attempt, generation) || !data.fatal) {
+        return
+      }
+
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRecoveryAttempts < 1) {
+        networkRecoveryAttempts += 1
+        showPlayerMessage('HLS interrupted · reconnecting…')
+        hls.startLoad()
+        return
+      }
+
+      if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveryAttempts < 1) {
+        mediaRecoveryAttempts += 1
+        showPlayerMessage('HLS media recovery…')
+        hls.recoverMediaError()
+        return
+      }
+
+      failAttempt(
+        attempt,
+        generation,
+        data.type === Hls.ErrorTypes.MEDIA_ERROR
+          ? 'decode'
+          : hlsFailureKind(String(data.details)),
+        sourceEvidence(String(data.details)),
+      )
+    })
+  }
+
+  function startMpegtsAttempt(attempt: PlaybackAttempt, generation: number): void {
+    if (!playbackCapabilities.mpegts) {
+      failAttempt(attempt, generation, 'media-source', sourceEvidence('MPEG-TS MediaSource playback is unavailable.'))
+      return
+    }
+
+    let mediaInfo: {
+      videoCodec?: string
+      audioCodec?: string
+      hasVideo?: boolean
+      hasAudio?: boolean
+    } = {}
+    const transportPlayer = Mpegts.createPlayer(
+      {
+        type: 'mse',
+        isLive: activeItem.section === 'live',
+        url: attempt.url,
+      },
+      {
+        enableWorker: false,
+        enableStashBuffer: true,
+        lazyLoad: false,
+        autoCleanupSourceBuffer: true,
+        autoCleanupMaxBackwardDuration: Math.max(30, settings.bufferSeconds * 3),
+        autoCleanupMinBackwardDuration: Math.max(15, settings.bufferSeconds),
+      },
+    )
+    activeMpegts = transportPlayer
+    transportPlayer.on(Mpegts.Events.MEDIA_INFO, (info: Record<string, unknown>) => {
+      if (!isActiveAttempt(attempt, generation) || activeMpegts !== transportPlayer) {
+        return
+      }
+
+      mediaInfo = {
+        videoCodec: typeof info.videoCodec === 'string' ? info.videoCodec : undefined,
+        audioCodec: typeof info.audioCodec === 'string' ? info.audioCodec : undefined,
+        hasVideo: info.hasVideo === true,
+        hasAudio: info.hasAudio === true,
+      }
+
+      if (mediaInfo.hasVideo === false && mediaInfo.hasAudio) {
+        failAttempt(attempt, generation, 'audio-only', mediaInfo)
+      }
+    })
+    transportPlayer.on(Mpegts.Events.ERROR, (errorType: string, detail: string) => {
+      if (isActiveAttempt(attempt, generation) && activeMpegts === transportPlayer) {
+        failAttempt(attempt, generation, mpegtsFailureKind(detail), {
+          ...mediaInfo,
+          detail: detail || errorType,
+        })
+      }
+    })
+    transportPlayer.attachMediaElement(player)
+    transportPlayer.load()
+    void Promise.resolve(transportPlayer.play()).catch(() => {
+      failAttempt(attempt, generation, 'decode', mediaInfo)
+    })
+  }
+
+  function startDashAttempt(attempt: PlaybackAttempt, generation: number): void {
+    if (!playbackCapabilities.dash) {
+      failAttempt(attempt, generation, 'media-source', sourceEvidence('MPEG-DASH MediaSource playback is unavailable.'))
+      return
+    }
+
+    const dash = DashMediaPlayer().create()
+    activeDash = dash
+    dash.on(DashMediaPlayer.events.ERROR, (event: { error?: { message?: string } }) => {
+      if (isActiveAttempt(attempt, generation) && activeDash === dash) {
+        const detail = event.error?.message ?? 'MPEG-DASH playback error.'
+        failAttempt(attempt, generation, 'network', sourceEvidence(detail))
+      }
+    })
+    dash.on(DashMediaPlayer.events.STREAM_INITIALIZED, () => {
+      if (isActiveAttempt(attempt, generation)) {
+        void player.play().catch(() => {
+          failAttempt(attempt, generation, 'decode', sourceEvidence('The MPEG-DASH media element rejected playback.'))
+        })
+      }
+    })
+    dash.initialize(player, attempt.url, true)
+  }
+
+  function startNativeAttempt(attempt: PlaybackAttempt, generation: number): void {
+    player.src = attempt.url
     player.load()
+    void player.play().catch(() => {
+      failAttempt(attempt, generation, 'decode', sourceEvidence('The native media element rejected playback.'))
+    })
   }
 
   player.playbackRate = playerPlaybackRate
   player.muted = playerMuted
   player.addEventListener('loadedmetadata', () => {
-    clearPlaybackWatchdog()
     const legacyResumeKey = `legacy:${activeItem.id}`
     const resume = resumeEntries.get(activeItemKey) ?? resumeEntries.get(legacyResumeKey)
 
@@ -1819,14 +2168,15 @@ function renderPlayer(): void {
     watchForVideoTrack()
   })
   player.addEventListener('error', () => {
-    clearPlaybackWatchdog()
-    showPlayerMessage(
-      playbackCompatibilityMessage ??
-        'This stream could not be played. It may use an unsupported format.',
+    const error = player.error
+
+    failActiveAttempt(
+      error?.code === 3 ? 'decode' : 'network',
+      sourceEvidence(error?.message),
     )
-    window.setTimeout(watchForVideoTrack, 250)
   })
   player.addEventListener('timeupdate', () => {
+    confirmVisiblePlayback()
     watchForVideoTrack()
 
     if (
@@ -1856,14 +2206,11 @@ function renderPlayer(): void {
     }
   })
   player.addEventListener('playing', () => {
-    clearPlaybackWatchdog()
-    hidePlayerMessage()
+    confirmVisiblePlayback()
     watchForVideoTrack()
   })
   player.addEventListener('resize', () => {
-    if (player.videoWidth > 0 && player.videoHeight > 0) {
-      clearVideoDecodeWatchdog()
-    }
+    confirmVisiblePlayback()
   })
   playerProgress.addEventListener('input', () => {
     if (Number.isFinite(player.duration)) {
@@ -1874,14 +2221,7 @@ function renderPlayer(): void {
   setPlayerUiMode(playerUiMode)
   renderedView = view
   restoreFocus(snapshot)
-  watchForVideoTrack()
-
-  function clearPlaybackWatchdog(): void {
-    if (playbackWatchdog !== null) {
-      window.clearTimeout(playbackWatchdog)
-      playbackWatchdog = null
-    }
-  }
+  startNextAttempt()
 
   function clearVideoDecodeWatchdog(): void {
     if (videoDecodeWatchdog !== null) {
@@ -1890,33 +2230,66 @@ function renderPlayer(): void {
     }
   }
 
-  function watchForVideoTrack(): void {
-    if (player.videoWidth > 0 && player.videoHeight > 0) {
-      clearVideoDecodeWatchdog()
+  function decodedVideoFrames(): number | null {
+    if (typeof player.getVideoPlaybackQuality !== 'function') {
+      return null
+    }
+
+    const frames = player.getVideoPlaybackQuality().totalVideoFrames
+    return Number.isFinite(frames) ? frames : null
+  }
+
+  function confirmVisiblePlayback(): void {
+    if (
+      visiblePlaybackConfirmed ||
+      !hasVerifiedVideoFrame(
+        player.videoWidth,
+        player.videoHeight,
+        player.currentTime,
+        decodedFrameBaseline,
+        decodedVideoFrames(),
+      )
+    ) {
       return
     }
+
+    visiblePlaybackConfirmed = true
+    clearPlaybackWatchdog()
+    clearVideoDecodeWatchdog()
+    playerDiagnostics = []
+    playerDiagnosticsElement.hidden = true
+    hidePlayerMessage()
+  }
+
+  function watchForVideoTrack(): void {
+    if (visiblePlaybackConfirmed) {
+      return
+    }
+
+    const deadline = Date.now() + 8_000
 
     if (videoDecodeWatchdog !== null) {
       return
     }
 
     videoDecodeWatchdog = window.setInterval(() => {
-      if (player.videoWidth > 0 && player.videoHeight > 0) {
-        clearVideoDecodeWatchdog()
+      confirmVisiblePlayback()
+
+      if (visiblePlaybackConfirmed) {
         return
       }
 
-      if (player.paused || player.currentTime <= 0) {
+      if (Date.now() < deadline) {
         return
       }
 
-      playbackCompatibilityMessage =
-        'Audio is available, but this stream has no video track that this webOS device can decode. This provider item is delivered as an incompatible MKV/video codec combination. Try another provider rendition or play it on a device that supports this video codec.'
-      player.pause()
-      clearPlaybackWatchdog()
       clearVideoDecodeWatchdog()
-      showPlayerMessage(playbackCompatibilityMessage)
-    }, 750)
+      failActiveAttempt('no-video-frames', {
+        detail:
+          'The media pipeline advanced, but no decoded video frames could be verified.',
+        decodedFrames: decodedVideoFrames() ?? undefined,
+      })
+    }, 500)
   }
 
   function persistProgress(): void {
@@ -2006,7 +2379,11 @@ function isFocusedPlayerControl(): boolean {
   const active = document.activeElement
   return (
     active instanceof HTMLElement &&
-    Boolean(active.closest('#player-controls, #player-progress-wrap, #channel-overlay'))
+    Boolean(
+      active.closest(
+        '#player-controls, #player-progress-wrap, #player-diagnostics, #channel-overlay',
+      ),
+    )
   )
 }
 
@@ -2142,6 +2519,7 @@ function assignNavigationZones(): void {
     '.status-page',
     '#player-controls',
     '#player-progress-wrap',
+    '#player-diagnostics',
     '#channel-overlay',
   ].join(', ')
 
@@ -2232,19 +2610,20 @@ async function handleAction(element: HTMLElement): Promise<void> {
   const action = element.dataset.action
 
   if (action === 'home') {
+    catalogReturnPoint = null
     startNavigation()
     view = 'home'
     render()
     return
   }
 
-  if (action === 'open-section') {
-    await openSection(element.dataset.section as LibrarySection)
+  if (action === 'return-to-library') {
+    requestAppBack()
     return
   }
 
-  if (action === 'choose-category' && catalog) {
-    requestAppBack()
+  if (action === 'open-section') {
+    await openSection(element.dataset.section as LibrarySection)
     return
   }
 
@@ -2437,6 +2816,14 @@ async function handleAction(element: HTMLElement): Promise<void> {
     return
   }
 
+  if (action === 'retry-player' && view === 'player') {
+    startNavigation()
+    playerCleanup?.()
+    playerCleanup = null
+    render()
+    return
+  }
+
   if (action === 'toggle-play') {
     togglePlayback()
     return
@@ -2610,6 +2997,7 @@ async function openSection(section: LibrarySection): Promise<void> {
     return
   }
 
+  catalogReturnPoint = null
   pushRouteHistory()
   const { token, signal } = startNavigation()
   renderLoading(`Loading ${labels[section].toLowerCase()}…`)
@@ -2690,6 +3078,10 @@ async function loadCategory(category: Category | null): Promise<void> {
     return
   }
 
+  catalogReturnPoint = {
+    catalog: { ...activeCatalog },
+    focus: snapshotFocus(),
+  }
   pushRouteHistory()
   const { token, signal } = startNavigation()
   renderLoading(`Loading ${category.name}…`)
@@ -2795,6 +3187,8 @@ async function openDetails(stream: StreamItem): Promise<void> {
 }
 
 function openFavorites(): void {
+  catalogReturnPoint = null
+
   if (!catalog?.isFavorites) {
     pushRouteHistory()
   }
@@ -3732,6 +4126,7 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: XtreamClient):
   favorites = loadFavorites(nextProfile.id)
   resumeEntries = loadResume(nextProfile.id)
   catalog = null
+  catalogReturnPoint = null
   selectedItem = null
   selectedSeries = null
   selectedVod = null
@@ -3818,15 +4213,24 @@ function navigateBack(): boolean {
 
   if (view === 'catalog') {
     if (catalog && catalog.category !== null && !catalog.isFavorites) {
+      const returnPoint = catalogReturnPoint
+      catalogReturnPoint = null
       startNavigation()
-      catalog = {
-        ...catalog,
-        category: null,
-        streams: [],
-        query: '',
-        page: 0,
-        results: undefined,
+
+      if (returnPoint) {
+        catalog = returnPoint.catalog
+        requestFocus(returnPoint.focus)
+      } else {
+        catalog = {
+          ...catalog,
+          category: null,
+          streams: [],
+          query: '',
+          page: 0,
+          results: undefined,
+        }
       }
+
       renderCatalog()
     } else {
       startNavigation()

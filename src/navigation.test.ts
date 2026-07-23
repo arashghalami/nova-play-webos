@@ -64,7 +64,24 @@ describe('resolveNavigationTarget', () => {
     expect(resolveNavigationTarget(items, 'guide', 'ArrowDown')).toBe('live')
   })
 
-  it('preserves the nearest column through incomplete rows', () => {
+  it('traverses multi-row grids horizontally in the direction of travel', () => {
+    const items = [
+      item('one', 'catalog', 0, 0),
+      item('two', 'catalog', 120, 0),
+      item('three', 'catalog', 240, 0),
+      item('four', 'catalog', 0, 120),
+      item('five', 'catalog', 120, 120),
+    ]
+
+    expect(resolveNavigationTarget(items, 'one', 'ArrowRight')).toBe('two')
+    expect(resolveNavigationTarget(items, 'three', 'ArrowRight')).toBe('four')
+    expect(resolveNavigationTarget(items, 'five', 'ArrowRight')).toBe('one')
+    expect(resolveNavigationTarget(items, 'five', 'ArrowLeft')).toBe('four')
+    expect(resolveNavigationTarget(items, 'four', 'ArrowLeft')).toBe('three')
+    expect(resolveNavigationTarget(items, 'one', 'ArrowLeft')).toBe('five')
+  })
+
+  it('preserves the nearest column when moving vertically through incomplete rows', () => {
     const items = [
       item('one', 'catalog', 0, 0),
       item('two', 'catalog', 120, 0),
@@ -75,8 +92,6 @@ describe('resolveNavigationTarget', () => {
 
     expect(resolveNavigationTarget(items, 'three', 'ArrowDown')).toBe('five')
     expect(resolveNavigationTarget(items, 'five', 'ArrowUp')).toBe('two')
-    expect(resolveNavigationTarget(items, 'five', 'ArrowRight')).toBe('four')
-    expect(resolveNavigationTarget(items, 'four', 'ArrowLeft')).toBe('five')
   })
 
   it('navigates catalog toolbars, grids, and pagers as separate predictable zones', () => {

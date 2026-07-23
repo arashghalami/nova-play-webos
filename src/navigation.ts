@@ -106,8 +106,10 @@ function adjacentZone(
 /**
  * Resolves TV D-pad focus within explicit navigation zones.
  *
- * Horizontal navigation wraps within the current visual row. Vertical navigation
- * moves through rows first, then enters the closest zone above or below.
+ * Horizontal navigation advances through the current visual row, then continues
+ * from the corresponding edge of the next or previous row. Single-row rails wrap.
+ * Vertical navigation moves through rows first, then enters the closest zone above
+ * or below.
  */
 export function resolveNavigationTarget(
   items: NavigationItem[],
@@ -131,12 +133,26 @@ export function resolveNavigationTarget(
   const rowIndex = rows.findIndex((row) => row.some((item) => item.id === origin.id))
   const row = rows[rowIndex]
   const column = row?.findIndex((item) => item.id === origin.id) ?? -1
+  const isHorizontalGrid = rows.some((candidate) => candidate.length > 1)
   let target: NavigationItem | null = null
 
   if (direction === 'ArrowRight' && row?.length) {
-    target = row[(column + 1) % row.length]
+    if (column < row.length - 1) {
+      target = row[column + 1]
+    } else if (rows.length > 1 && isHorizontalGrid) {
+      target = rows[rowIndex + 1]?.[0] ?? rows[0]?.[0] ?? null
+    } else {
+      target = row[0]
+    }
   } else if (direction === 'ArrowLeft' && row?.length) {
-    target = row[(column - 1 + row.length) % row.length]
+    if (column > 0) {
+      target = row[column - 1]
+    } else if (rows.length > 1 && isHorizontalGrid) {
+      const previousRow = rows[rowIndex - 1] ?? rows[rows.length - 1]
+      target = previousRow?.[previousRow.length - 1] ?? null
+    } else {
+      target = row[row.length - 1]
+    }
   } else if (direction === 'ArrowUp' || direction === 'ArrowDown') {
     const nextRow = rows[rowIndex + (direction === 'ArrowUp' ? -1 : 1)]
     target = nextRow ? closestColumn(nextRow, origin) : null

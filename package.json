@@ -16,6 +16,8 @@
     "vitest": "^2.1.9"
   },
   "dependencies": {
-    "hls.js": "^1.6.16"
+    "dashjs": "^5.2.0",
+    "hls.js": "^1.6.16",
+    "mpegts.js": "^1.8.0"
   }
 }

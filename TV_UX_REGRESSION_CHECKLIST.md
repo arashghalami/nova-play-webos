@@ -86,6 +86,21 @@ For VOD, episodes, and catch-up playback:
 8. Verify player controls remain visible while a control owns focus and overlays cannot receive focus behind the channel list.
 9. Test live TV, VOD, series episodes, catch-up, channel switching, audio/subtitle controls, and player Back/Return paths.
 
+### Playback compatibility and fallback
+
+1. Use a live channel whose HLS endpoint fails, stalls, redirects to HTML, or returns a malformed manifest. Confirm the player records the manifest failure, applies one bounded HLS recovery, then proceeds to its remaining applicable sources.
+2. Confirm discovery uses only real provider sources: `direct_source`, declared Xtream container, standard HLS, standard MPEG-TS, and actual `.mpd` DASH sources. It must never fabricate an unrelated extension merely to guess a codec.
+3. On a real webOS TV, verify native HLS and native MPEG-TS each receive a bounded attempt when the relevant provider source exists, even if `canPlayType()` does not advertise the hardware path. Confirm the emulator and physical-TV capability reports are recorded separately.
+4. Use a provider channel with a valid `.ts` rendition. Confirm MPEG-TS transmuxing starts when MediaSource live playback is available; verify `MEDIA_INFO`, codec fields, audio/video track flags, and frame statistics are captured when supplied.
+5. Use an actual `.mpd` provider source and confirm the DASH adapter starts; a non-MPD URL must never be sent to the DASH adapter.
+6. Confirm each unique source/engine pair is tried once, late events from a previous attempt cannot replace the current state, and changing channel or leaving the player cancels native, HLS, MPEG-TS, and DASH transports.
+7. Verify successful playback clears the attempt status only after decoded video dimensions and time progression are present; `loadedmetadata`, `canplay`, or `playing` alone must never hide status over a black screen.
+8. Verify an audio-only service is identified as audio-only rather than a video codec failure.
+9. Verify a codec conclusion is shown only when the playback engine reports a codec or the exact MIME/codec combination is rejected. A stream with no visible frames but no codec evidence must report the no-frame condition instead.
+10. Verify final diagnostics list sanitized engine outcomes and expose **Retry** and **Back to channels** with visible remote focus.
+11. For authorization, DRM, HTTP/network, manifest, MediaSource, and no-frame failures, confirm the final message identifies that specific class rather than using a generic “unsupported format” message.
+12. For a stream that remains incompatible on the physical TV, record the actual codec evidence and use a configured server-side H.264/AAC HLS relay; client code must not claim local transcoding exists.
+
 ## Release evidence
 
 Record the following with the release:
