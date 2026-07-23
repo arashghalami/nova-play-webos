@@ -66,8 +66,25 @@ Run with at least two complete rows and one incomplete final row.
 - Start loading a library, category, guide, details page, or search, then press Back immediately. A stale response must not replace the newer view.
 - Change sort, change page, remove a Favorite, save settings, expand/collapse global search results, and refresh the guide. Focus must remain visible and logical.
 - Check empty categories, empty search results, one-item grids, and error/retry states.
-- Verify the player’s auto-hidden controls are revealed before they receive focus.
-- Test live TV, VOD, series, episode, catch-up, and channel switching paths.
+### Player transport and controls
+
+For VOD, episodes, and catch-up playback:
+
+1. Enter playback and confirm the player surface—not the Close/Back button—has focus.
+2. Confirm no player action is selected and the control overlay is concealed initially.
+3. Press **OK** once: controls appear, but no action button is selected and playback remains on the player surface.
+4. Press **Up**: focus enters the Play/Pause control. Press **Down** from neutral playback: focus enters the timeline.
+5. Press **Back** while the overlay or a player control is active: it hides the overlay and returns to neutral playback; a subsequent Back returns through the app history.
+6. From neutral playback, verify:
+   - one Left/Right tap seeks 10 seconds;
+   - a second same-direction tap within 350 ms performs a 20-second jump;
+   - holding Left/Right repeats after 450 ms and accelerates through 10, 20, 30, then 60-second jumps;
+   - releasing the key stops repeated seeking;
+   - seek feedback reports direction, jump amount, and resulting timestamp;
+   - seeking clamps at 0 and at media duration.
+7. For non-DVR Live TV, verify Left/Right does not alter a nonexistent timeline and displays the seek-unavailable feedback instead.
+8. Verify player controls remain visible while a control owns focus and overlays cannot receive focus behind the channel list.
+9. Test live TV, VOD, series episodes, catch-up, channel switching, audio/subtitle controls, and player Back/Return paths.
 
 ## Release evidence
 

@@ -43,6 +43,12 @@ import {
   type NavigationDirection,
   type NavigationItem,
 } from './navigation'
+import {
+  clampSeekPosition,
+  isDoubleSeekTap,
+  seekFeedbackLabel,
+  seekStepForHold,
+} from './player-transport'
 import { XtreamClient } from './xtream-client'
 
 type CatalogResults = {
@@ -90,6 +96,8 @@ type AppHistoryState = {
   novaPlay: true
   depth: number
 }
+
+type PlayerUiMode = 'immersive' | 'overlay' | 'focused' | 'seeking'
 const CATALOG_PAGE_SIZE = 60
 const SEARCH_DEBOUNCE_MS = 180
 const NUMERIC_CHANNEL_TIMEOUT_MS = 1600
@@ -168,6 +176,14 @@ let playerMuted = false
 let playerPlaybackRate = 1
 let playerAspect: 'contain' | 'cover' = 'contain'
 let showPlayerChannels = false
+let playerUiMode: PlayerUiMode = 'immersive'
+let playerSeekDirection: -1 | 1 | null = null
+let playerSeekStartedAt = 0
+let playerSeekHoldTimer: number | null = null
+let playerSeekRepeatTimer: number | null = null
+let playerSeekFeedbackTimer: number | null = null
+let playerLastSeekDirection: -1 | 1 | null = null
+let playerLastSeekAt = 0
 let wakeLock: { release: () => Promise<void> } | null = null
 let navigationSequence = 0
 let navigationToken = 0
@@ -596,7 +612,7 @@ function defaultFocusTarget(): HTMLElement | null {
               : view === 'settings'
                 ? ['[data-focus-id="settings-add-profile"]', '.settings-panel [data-focus-id]']
                 : view === 'player'
-                  ? ['[data-focus-id="player-close"]', '#player-controls [data-focus-id]']
+                  ? ['#player-surface', '[data-focus-id="player-play"]']
                   : ['[autofocus]', '.login-form [data-focus-id]']
 
   for (const selector of selectors) {
@@ -1572,6 +1588,9 @@ function renderPlayer(): void {
 
   const snapshot = snapshotFocus()
   const isLive = item.section === 'live'
+  const hasSeekableTimeline = !isLive || Boolean(playerSourceOverride)
+  const playerControlsClass = playerUiMode === 'immersive' ? 'concealed' : ''
+  const playerProgressClass = `${hasSeekableTimeline ? '' : 'hidden'} ${playerUiMode === 'immersive' ? 'concealed' : ''}`.trim()
   const queue = isLive ? liveQueue : []
   const currentIndex = queue.findIndex((candidate) => streamLookupKey(candidate) === streamLookupKey(item))
   const playerNavigationControls = isLive
@@ -1582,11 +1601,12 @@ function renderPlayer(): void {
     : `<button class="icon-button" data-action="skip-forward" data-focus-id="player-skip-forward" aria-label="Skip forward 10 seconds">+10</button><button class="icon-button" data-action="cycle-speed" data-focus-id="player-speed" aria-label="Playback speed">${playerPlaybackRate}×</button>`
 
   app.innerHTML = `
-    <main class="player-page player-aspect-${playerAspect}">
+    <main id="player-surface" class="player-page player-aspect-${playerAspect}" tabindex="0" aria-label="Video player. Press OK to show controls.">
       <video id="video-player" autoplay playsinline ${playerMuted ? 'muted' : ''}></video>
       <div id="player-message" class="player-message" hidden></div>
+      <div id="player-seek-feedback" class="player-seek-feedback" aria-live="polite" hidden></div>
       <div id="channel-number-overlay" class="channel-number-overlay" hidden></div>
-      <div id="player-controls" class="player-controls">
+      <div id="player-controls" class="player-controls ${playerControlsClass}">
         <button class="icon-button player-back" data-action="close-player" data-focus-id="player-close" aria-label="Close player">←</button>
         ${playerNavigationControls}
         <div class="player-title"><span>${escape(isLive ? 'LIVE' : 'PLAYING')}</span>${escape(item.name)}</div>
@@ -1615,7 +1635,7 @@ function renderPlayer(): void {
             </aside>`
           : ''
       }
-      <div id="player-progress-wrap" class="player-progress-wrap ${isLive ? 'hidden' : ''}">
+      <div id="player-progress-wrap" class="player-progress-wrap ${playerProgressClass}">
         <div class="player-time"><span id="player-current">0:00</span><span id="player-duration">0:00</span></div>
         <input id="player-progress" data-focus-id="player-progress" aria-label="Playback position" type="range" min="0" max="100" value="0" step="0.1" />
       </div>
@@ -1659,7 +1679,7 @@ function renderPlayer(): void {
     player.removeAttribute('src')
     player.load()
     document.removeEventListener('mousemove', revealControls)
-    document.removeEventListener('keydown', revealControls)
+    cancelPlayerSeek()
     void releaseKeepAwake()
   }
 
@@ -1809,12 +1829,15 @@ function renderPlayer(): void {
   player.addEventListener('timeupdate', () => {
     watchForVideoTrack()
 
-    if (activeItem.section !== 'live' && Number.isFinite(player.duration)) {
+    if (
+      (activeItem.section !== 'live' || Boolean(playerSourceOverride)) &&
+      Number.isFinite(player.duration)
+    ) {
       playerProgress.value = String((player.currentTime / player.duration) * 100)
       playerCurrentTime.textContent = formatDuration(player.currentTime)
       playerDuration.textContent = formatDuration(player.duration)
 
-      if (Date.now() - lastResumeSaveAt > 10_000) {
+      if (activeItem.section !== 'live' && Date.now() - lastResumeSaveAt > 10_000) {
         persistProgress()
       }
     }
@@ -1848,8 +1871,7 @@ function renderPlayer(): void {
     }
   })
   document.addEventListener('mousemove', revealControls)
-  document.addEventListener('keydown', revealControls)
-  revealControls()
+  setPlayerUiMode(playerUiMode)
   renderedView = view
   restoreFocus(snapshot)
   watchForVideoTrack()
@@ -1935,20 +1957,163 @@ function renderPlayer(): void {
   }
 }
 
-function revealControls(): void {
+function clearPlayerControlsTimer(): void {
+  if (playerControlsTimer !== null) {
+    window.clearTimeout(playerControlsTimer)
+    playerControlsTimer = null
+  }
+}
+
+function setPlayerUiMode(mode: PlayerUiMode): void {
+  playerUiMode = mode
   const controls = document.querySelector<HTMLElement>('#player-controls')
   const progress = document.querySelector<HTMLElement>('#player-progress-wrap')
+
+  clearPlayerControlsTimer()
+
+  if (mode === 'immersive') {
+    controls?.classList.add('concealed')
+    progress?.classList.add('concealed')
+    document.querySelector<HTMLElement>('#player-surface')?.focus({ preventScroll: true })
+    return
+  }
+
   controls?.classList.remove('concealed')
   progress?.classList.remove('concealed')
 
-  if (playerControlsTimer !== null) {
-    window.clearTimeout(playerControlsTimer)
+  if (mode === 'overlay' || mode === 'seeking') {
+    playerControlsTimer = window.setTimeout(() => {
+      if (playerUiMode === 'overlay') {
+        setPlayerUiMode('immersive')
+      }
+    }, 3500)
+  }
+}
+
+function revealControls(): void {
+  if (view !== 'player') {
+    return
   }
 
-  playerControlsTimer = window.setTimeout(() => {
-    controls?.classList.add('concealed')
-    progress?.classList.add('concealed')
-  }, 3500)
+  if (playerUiMode === 'immersive') {
+    setPlayerUiMode('overlay')
+  } else if (playerUiMode === 'overlay' || playerUiMode === 'seeking') {
+    setPlayerUiMode(playerUiMode)
+  }
+}
+
+function isFocusedPlayerControl(): boolean {
+  const active = document.activeElement
+  return (
+    active instanceof HTMLElement &&
+    Boolean(active.closest('#player-controls, #player-progress-wrap, #channel-overlay'))
+  )
+}
+
+function showPlayerSeekFeedback(text: string): void {
+  const feedback = document.querySelector<HTMLElement>('#player-seek-feedback')
+
+  if (!feedback) {
+    return
+  }
+
+  if (playerSeekFeedbackTimer !== null) {
+    window.clearTimeout(playerSeekFeedbackTimer)
+  }
+
+  feedback.textContent = text
+  feedback.hidden = false
+  playerSeekFeedbackTimer = window.setTimeout(() => {
+    feedback.hidden = true
+    playerSeekFeedbackTimer = null
+  }, 900)
+}
+
+function playerCanSeek(): boolean {
+  const player = document.querySelector<HTMLVideoElement>('#video-player')
+  const hasSeekableSource = playerItem?.section !== 'live' || Boolean(playerSourceOverride)
+  return Boolean(
+    hasSeekableSource &&
+      player &&
+      Number.isFinite(player.duration) &&
+      player.duration > 0,
+  )
+}
+
+function applyPlayerSeek(direction: -1 | 1, seconds: number): boolean {
+  const player = document.querySelector<HTMLVideoElement>('#video-player')
+
+  if (!player || !Number.isFinite(player.duration) || player.duration <= 0) {
+    return false
+  }
+
+  const delta = direction * seconds
+  player.currentTime = clampSeekPosition(player.currentTime + delta, player.duration)
+  showPlayerSeekFeedback(`${seekFeedbackLabel(delta)} · ${formatDuration(player.currentTime)}`)
+  return true
+}
+
+function cancelPlayerSeek(): void {
+  if (playerSeekHoldTimer !== null) {
+    window.clearTimeout(playerSeekHoldTimer)
+    playerSeekHoldTimer = null
+  }
+
+  if (playerSeekRepeatTimer !== null) {
+    window.clearInterval(playerSeekRepeatTimer)
+    playerSeekRepeatTimer = null
+  }
+
+  if (playerSeekDirection !== null && playerUiMode === 'seeking') {
+    setPlayerUiMode('overlay')
+  }
+
+  playerSeekDirection = null
+  playerSeekStartedAt = 0
+}
+
+function startPlayerSeek(direction: -1 | 1): void {
+  if (!playerCanSeek()) {
+    setPlayerUiMode('overlay')
+    showPlayerSeekFeedback('Seeking is unavailable for this live stream')
+    return
+  }
+
+  if (playerSeekDirection === direction) {
+    return
+  }
+
+  cancelPlayerSeek()
+
+  const now = Date.now()
+  const isDoubleTap = isDoubleSeekTap(
+    playerLastSeekDirection,
+    playerLastSeekAt,
+    direction,
+    now,
+  )
+
+  playerLastSeekDirection = direction
+  playerLastSeekAt = now
+  playerSeekDirection = direction
+  playerSeekStartedAt = now
+  setPlayerUiMode('seeking')
+  applyPlayerSeek(direction, isDoubleTap ? 20 : 10)
+
+  playerSeekHoldTimer = window.setTimeout(() => {
+    if (playerSeekDirection !== direction) {
+      return
+    }
+
+    playerSeekRepeatTimer = window.setInterval(() => {
+      if (playerSeekDirection !== direction) {
+        return
+      }
+
+      const heldMs = Date.now() - playerSeekStartedAt
+      applyPlayerSeek(direction, seekStepForHold(heldMs))
+    }, 420)
+  }, 450)
 }
 
 let delegatedEventsBound = false
@@ -3213,7 +3378,9 @@ function beginPlayback(item: StreamItem): void {
   if (view !== 'player') {
     playerReturnPoint = captureReturnPoint()
     pushRouteHistory()
+    playerUiMode = 'immersive'
   }
+  cancelPlayerSeek()
   startNavigation()
 
   if (
@@ -3244,6 +3411,8 @@ function beginPlayback(item: StreamItem): void {
 }
 
 function closePlayer(): void {
+  cancelPlayerSeek()
+  playerUiMode = 'immersive'
   startNavigation()
   playerCleanup?.()
   playerCleanup = null
@@ -3976,6 +4145,14 @@ window.addEventListener('keydown', (event) => {
       return
     }
 
+    if (view === 'player' && playerUiMode !== 'immersive') {
+      cancelPlayerSeek()
+      setPlayerUiMode('immersive')
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      return
+    }
+
     if (requestAppBack()) {
       event.preventDefault()
       event.stopImmediatePropagation()
@@ -4009,12 +4186,6 @@ window.addEventListener('keydown', (event) => {
   }
 
   if (view === 'player') {
-    if (event.key === 'Escape' || event.key === 'Backspace' || event.key === 'BrowserBack') {
-      event.preventDefault()
-      closePlayer()
-      return
-    }
-
     if (event.key === 'ChannelUp') {
       event.preventDefault()
       switchLiveChannel(1)
@@ -4033,35 +4204,71 @@ window.addEventListener('keydown', (event) => {
       return
     }
 
-    if (handleSpatialNavigation(event)) {
-      revealControls()
+    const isPlayerControl = isFocusedPlayerControl()
+    const isSeekKey = event.key === 'ArrowLeft' || event.key === 'ArrowRight'
+
+    if (isSeekKey && !isPlayerControl) {
+      event.preventDefault()
+      startPlayerSeek(event.key === 'ArrowLeft' ? -1 : 1)
       return
     }
 
-    if (['ArrowLeft', 'ArrowRight', 'Enter', ' '].includes(event.key)) {
-      revealControls()
-    }
-
-    const activeElement = document.activeElement
-    const isPlayerControl =
-      activeElement instanceof HTMLElement &&
-      Boolean(activeElement.closest('#player-controls, #player-progress-wrap, #channel-overlay'))
-
     if ((event.key === 'Enter' || event.key === ' ') && !isPlayerControl) {
       event.preventDefault()
-      togglePlayback()
-    } else if (event.key === 'ArrowLeft' && !isPlayerControl && playerItem?.section !== 'live') {
+
+      if (playerUiMode === 'immersive') {
+        setPlayerUiMode('overlay')
+      } else {
+        setPlayerUiMode('immersive')
+      }
+      return
+    }
+
+    if (!isPlayerControl && event.key === 'ArrowUp') {
       event.preventDefault()
-      seekBy(-10)
-    } else if (event.key === 'ArrowRight' && !isPlayerControl && playerItem?.section !== 'live') {
+      setPlayerUiMode('focused')
+      document.querySelector<HTMLElement>('[data-focus-id="player-play"]')?.focus({
+        preventScroll: true,
+      })
+      return
+    }
+
+    if (!isPlayerControl && event.key === 'ArrowDown') {
       event.preventDefault()
-      seekBy(10)
+
+      if (playerCanSeek()) {
+        setPlayerUiMode('focused')
+        document.querySelector<HTMLElement>('[data-focus-id="player-progress"]')?.focus({
+          preventScroll: true,
+        })
+      } else {
+        setPlayerUiMode('overlay')
+        showPlayerSeekFeedback('Timeline controls are unavailable for live TV')
+      }
+      return
+    }
+
+    if (isPlayerControl) {
+      setPlayerUiMode('focused')
+
+      if (handleSpatialNavigation(event)) {
+        return
+      }
     }
     return
   }
 
   if (handleSpatialNavigation(event)) {
     return
+  }
+})
+
+window.addEventListener('keyup', (event) => {
+  if (
+    view === 'player' &&
+    (event.key === 'ArrowLeft' || event.key === 'ArrowRight')
+  ) {
+    cancelPlayerSeek()
   }
 })
 
@@ -4123,6 +4330,7 @@ window.addEventListener('resize', invalidateSpatialLayout)
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden && view === 'player') {
+    cancelPlayerSeek()
     document.querySelector<HTMLVideoElement>('#video-player')?.pause()
   }
 })
