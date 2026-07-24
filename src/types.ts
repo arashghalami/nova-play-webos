@@ -74,6 +74,12 @@ export interface StreamItem {
   season?: string
   episodeNumber?: string
   /**
+   * Parent-series context carried by episode records. Providers frequently omit
+   * episode artwork, so this is used as the reliable display fallback.
+   */
+  seriesTitle?: string
+  seriesCover?: string
+  /**
    * Cached lowercase display name used for catalog and global-search matching.
    * It is deliberately kept outside rich metadata so list rendering stays cheap.
    */
@@ -113,6 +119,11 @@ export interface ResumeEntry {
   position: number
   updatedAt: number
   stream?: StreamItem
+  /**
+   * Duration observed by the player when progress was saved. This makes progress
+   * meters accurate after the stream object has been restored from storage.
+   */
+  duration?: number
   completed?: boolean
 }
 

@@ -75,10 +75,10 @@ describe('resolveNavigationTarget', () => {
 
     expect(resolveNavigationTarget(items, 'one', 'ArrowRight')).toBe('two')
     expect(resolveNavigationTarget(items, 'three', 'ArrowRight')).toBe('four')
-    expect(resolveNavigationTarget(items, 'five', 'ArrowRight')).toBe('one')
+    expect(resolveNavigationTarget(items, 'five', 'ArrowRight')).toBeNull()
     expect(resolveNavigationTarget(items, 'five', 'ArrowLeft')).toBe('four')
     expect(resolveNavigationTarget(items, 'four', 'ArrowLeft')).toBe('three')
-    expect(resolveNavigationTarget(items, 'one', 'ArrowLeft')).toBe('five')
+    expect(resolveNavigationTarget(items, 'one', 'ArrowLeft')).toBeNull()
   })
 
   it('preserves the nearest column when moving vertically through incomplete rows', () => {
@@ -92,6 +92,63 @@ describe('resolveNavigationTarget', () => {
 
     expect(resolveNavigationTarget(items, 'three', 'ArrowDown')).toBe('five')
     expect(resolveNavigationTarget(items, 'five', 'ArrowUp')).toBe('two')
+  })
+
+  it('stops at absolute grid edges without wrap', () => {
+    const items = [
+      item('a1', 'grid', 0, 0),
+      item('a2', 'grid', 120, 0),
+      item('a3', 'grid', 240, 0),
+      item('b1', 'grid', 0, 120),
+      item('b2', 'grid', 120, 120),
+      item('b3', 'grid', 240, 120),
+      item('c1', 'grid', 0, 240),
+    ]
+
+    // First item: Left → null (no wrap to last)
+    expect(resolveNavigationTarget(items, 'a1', 'ArrowLeft')).toBeNull()
+    // Last item: Right → null (no wrap to first)
+    expect(resolveNavigationTarget(items, 'c1', 'ArrowRight')).toBeNull()
+    // Row-end flow: a3 → b1
+    expect(resolveNavigationTarget(items, 'a3', 'ArrowRight')).toBe('b1')
+    // Row-start flow: b1 → a3
+    expect(resolveNavigationTarget(items, 'b1', 'ArrowLeft')).toBe('a3')
+    // Last full-row end → partial row start
+    expect(resolveNavigationTarget(items, 'b3', 'ArrowRight')).toBe('c1')
+    // Partial row start → full-row end
+    expect(resolveNavigationTarget(items, 'c1', 'ArrowLeft')).toBe('b3')
+  })
+
+  it('uses preferredCenterX for sticky column across ragged rows', () => {
+    // 3-column grid with a ragged last row (1 item)
+    const items = [
+      item('a1', 'grid', 0, 0),
+      item('a2', 'grid', 120, 0),
+      item('a3', 'grid', 240, 0),
+      item('b1', 'grid', 0, 120),
+    ]
+
+    // From a3 (center X = 290), going down with no sticky → b1 (nearest = b1)
+    expect(resolveNavigationTarget(items, 'a3', 'ArrowDown')).toBe('b1')
+    // Now going back up with sticky X = 290 → should target a3 (closest to 290)
+    expect(resolveNavigationTarget(items, 'b1', 'ArrowUp', 290)).toBe('a3')
+    // Sticky X = 60 (a1 center) → going down and back up returns to a1
+    expect(resolveNavigationTarget(items, 'b1', 'ArrowUp', 60)).toBe('a1')
+  })
+
+  it('does not apply preferredCenterX across zone boundaries', () => {
+    const items = [
+      item('tool-1', 'toolbar', 0, 0),
+      item('tool-2', 'toolbar', 120, 0),
+      item('tool-3', 'toolbar', 240, 0),
+      item('card-1', 'grid', 0, 150),
+      item('card-2', 'grid', 120, 150),
+      item('card-3', 'grid', 240, 150),
+    ]
+
+    // From toolbar to grid: preferredCenterX should NOT be used across zones
+    // tool-1 (center 50) going down should land on card-1 (nearest by origin center)
+    expect(resolveNavigationTarget(items, 'tool-1', 'ArrowDown', 290)).toBe('card-1')
   })
 
   it('navigates catalog toolbars, grids, and pagers as separate predictable zones', () => {

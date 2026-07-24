@@ -17,6 +17,28 @@ export function hasVerifiedVideoFrame(
   )
 }
 
+/**
+ * Some webOS media pipelines render correctly but never update
+ * getVideoPlaybackQuality().totalVideoFrames. Dimensions plus an advancing
+ * timeline are the portable confirmation fallback for those devices.
+ */
+export function hasVisibleVideoTrack(
+  width: number,
+  height: number,
+  currentTime: number,
+): boolean {
+  return width > 0 && height > 0 && currentTime >= 1
+}
+
+/**
+ * WebOS hardware decoders can omit both frame counters and dimensions while
+ * video is playing. An advancing media timeline is sufficient to stop the
+ * startup watchdog from tearing down working playback.
+ */
+export function hasAdvancedPlaybackTimeline(currentTime: number): boolean {
+  return currentTime >= 1
+}
+
 export function seekStepForHold(heldMs: number): number {
   if (heldMs >= 5_000) {
     return 60

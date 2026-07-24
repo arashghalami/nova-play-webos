@@ -44,14 +44,18 @@ function rowsFor(items: NavigationItem[]): NavigationRow[] {
   return rows
 }
 
-function closestColumn(items: NavigationItem[], origin: NavigationItem): NavigationItem | null {
+function closestColumn(
+  items: NavigationItem[],
+  origin: NavigationItem,
+  targetX?: number,
+): NavigationItem | null {
+  const x = targetX ?? centerX(origin)
+
   return (
     items
       .slice()
-      .sort(
-        (left, right) =>
-          Math.abs(centerX(left) - centerX(origin)) - Math.abs(centerX(right) - centerX(origin)),
-      )[0] ?? null
+      .sort((left, right) => Math.abs(centerX(left) - x) - Math.abs(centerX(right) - x))[0] ??
+    null
   )
 }
 
@@ -98,7 +102,10 @@ function adjacentZone(
 
         return inDirection ? { zone, distance: Math.abs(zoneY - originY) } : null
       })
-      .filter((candidate): candidate is { zone: NavigationZone; distance: number } => Boolean(candidate))
+      .filter(
+        (candidate): candidate is { zone: NavigationZone; distance: number } =>
+          Boolean(candidate),
+      )
       .sort((left, right) => left.distance - right.distance)[0]?.zone ?? null
   )
 }
@@ -106,15 +113,21 @@ function adjacentZone(
 /**
  * Resolves TV D-pad focus within explicit navigation zones.
  *
- * Horizontal navigation advances through the current visual row, then continues
- * from the corresponding edge of the next or previous row. Single-row rails wrap.
- * Vertical navigation moves through rows first, then enters the closest zone above
- * or below.
+ * Multi-row grids (detected at runtime via row count): horizontal movement flows
+ * across row boundaries (right at row-end → first item of next row, left at
+ * row-start → last item of previous row) with NO wrap at grid edges.
+ * Single-row rails wrap horizontally as before.
+ *
+ * Vertical navigation moves through rows first, then enters the closest zone
+ * above or below. When `preferredCenterX` is provided, vertical movement targets
+ * that X coordinate instead of the origin item's center, implementing sticky-column
+ * behavior across ragged rows.
  */
 export function resolveNavigationTarget(
   items: NavigationItem[],
   originId: string,
   direction: NavigationDirection,
+  preferredCenterX?: number,
 ): string | null {
   const origin = items.find((item) => item.id === originId)
 
@@ -134,30 +147,36 @@ export function resolveNavigationTarget(
   const row = rows[rowIndex]
   const column = row?.findIndex((item) => item.id === origin.id) ?? -1
   const isHorizontalGrid = rows.some((candidate) => candidate.length > 1)
+  const isMultiRowGrid = rows.length > 1 && isHorizontalGrid
   let target: NavigationItem | null = null
 
   if (direction === 'ArrowRight' && row?.length) {
     if (column < row.length - 1) {
       target = row[column + 1]
-    } else if (rows.length > 1 && isHorizontalGrid) {
-      target = rows[rowIndex + 1]?.[0] ?? rows[0]?.[0] ?? null
+    } else if (isMultiRowGrid) {
+      // Flow to first item of next row; stop at grid edge (no wrap)
+      target = rows[rowIndex + 1]?.[0] ?? null
     } else {
+      // Single-row rail: modulo wrap
       target = row[0]
     }
   } else if (direction === 'ArrowLeft' && row?.length) {
     if (column > 0) {
       target = row[column - 1]
-    } else if (rows.length > 1 && isHorizontalGrid) {
-      const previousRow = rows[rowIndex - 1] ?? rows[rows.length - 1]
+    } else if (isMultiRowGrid) {
+      // Flow to last item of previous row; stop at grid edge (no wrap)
+      const previousRow = rows[rowIndex - 1]
       target = previousRow?.[previousRow.length - 1] ?? null
     } else {
+      // Single-row rail: modulo wrap
       target = row[row.length - 1]
     }
   } else if (direction === 'ArrowUp' || direction === 'ArrowDown') {
     const nextRow = rows[rowIndex + (direction === 'ArrowUp' ? -1 : 1)]
-    target = nextRow ? closestColumn(nextRow, origin) : null
+    target = nextRow ? closestColumn(nextRow, origin, preferredCenterX) : null
 
     if (!target) {
+      // Leaving the zone — do NOT use preferredCenterX across zone boundaries
       const nextZone = adjacentZone(zones, originZone, direction)
       target = nextZone ? closestColumn(boundaryRow(nextZone, direction), origin) : null
     }

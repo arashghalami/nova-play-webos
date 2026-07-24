@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   clampSeekPosition,
+  hasAdvancedPlaybackTimeline,
   hasVerifiedVideoFrame,
+  hasVisibleVideoTrack,
   isDoubleSeekTap,
   SEEK_DOUBLE_TAP_WINDOW_MS,
   seekFeedbackLabel,
@@ -39,6 +41,19 @@ describe('player transport behavior', () => {
     expect(hasVerifiedVideoFrame(1920, 1080, 0, 0, 1)).toBe(false)
     expect(hasVerifiedVideoFrame(0, 1080, 4, 0, 1)).toBe(false)
     expect(hasVerifiedVideoFrame(1920, 1080, 4, 0, 1)).toBe(true)
+  })
+
+  it('accepts an advancing, dimensioned video track when webOS does not expose frame counters', () => {
+    expect(hasVisibleVideoTrack(1920, 1080, 1)).toBe(true)
+    expect(hasVisibleVideoTrack(1920, 1080, 0.5)).toBe(false)
+    expect(hasVisibleVideoTrack(0, 1080, 5)).toBe(false)
+    expect(hasVisibleVideoTrack(1920, 0, 5)).toBe(false)
+  })
+
+  it('keeps playback alive when webOS exposes only an advancing timeline', () => {
+    expect(hasAdvancedPlaybackTimeline(1)).toBe(true)
+    expect(hasAdvancedPlaybackTimeline(0.5)).toBe(false)
+    expect(hasAdvancedPlaybackTimeline(0)).toBe(false)
   })
 
   it('provides conventional directional seek feedback', () => {

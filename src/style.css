@@ -249,6 +249,7 @@ h2 {
   border-radius: 1.1rem;
   text-align: left;
   transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+  scroll-margin-block: 3.5rem;
 }
 
 .hub-card.live {
@@ -386,6 +387,7 @@ h2 {
   border-radius: 0.85rem;
   font-weight: 750;
   text-align: left;
+  scroll-margin-block: 3.5rem;
 }
 
 .category-card:hover,
@@ -453,6 +455,7 @@ h2 {
   border-radius: 0.85rem;
   text-align: left;
   transition: transform 160ms ease, border-color 160ms ease;
+  scroll-margin-block: 3.5rem;
 }
 
 .media-select:hover,
@@ -649,6 +652,7 @@ h2 {
 }
 
 .media-name,
+.media-subtitle,
 .media-meta {
   display: block;
   overflow: hidden;
@@ -659,6 +663,12 @@ h2 {
 .media-name {
   font-size: 0.95rem;
   font-weight: 700;
+}
+
+.media-subtitle {
+  margin-top: 0.18rem;
+  color: #d5e8f8;
+  font-size: 0.82rem;
 }
 
 .media-meta {
@@ -776,10 +786,58 @@ h2 {
   color: #76e3ff;
 }
 
+.episodes-heading {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.episodes-heading h2 {
+  margin: 0;
+}
+
+.episode-summary,
+.resume-detail-status {
+  margin: 0;
+  color: #9db9d5;
+  font-size: 0.88rem;
+}
+
+.resume-detail-status {
+  margin-top: 1.2rem;
+  color: #7ddfff;
+  font-weight: 700;
+}
+
+.resume-detail-status.is-watched {
+  color: #7ff0b0;
+}
+
+.resume-detail-progress {
+  width: min(22rem, 100%);
+  height: 0.28rem;
+  display: block;
+  margin-top: 0.55rem;
+  overflow: hidden;
+  background: rgb(182 221 255 / 18%);
+  border-radius: 999px;
+}
+
+.resume-detail-progress::after {
+  width: var(--resume-progress);
+  height: 100%;
+  display: block;
+  background: linear-gradient(90deg, #5bdbff, #6e9dff);
+  border-radius: inherit;
+  content: '';
+}
+
 .episode {
   width: 100%;
   display: grid;
-  grid-template-columns: 2rem minmax(12rem, 24rem) 1fr;
+  grid-template-columns: 2rem minmax(0, 1fr);
   gap: 0.75rem;
   align-items: center;
   padding: 0.9rem;
@@ -789,9 +847,60 @@ h2 {
   text-align: left;
 }
 
+.episode.is-watched {
+  color: #a6eec5;
+}
+
+.episode-indicator {
+  display: grid;
+  place-content: center;
+  font-weight: 900;
+}
+
+.episode-copy {
+  min-width: 0;
+  display: grid;
+  gap: 0.28rem;
+}
+
+.episode-copy strong,
+.episode-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.episode-copy strong {
+  font-size: 0.97rem;
+}
+
+.episode-number {
+  margin-right: 0.55rem;
+  color: #77e1ff;
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+}
+
 .episode small,
 .program small {
   color: #a7bfd8;
+}
+
+.episode-progress {
+  width: 100%;
+  height: 0.22rem;
+  overflow: hidden;
+  background: rgb(182 221 255 / 18%);
+  border-radius: 999px;
+}
+
+.episode-progress::after {
+  width: var(--resume-progress);
+  height: 100%;
+  display: block;
+  background: linear-gradient(90deg, #5bdbff, #6e9dff);
+  border-radius: inherit;
+  content: '';
 }
 
 .episode:hover,

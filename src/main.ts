@@ -45,9 +45,12 @@ import {
   type NavigationDirection,
   type NavigationItem,
 } from './navigation'
+import { isRemoteBack, remoteDirection } from './remote-input'
 import {
   clampSeekPosition,
+  hasAdvancedPlaybackTimeline,
   hasVerifiedVideoFrame,
+  hasVisibleVideoTrack,
   isDoubleSeekTap,
   seekFeedbackLabel,
   seekStepForHold,
@@ -116,9 +119,26 @@ type AppHistoryState = {
   depth: number
 }
 
+type GlobalSearchPhase = 'idle' | 'debouncing' | 'searching' | 'completed' | 'cancelled'
+
+type GlobalSearchSession = {
+  id: number
+  query: string
+  controller: AbortController
+  phase: GlobalSearchPhase
+  dirtySections: Set<LibrarySection>
+  renderTimer: number | null
+}
+
+type GlobalSearchViewUpdate = {
+  controls?: boolean
+  fullResults?: boolean
+  sections?: Iterable<LibrarySection>
+}
+
 type PlayerUiMode = 'immersive' | 'overlay' | 'focused' | 'seeking'
 const CATALOG_PAGE_SIZE = 60
-const SEARCH_DEBOUNCE_MS = 180
+const SEARCH_DEBOUNCE_MS = 240
 const NUMERIC_CHANNEL_TIMEOUT_MS = 1600
 const NOW_NEXT_CONCURRENCY = 4
 const MAX_KNOWN_STREAMS = 5_000
@@ -127,6 +147,8 @@ const MAX_CACHED_STREAM_ITEMS = 12_000
 const STREAM_CACHE_TTL_MS = 15 * 60_000
 const GLOBAL_SEARCH_SECTION_RESULT_LIMIT = 60
 const GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT = 12
+const GLOBAL_SEARCH_RENDER_INTERVAL_MS = 80
+const GLOBAL_SEARCH_WORK_SLICE_MS = 8
 const MIN_GLOBAL_SEARCH_LENGTH = 1
 const MAX_NOW_NEXT_ENTRIES = 600
 const PLAYBACK_ATTEMPT_TIMEOUT_MS = 12_000
@@ -154,7 +176,6 @@ const labels: Record<LibrarySection, string> = {
   series: 'Series',
 }
 const GLOBAL_SEARCH_SECTIONS: LibrarySection[] = ['live', 'vod', 'series']
-const GLOBAL_SEARCH_EXECUTION_SECTIONS: LibrarySection[] = ['series', 'live', 'vod']
 
 const appElement = document.querySelector<HTMLDivElement>('#app')
 
@@ -189,6 +210,8 @@ let playerControlsTimer: number | null = null
 let playerCleanup: (() => void) | null = null
 let searchDebounceTimer: number | null = null
 let globalSearchDebounceTimer: number | null = null
+let globalSearchSequence = 0
+let globalSearchSession: GlobalSearchSession | null = null
 let numericChannelTimer: number | null = null
 let numericChannelBuffer = ''
 let activeHls: Hls | null = null
@@ -226,7 +249,10 @@ let catalogReturnPoint: CatalogReturnPoint | null = null
 let playerReturnPoint: ViewReturnPoint | null = null
 let editingInput: HTMLInputElement | HTMLTextAreaElement | null = null
 let lastZoneTransition: ZoneTransition | null = null
+let stickyColumnX: number | null = null
+let stickyColumnZone: string | null = null
 let appHistoryDepth = 0
+let retainSearchOnNextPopState = false
 const expandedGlobalSearchSections = new Set<LibrarySection>()
 let favorites = profile ? loadFavorites(profile.id) : new Map()
 let resumeEntries = profile ? loadResume(profile.id) : new Map<string, ResumeEntry>()
@@ -236,6 +262,10 @@ const sectionCategories = new Map<LibrarySection, Category[]>()
 const adultCategoryIds = new Map<LibrarySection, Set<string>>()
 const nowNextCache = new Map<string, NowNext>()
 const nowNextLoading = new Set<string>()
+
+if (profile && repairResumeEpisodeContexts()) {
+  saveResume(profile.id, resumeEntries)
+}
 
 const escape = (value: string): string =>
   value.replace(ESCAPE_PATTERN, (character) => ESCAPED_CHARACTERS[character])
@@ -360,6 +390,140 @@ function visibleStream(stream: StreamItem): boolean {
 
 function streamLookupKey(stream: StreamItem): string {
   return favoriteKey(stream)
+}
+
+function episodeIdentifier(stream: StreamItem): string {
+  const season = stream.season?.trim()
+  const episode = stream.episodeNumber?.trim()
+
+  if (season && episode) {
+    return `S${season.padStart(2, '0')} E${episode.padStart(2, '0')}`
+  }
+
+  if (episode) {
+    return `Episode ${episode}`
+  }
+
+  return season ? `Season ${season}` : 'Episode'
+}
+
+function streamDisplayTitle(stream: StreamItem): string {
+  return stream.streamType === 'episode' && stream.seriesTitle
+    ? `${stream.seriesTitle} · ${episodeIdentifier(stream)}`
+    : stream.name
+}
+
+function streamDisplaySubtitle(stream: StreamItem): string {
+  return stream.streamType === 'episode' && stream.seriesTitle
+    ? stream.name
+    : ''
+}
+
+function normalizedSeriesName(stream: StreamItem): string {
+  const title = (stream.seriesTitle || stream.name)
+    .replace(/^\s*[a-z]{2,4}\s*(?:[-|]\s*)?/i, '')
+    .replace(/\s*(?:[-·|]\s*)?s\d{1,2}\s*e\d{1,3}.*$/i, '')
+    .replace(/\s*\(\d{4}\)\s*/g, ' ')
+    .toLocaleLowerCase()
+
+  return title.replace(/[^a-z0-9]+/g, ' ').trim()
+}
+
+/**
+ * Historic resume records were written before episodes retained their parent
+ * series data. Reuse the known poster/series ID from another saved episode of
+ * the same show so the home rail repairs itself without losing progress.
+ */
+function repairResumeEpisodeContexts(): boolean {
+  const donors = new Map<string, StreamItem>()
+
+  resumeEntries.forEach((entry) => {
+    const stream = entry.stream
+
+    if (!stream || stream.streamType !== 'episode') {
+      return
+    }
+
+    const key = normalizedSeriesName(stream)
+    const current = donors.get(key)
+    const streamScore =
+      (stream.seriesCover ? 4 : 0) +
+      (stream.seriesId ? 2 : 0) +
+      (stream.seriesTitle ? 1 : 0) +
+      (stream.cover ? 1 : 0)
+    const currentScore = current
+      ? (current.seriesCover ? 4 : 0) +
+        (current.seriesId ? 2 : 0) +
+        (current.seriesTitle ? 1 : 0) +
+        (current.cover ? 1 : 0)
+      : -1
+
+    if (streamScore > currentScore) {
+      donors.set(key, stream)
+    }
+  })
+
+  let changed = false
+
+  resumeEntries.forEach((entry, key) => {
+    const stream = entry.stream
+
+    if (!stream || stream.streamType !== 'episode') {
+      return
+    }
+
+    const donor = donors.get(normalizedSeriesName(stream))
+
+    if (!donor) {
+      return
+    }
+
+    const seriesCover = stream.seriesCover || donor.seriesCover || donor.cover
+    const seriesId = stream.seriesId || donor.seriesId
+    const seriesTitle = stream.seriesTitle || donor.seriesTitle
+
+    if (
+      seriesCover === stream.seriesCover &&
+      seriesId === stream.seriesId &&
+      seriesTitle === stream.seriesTitle
+    ) {
+      return
+    }
+
+    resumeEntries.set(key, {
+      ...entry,
+      stream: {
+        ...stream,
+        cover: seriesCover || stream.cover,
+        seriesCover,
+        seriesId,
+        seriesTitle,
+      },
+    })
+    changed = true
+  })
+
+  return changed
+}
+
+function resumeDuration(entry: ResumeEntry, stream: StreamItem): number | undefined {
+  const duration = entry.duration ?? stream.metadata?.durationSeconds
+
+  return typeof duration === 'number' && Number.isFinite(duration) && duration > 0
+    ? duration
+    : undefined
+}
+
+function resumeLabel(entry: ResumeEntry, stream: StreamItem): string {
+  if (entry.completed) {
+    return 'Watched'
+  }
+
+  const duration = resumeDuration(entry, stream)
+
+  return duration
+    ? `Resume ${formatDuration(entry.position)} of ${formatDuration(duration)}`
+    : `Resume ${formatDuration(entry.position)}`
 }
 
 function rememberStreams(streams: StreamItem[]): void {
@@ -507,7 +671,26 @@ function pushRouteHistory(): void {
   }
 }
 
+function armSearchBackCancellation(): void {
+  // Some webOS remotes emit both a key event and a delayed browser-history
+  // event for one physical Back press. Keep this marker until that history
+  // event is consumed; a subsequent Back clears it before navigating away.
+  retainSearchOnNextPopState = true
+}
+
+function retainSearchRouteAfterPopState(): void {
+  retainSearchOnNextPopState = false
+  pushAppHistory()
+  document.querySelector<HTMLInputElement>('#global-search-input')?.focus({
+    preventScroll: true,
+  })
+}
+
 function startNavigation(): { token: number; signal: AbortSignal } {
+  if (view === 'search') {
+    stopGlobalSearchWork()
+  }
+
   navigationToken += 1
   navigationController?.abort()
   nowNextPrefetchController?.abort()
@@ -1137,7 +1320,13 @@ function liveArtwork(stream: StreamItem): string {
 }
 
 function posterArtwork(stream: StreamItem): string {
-  const source = stream.cover ?? stream.metadata?.cover ?? stream.icon
+  // Providers often return a truthy but unusable episode-art URL. Episodes are
+  // intentionally represented by their parent-series poster, which is the
+  // consistent artwork shown in the series catalog and detail view.
+  const source =
+    stream.streamType === 'episode'
+      ? stream.seriesCover || stream.cover || stream.metadata?.cover || stream.icon
+      : stream.cover || stream.metadata?.cover || stream.seriesCover || stream.icon
 
   if (!source) {
     return imageOrPlaceholder(undefined, stream.name, 'poster')
@@ -1158,23 +1347,23 @@ function streamCard(stream: StreamItem, resume?: ResumeEntry): string {
   const storedResume = resume ?? resumeEntries.get(streamKey)
   const image = isLive ? liveArtwork(stream) : posterArtwork(stream)
   const nowNext = nowNextCache.get(streamKey)
+  const subtitle = streamDisplaySubtitle(stream)
   const meta = isLive
     ? nowNext?.now
       ? `Now: ${nowNext.now.title}`
       : 'Live · loading now/next…'
-    : storedResume?.completed
-      ? 'Watched'
-      : storedResume
-        ? `Resume ${formatDuration(storedResume.position)}`
-        : stream.rating ?? stream.year ?? 'On demand'
+    : storedResume
+      ? resumeLabel(storedResume, stream)
+      : stream.rating ?? stream.year ?? 'On demand'
 
   return `
     <article class="media-card ${isLive ? 'is-live' : ''} ${storedResume?.completed ? 'is-watched' : ''}">
       ${cardRating(stream)}
-      <button class="media-select" data-action="select-stream" data-stream-key="${escape(streamKey)}" data-resume-card="${storedResume ? 'true' : 'false'}" data-focus-id="stream-${escape(streamKey)}">
+      <button class="media-select" data-action="select-stream" data-stream-key="${escape(streamKey)}" data-resume-card="${storedResume && !storedResume.completed ? 'true' : 'false'}" data-focus-id="stream-${escape(streamKey)}">
         <span class="artwork ${isLive ? 'live-artwork' : ''}">${image}</span>
         <span class="media-info">
-          <span class="media-name">${escape(stream.name)}</span>
+          <span class="media-name">${escape(streamDisplayTitle(stream))}</span>
+          ${subtitle ? `<span class="media-subtitle">${escape(subtitle)}</span>` : ''}
           <span class="media-meta" data-now-next-key="${escape(streamKey)}">${escape(meta)}</span>
           ${
             storedResume && !storedResume.completed
@@ -1189,9 +1378,9 @@ function streamCard(stream: StreamItem, resume?: ResumeEntry): string {
 }
 
 function resumePercent(entry: ResumeEntry, stream: StreamItem): number {
-  const duration = stream.metadata?.durationSeconds
+  const duration = resumeDuration(entry, stream)
 
-  if (!duration || duration <= 0) {
+  if (!duration) {
     return 20
   }
 
@@ -1274,6 +1463,15 @@ function detailActions(item: StreamItem, metadata: RichMetadata): string {
   const canCatchup = item.section === 'live' && item.catchup?.available
 
   return `
+    ${
+      resume && item.section !== 'live'
+        ? `<p class="resume-detail-status ${resume.completed ? 'is-watched' : ''}">${escape(resumeLabel(resume, item))}</p>${
+            !resume.completed
+              ? `<span class="resume-detail-progress" style="--resume-progress:${resumePercent(resume, item)}%"></span>`
+              : ''
+          }`
+        : ''
+    }
     <div class="action-row">
       <button class="primary-button" data-action="play-selected" data-focus-id="detail-play">▶ ${item.section === 'live' ? 'Watch live' : resume && !resume.completed ? 'Resume' : 'Play'}</button>
       <button class="secondary-button" data-action="toggle-favorite" data-favorite-key="${escape(streamKey)}" data-favorite-style="label" data-focus-id="detail-favorite">${hasFavorite(favorites, item) ? '★ Saved' : '☆ Add favorite'}</button>
@@ -1285,12 +1483,24 @@ function detailActions(item: StreamItem, metadata: RichMetadata): string {
   `
 }
 
+function seriesProgressSummary(episodes: StreamItem[]): string {
+  const entries = episodes
+    .map((episode) => resumeEntries.get(streamLookupKey(episode)))
+    .filter((entry): entry is ResumeEntry => Boolean(entry))
+  const watched = entries.filter((entry) => entry.completed).length
+  const inProgress = entries.filter((entry) => !entry.completed && entry.position > 0).length
+  const total = episodes.length
+
+  return `<p class="episode-summary">${watched} of ${total} watched${inProgress ? ` · ${inProgress} in progress` : ''}</p>`
+}
+
 function renderEpisodeList(): string {
   if (!selectedSeries) {
     return ''
   }
 
   const seasons = Object.entries(selectedSeries.episodes)
+  const allEpisodes = seasons.flatMap(([, episodes]) => episodes)
 
   if (!seasons.length) {
     return '<section class="empty-state"><h2>No episodes available</h2><p>The provider did not return episode information for this series.</p></section>'
@@ -1298,7 +1508,7 @@ function renderEpisodeList(): string {
 
   return `
     <section class="episodes">
-      <h2>Episodes</h2>
+      <div class="episodes-heading"><h2>Episodes</h2>${seriesProgressSummary(allEpisodes)}</div>
       ${seasons
         .map(
           ([season, episodes]) => `
@@ -1306,9 +1516,22 @@ function renderEpisodeList(): string {
             ${episodes
               .map((episode) => {
                 const entry = resumeEntries.get(streamLookupKey(episode))
+                const status = entry
+                  ? resumeLabel(entry, episode)
+                  : 'Not watched'
+                const progress =
+                  entry && !entry.completed
+                    ? `<span class="episode-progress" style="--resume-progress:${resumePercent(entry, episode)}%"></span>`
+                    : ''
+
                 return `
                   <button class="episode ${entry?.completed ? 'is-watched' : ''}" data-action="play-episode" data-stream-key="${escape(streamLookupKey(episode))}" data-focus-id="episode-${escape(streamLookupKey(episode))}">
-                    <span>${entry?.completed ? '✓' : '▶'}</span><span>${escape(episode.name)}</span><small>${escape(episode.plot ?? '')}</small>
+                    <span class="episode-indicator" aria-hidden="true">${entry?.completed ? '✓' : '▶'}</span>
+                    <span class="episode-copy">
+                      <strong><span class="episode-number">${escape(episodeIdentifier(episode))}</span>${escape(episode.name)}</strong>
+                      <small>${escape(status)}${episode.plot ? ` · ${escape(episode.plot)}` : ''}</small>
+                      ${progress}
+                    </span>
                   </button>`
               })
               .join('')}
@@ -1351,51 +1574,65 @@ function renderGuide(): void {
   prefetchNowNext(guideStreams)
 }
 
-function renderGlobalSearchSection(section: LibrarySection): string {
-  const results = globalSearchResults.filter((stream) => stream.section === section)
+function globalSearchResultsForSection(section: LibrarySection): StreamItem[] {
+  return globalSearchResults.filter((stream) => stream.section === section)
+}
+
+function globalSearchResultNoun(section: LibrarySection, count: number): string {
+  if (section === 'live') {
+    return count === 1 ? 'channel' : 'channels'
+  }
+
+  if (section === 'vod') {
+    return count === 1 ? 'movie' : 'movies'
+  }
+
+  return count === 1 ? 'series' : 'series'
+}
+
+function globalSearchCard(stream: StreamItem): string {
+  const key = streamLookupKey(stream)
+  return `<div data-global-search-card-key="${escape(key)}">${streamCard(stream)}</div>`
+}
+
+function globalSearchSectionContent(section: LibrarySection): string {
+  const results = globalSearchResultsForSection(section)
   const expanded = expandedGlobalSearchSections.has(section)
   const visibleResults = expanded
     ? results
     : results.slice(0, GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT)
   const hiddenCount = Math.max(0, results.length - visibleResults.length)
   const hasMore = results.length > GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT
-  const noun =
-    section === 'live'
-      ? results.length === 1
-        ? 'channel'
-        : 'channels'
-      : section === 'vod'
-        ? results.length === 1
-          ? 'movie'
-          : 'movies'
-        : results.length === 1
-          ? 'series'
-          : 'series'
+  const noun = globalSearchResultNoun(section, results.length)
 
   return `
-    <section class="global-search-group" aria-label="${labels[section]} results">
-      <div class="global-search-group-heading">
-        <div class="global-search-group-title">
-          <h2>${escape(labels[section])}</h2>
-          <span class="global-search-count" aria-label="${results.length} ${noun} found">
-            <strong>${results.length}</strong><span>results</span>
-          </span>
-        </div>
-        ${
-          hasMore
-            ? `<button class="secondary-button global-search-toggle" data-action="toggle-global-search-section" data-section="${section}" data-focus-id="global-search-toggle-${section}" aria-expanded="${expanded}">
-                ${expanded ? 'Show less' : `Show ${hiddenCount} more`}
-              </button>`
-            : ''
-        }
+    <div class="global-search-group-heading">
+      <div class="global-search-group-title">
+        <h2>${escape(labels[section])}</h2>
+        <span id="global-search-count-${section}" class="global-search-count" aria-label="${results.length} ${noun} found">
+          <strong>${results.length}</strong><span>results</span>
+        </span>
       </div>
+      <button id="global-search-toggle-${section}" class="secondary-button global-search-toggle" data-action="toggle-global-search-section" data-section="${section}" data-focus-id="global-search-toggle-${section}" aria-expanded="${expanded}" ${hasMore ? '' : 'hidden disabled'}>
+        ${expanded ? 'Show less' : `Show ${hiddenCount} more`}
+      </button>
+    </div>
+    <div id="global-search-content-${section}" data-global-search-content="${section}" class="${visibleResults.length ? 'content-grid' : 'global-search-empty'}">
       ${
         visibleResults.length
-          ? `<div class="content-grid">${visibleResults.map((stream) => streamCard(stream)).join('')}</div>`
+          ? visibleResults.map(globalSearchCard).join('')
           : globalSearchLoading
-            ? '<div class="global-search-empty"><div class="spinner"></div><span>Looking in this library…</span></div>'
-            : '<div class="global-search-empty">No results</div>'
+            ? '<div class="spinner"></div><span>Looking in this library…</span>'
+            : 'No results'
       }
+    </div>
+  `
+}
+
+function renderGlobalSearchSection(section: LibrarySection): string {
+  return `
+    <section class="global-search-group" data-global-search-section="${section}" aria-label="${labels[section]} results">
+      ${globalSearchSectionContent(section)}
     </section>
   `
 }
@@ -1408,106 +1645,262 @@ function renderGlobalSearchResults(): string {
   return GLOBAL_SEARCH_SECTIONS.map(renderGlobalSearchSection).join('')
 }
 
-function globalSearchControls(): string {
+function globalSearchControlsContent(): string {
   return `
-    <div id="global-search-controls" class="global-search-controls">
-      ${globalSearchQuery ? '<button class="secondary-button" data-action="clear-global-search" data-focus-id="global-search-clear">Clear</button>' : ''}
-      ${globalSearchLoading ? '<button class="secondary-button" data-action="cancel-global-search" data-focus-id="global-search-cancel">Cancel</button>' : ''}
-      <button class="primary-button" data-action="run-global-search" data-focus-id="global-search-run">Search</button>
-    </div>
+    ${globalSearchQuery ? '<button class="secondary-button" data-action="clear-global-search" data-focus-id="global-search-clear">Clear</button>' : ''}
+    ${globalSearchLoading ? '<button class="secondary-button" data-action="cancel-global-search" data-focus-id="global-search-cancel">Cancel</button>' : ''}
+    <button class="primary-button" data-action="run-global-search" data-focus-id="global-search-run">Search</button>
   `
 }
 
-function updateGlobalSearchView(): void {
+function globalSearchControls(): string {
+  return `<div id="global-search-controls" class="global-search-controls">${globalSearchControlsContent()}</div>`
+}
+
+function visibleGlobalSearchResults(section: LibrarySection): StreamItem[] {
+  const results = globalSearchResultsForSection(section)
+  return expandedGlobalSearchSections.has(section)
+    ? results
+    : results.slice(0, GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT)
+}
+
+function updateGlobalSearchSection(section: LibrarySection): void {
+  const group = document.querySelector<HTMLElement>(
+    `[data-global-search-section="${section}"]`,
+  )
+
+  if (!group) {
+    return
+  }
+
+  const results = globalSearchResultsForSection(section)
+  const visibleResults = visibleGlobalSearchResults(section)
+  const count = group.querySelector<HTMLElement>(`#global-search-count-${section}`)
+  const toggle = group.querySelector<HTMLButtonElement>(`#global-search-toggle-${section}`)
+  const content = group.querySelector<HTMLElement>(`#global-search-content-${section}`)
+  const noun = globalSearchResultNoun(section, results.length)
+  const hasMore = results.length > GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT
+  const expanded = expandedGlobalSearchSections.has(section)
+
+  if (count) {
+    count.setAttribute('aria-label', `${results.length} ${noun} found`)
+    count.innerHTML = `<strong>${results.length}</strong><span>results</span>`
+  }
+
+  if (toggle) {
+    toggle.hidden = !hasMore
+    toggle.disabled = !hasMore
+    toggle.setAttribute('aria-expanded', String(expanded))
+    toggle.textContent = expanded
+      ? 'Show less'
+      : `Show ${Math.max(0, results.length - visibleResults.length)} more`
+  }
+
+  if (!content) {
+    return
+  }
+
+  if (!visibleResults.length) {
+    content.className = 'global-search-empty'
+    content.textContent = ''
+
+    if (globalSearchLoading) {
+      content.innerHTML = '<div class="spinner"></div><span>Looking in this library…</span>'
+    } else {
+      content.textContent = 'No results'
+    }
+    return
+  }
+
+  if (!content.classList.contains('content-grid')) {
+    content.className = 'content-grid'
+    content.textContent = ''
+  }
+
+  const expectedKeys = new Set(visibleResults.map(streamLookupKey))
+
+  content
+    .querySelectorAll<HTMLElement>('[data-global-search-card-key]')
+    .forEach((card) => {
+      if (!expectedKeys.has(card.dataset.globalSearchCardKey ?? '')) {
+        card.remove()
+      }
+    })
+
+  for (const stream of visibleResults) {
+    const key = streamLookupKey(stream)
+    const existing = content.querySelector<HTMLElement>(
+      `[data-global-search-card-key="${cssEscape(key)}"]`,
+    )
+
+    if (!existing) {
+      content.insertAdjacentHTML(
+        'beforeend',
+        globalSearchCard(stream),
+      )
+    }
+  }
+}
+
+function updateGlobalSearchView(update: GlobalSearchViewUpdate = {}): void {
   const status = document.querySelector<HTMLElement>('#global-search-status')
   const controls = document.querySelector<HTMLElement>('#global-search-controls')
   const results = document.querySelector<HTMLElement>('#global-search-results')
-  const active = document.activeElement
-  const activeFocusId =
-    active instanceof HTMLElement ? active.dataset.focusId ?? null : null
-  const scrollY = window.scrollY
+  const fullResults = update.fullResults ?? true
+  const updateControls = update.controls ?? fullResults
 
   if (status) {
     status.textContent = globalSearchStatus
     status.hidden = !globalSearchStatus
   }
 
-  if (controls) {
-    controls.outerHTML = globalSearchControls()
+  if (controls && updateControls) {
+    controls.innerHTML = globalSearchControlsContent()
   }
 
   if (!results) {
     return
   }
 
-  results.innerHTML = renderGlobalSearchResults()
-  bindEvents()
-
-  if (activeFocusId) {
-    window.setTimeout(() => {
-      const replacement = document.querySelector<HTMLElement>(
-        `[data-focus-id="${cssEscape(activeFocusId)}"]`,
-      )
-
-      if (replacement) {
-        replacement.focus({ preventScroll: true })
-        window.scrollTo(0, scrollY)
-      }
-    }, 0)
+  if (fullResults) {
+    results.innerHTML = renderGlobalSearchResults()
+    bindEvents()
+    return
   }
+
+  const sections = update.sections ?? []
+
+  for (const section of sections) {
+    updateGlobalSearchSection(section)
+  }
+
+  // Search cards use delegated actions and already provide stable focus IDs.
+  // Avoid re-scanning every button/image for each incremental result commit.
+  assignNavigationZones()
+  invalidateSpatialLayout()
+}
+
+function globalSearchIsActive(): boolean {
+  return (
+    globalSearchSession?.phase === 'debouncing' ||
+    globalSearchSession?.phase === 'searching'
+  )
+}
+
+function isCurrentGlobalSearchSession(session: GlobalSearchSession): boolean {
+  return (
+    globalSearchSession === session &&
+    view === 'search' &&
+    !session.controller.signal.aborted &&
+    (session.phase === 'debouncing' || session.phase === 'searching')
+  )
+}
+
+function stopGlobalSearchWork(): void {
+  if (globalSearchDebounceTimer !== null) {
+    window.clearTimeout(globalSearchDebounceTimer)
+    globalSearchDebounceTimer = null
+  }
+
+  const session = globalSearchSession
+
+  if (!session) {
+    return
+  }
+
+  if (session.renderTimer !== null) {
+    window.clearTimeout(session.renderTimer)
+    session.renderTimer = null
+  }
+
+  session.controller.abort()
+}
+
+function startGlobalSearchSession(query: string, phase: GlobalSearchPhase): GlobalSearchSession {
+  stopGlobalSearchWork()
+  const session: GlobalSearchSession = {
+    id: globalSearchSequence + 1,
+    query,
+    controller: new AbortController(),
+    phase,
+    dirtySections: new Set(),
+    renderTimer: null,
+  }
+  globalSearchSequence = session.id
+  globalSearchSession = session
+  return session
+}
+
+function scheduleGlobalSearchRender(
+  session: GlobalSearchSession,
+  sections: Iterable<LibrarySection>,
+): void {
+  if (!isCurrentGlobalSearchSession(session)) {
+    return
+  }
+
+  for (const section of sections) {
+    session.dirtySections.add(section)
+  }
+
+  if (session.renderTimer !== null) {
+    return
+  }
+
+  session.renderTimer = window.setTimeout(() => {
+    session.renderTimer = null
+
+    if (!isCurrentGlobalSearchSession(session) || !session.dirtySections.size) {
+      return
+    }
+
+    const dirtySections = [...session.dirtySections]
+    session.dirtySections.clear()
+    updateGlobalSearchView({ controls: false, fullResults: false, sections: dirtySections })
+  }, GLOBAL_SEARCH_RENDER_INTERVAL_MS)
 }
 
 function clearGlobalSearch(): void {
   const input = document.querySelector<HTMLInputElement>('#global-search-input')
+
+  stopGlobalSearchWork()
+  globalSearchSession = null
 
   if (input) {
     input.value = ''
     input.setSelectionRange(0, 0)
   }
 
-  if (globalSearchDebounceTimer !== null) {
-    window.clearTimeout(globalSearchDebounceTimer)
-    globalSearchDebounceTimer = null
-  }
-
-  startNavigation()
   globalSearchQuery = ''
   globalSearchResults = []
   globalSearchLoading = false
   globalSearchStatus = ''
   expandedGlobalSearchSections.clear()
-  updateGlobalSearchView()
-
-  window.setTimeout(() => {
-    document.querySelector<HTMLInputElement>('#global-search-input')?.focus()
-  }, 0)
+  updateGlobalSearchView({ controls: true, fullResults: true })
+  input?.focus({ preventScroll: true })
 }
 
-function cancelGlobalSearch(): void {
-  if (!globalSearchLoading) {
-    return
+function cancelGlobalSearch(): boolean {
+  const session = globalSearchSession
+
+  if (!session || !globalSearchIsActive()) {
+    return false
   }
 
-  if (globalSearchDebounceTimer !== null) {
-    window.clearTimeout(globalSearchDebounceTimer)
-    globalSearchDebounceTimer = null
-  }
-
-  startNavigation()
+  stopGlobalSearchWork()
+  session.phase = 'cancelled'
   globalSearchLoading = false
   globalSearchStatus = globalSearchResults.length
-    ? `${globalSearchResults.length} results`
+    ? `${globalSearchResults.length} results · Search stopped`
     : 'Search stopped'
-  updateGlobalSearchView()
+  updateGlobalSearchView({ controls: true, fullResults: false, sections: GLOBAL_SEARCH_SECTIONS })
+  document.querySelector<HTMLInputElement>('#global-search-input')?.focus({ preventScroll: true })
+  return true
 }
 
 function leaveGlobalSearch(): void {
-  if (globalSearchDebounceTimer !== null) {
-    window.clearTimeout(globalSearchDebounceTimer)
-    globalSearchDebounceTimer = null
-  }
-
-  startNavigation()
+  stopGlobalSearchWork()
+  globalSearchSession = null
   globalSearchQuery = ''
   globalSearchResults = []
   globalSearchLoading = false
@@ -1526,6 +1919,39 @@ function leaveGlobalSearch(): void {
   render()
 }
 
+function scheduleGlobalSearch(query: string): void {
+  const normalizedQuery = query.trim()
+  globalSearchQuery = query
+  expandedGlobalSearchSections.clear()
+
+  if (normalizedQuery.length < MIN_GLOBAL_SEARCH_LENGTH) {
+    stopGlobalSearchWork()
+    globalSearchSession = null
+    globalSearchResults = []
+    globalSearchLoading = false
+    globalSearchStatus = ''
+    updateGlobalSearchView({ controls: true, fullResults: true })
+    return
+  }
+
+  const session = startGlobalSearchSession(normalizedQuery, 'debouncing')
+  globalSearchResults = []
+  globalSearchLoading = true
+  globalSearchStatus = 'Searching…'
+  updateGlobalSearchView({ controls: true, fullResults: true })
+
+  globalSearchDebounceTimer = window.setTimeout(() => {
+    globalSearchDebounceTimer = null
+
+    if (!isCurrentGlobalSearchSession(session)) {
+      return
+    }
+
+    session.phase = 'searching'
+    void runGlobalSearch(session)
+  }, SEARCH_DEBOUNCE_MS)
+}
+
 function renderGlobalSearch(): void {
   renderShell(`
     <section class="catalog-heading">
@@ -1541,32 +1967,7 @@ function renderGlobalSearch(): void {
 
   const input = document.querySelector<HTMLInputElement>('#global-search-input')
   input?.addEventListener('input', () => {
-    globalSearchQuery = input.value
-
-    if (globalSearchDebounceTimer !== null) {
-      window.clearTimeout(globalSearchDebounceTimer)
-    }
-
-    startNavigation()
-    globalSearchResults = []
-    globalSearchLoading = globalSearchQuery.trim().length >= MIN_GLOBAL_SEARCH_LENGTH
-    globalSearchStatus = globalSearchLoading ? 'Searching…' : ''
-    expandedGlobalSearchSections.clear()
-    updateGlobalSearchView()
-
-    globalSearchDebounceTimer = window.setTimeout(() => {
-      globalSearchDebounceTimer = null
-
-      if (view !== 'search') {
-        return
-      }
-
-      if (globalSearchQuery.trim().length < MIN_GLOBAL_SEARCH_LENGTH) {
-        return
-      }
-
-      void runGlobalSearch(globalSearchQuery)
-    }, SEARCH_DEBOUNCE_MS)
+    scheduleGlobalSearch(input.value)
   })
 }
 
@@ -1648,7 +2049,7 @@ function renderPlayer(): void {
       <div id="player-controls" class="player-controls ${playerControlsClass}">
         <button class="icon-button player-back" data-action="close-player" data-focus-id="player-close" aria-label="Close player">←</button>
         ${playerNavigationControls}
-        <div class="player-title"><span>${escape(isLive ? 'LIVE' : 'PLAYING')}</span>${escape(item.name)}</div>
+        <div class="player-title"><span>${escape(isLive ? 'LIVE' : 'PLAYING')}</span>${escape(streamDisplayTitle(item))}</div>
         <div class="player-spacer"></div>
         <button class="icon-button" data-action="toggle-mute" data-focus-id="player-mute" aria-label="Mute or unmute">${playerMuted ? '🔇' : '🔊'}</button>
         ${playerUtilityControls}
@@ -1703,9 +2104,9 @@ function renderPlayer(): void {
   const playerCurrentTime = currentTime
   const playerDuration = duration
   let lastResumeSaveAt = 0
-  let videoDecodeWatchdog: number | null = null
   let playbackWatchdog: number | null = null
   let visiblePlaybackConfirmed = false
+  let resumeRestored = false
   let decodedFrameBaseline: number | null = null
   let activeAttempt: PlaybackAttempt | null = null
   let activeAttemptGeneration = 0
@@ -1782,9 +2183,9 @@ function renderPlayer(): void {
   }
 
   const cleanup = (): void => {
+    persistProgress()
     activeAttemptGeneration += 1
     clearPlaybackWatchdog()
-    clearVideoDecodeWatchdog()
     cleanupActiveTransport()
     document.removeEventListener('mousemove', revealControls)
     cancelPlayerSeek()
@@ -2139,34 +2540,55 @@ function renderPlayer(): void {
 
   player.playbackRate = playerPlaybackRate
   player.muted = playerMuted
-  player.addEventListener('loadedmetadata', () => {
+
+  function restoreResume(): void {
+    if (
+      resumeRestored ||
+      activeItem.section === 'live' ||
+      !Number.isFinite(player.duration) ||
+      player.duration <= 0
+    ) {
+      return
+    }
+
     const legacyResumeKey = `legacy:${activeItem.id}`
     const resume = resumeEntries.get(activeItemKey) ?? resumeEntries.get(legacyResumeKey)
 
     if (
-      resume &&
-      activeItem.section !== 'live' &&
-      !resume.completed &&
-      resume.position > 10 &&
-      resume.position < player.duration - 10
+      !resume ||
+      resume.completed ||
+      resume.position <= 10 ||
+      resume.position >= player.duration - 10
     ) {
-      player.currentTime = resume.position
-
-      if (!resumeEntries.has(activeItemKey) && resumeEntries.has(legacyResumeKey)) {
-        resumeEntries.delete(legacyResumeKey)
-        resumeEntries.set(activeItemKey, {
-          streamKey: activeItemKey,
-          position: resume.position,
-          updatedAt: resume.updatedAt,
-          stream: activeItem,
-          completed: false,
-        })
-        saveCurrentResume()
-      }
+      return
     }
+
+    player.currentTime = resume.position
+    resumeRestored = true
+
+    if (!resumeEntries.has(activeItemKey) && resumeEntries.has(legacyResumeKey)) {
+      resumeEntries.delete(legacyResumeKey)
+      resumeEntries.set(activeItemKey, {
+        streamKey: activeItemKey,
+        position: resume.position,
+        updatedAt: resume.updatedAt,
+        stream: activeItem,
+        duration: resume.duration ?? player.duration,
+        completed: false,
+      })
+      saveCurrentResume()
+    }
+  }
+
+  player.addEventListener('loadedmetadata', () => {
+    restoreResume()
+    // On webOS, loaded metadata is the reliable native-playback readiness signal.
+    // Do not destroy a stream that has already attached a playable media pipeline
+    // merely because frame telemetry is unavailable in the emulator.
+    confirmPlaybackStarted()
     player.play().catch(() => showPlayerMessage('Press OK to start playback.'))
-    watchForVideoTrack()
   })
+  player.addEventListener('durationchange', restoreResume)
   player.addEventListener('error', () => {
     const error = player.error
 
@@ -2177,7 +2599,6 @@ function renderPlayer(): void {
   })
   player.addEventListener('timeupdate', () => {
     confirmVisiblePlayback()
-    watchForVideoTrack()
 
     if (
       (activeItem.section !== 'live' || Boolean(playerSourceOverride)) &&
@@ -2192,9 +2613,10 @@ function renderPlayer(): void {
       }
     }
   })
+  player.addEventListener('pause', persistProgress)
   player.addEventListener('ended', () => {
     if (activeItem.section !== 'live') {
-      markStreamWatched(activeItem, true)
+      markStreamWatched(activeItem, true, player.duration)
       const nextEpisode = findNextEpisode(activeItem)
 
       if (nextEpisode) {
@@ -2206,8 +2628,10 @@ function renderPlayer(): void {
     }
   })
   player.addEventListener('playing', () => {
-    confirmVisiblePlayback()
-    watchForVideoTrack()
+    // The webOS emulator can render native video while exposing neither stable
+    // dimensions nor decoded-frame statistics. Once the media element reports
+    // playing, it must not be torn down by the visual-frame watchdog.
+    confirmPlaybackStarted()
   })
   player.addEventListener('resize', () => {
     confirmVisiblePlayback()
@@ -2223,13 +2647,6 @@ function renderPlayer(): void {
   restoreFocus(snapshot)
   startNextAttempt()
 
-  function clearVideoDecodeWatchdog(): void {
-    if (videoDecodeWatchdog !== null) {
-      window.clearInterval(videoDecodeWatchdog)
-      videoDecodeWatchdog = null
-    }
-  }
-
   function decodedVideoFrames(): number | null {
     if (typeof player.getVideoPlaybackQuality !== 'function') {
       return null
@@ -2239,57 +2656,38 @@ function renderPlayer(): void {
     return Number.isFinite(frames) ? frames : null
   }
 
+  function confirmPlaybackStarted(): void {
+    if (visiblePlaybackConfirmed) {
+      return
+    }
+
+    visiblePlaybackConfirmed = true
+    clearPlaybackWatchdog()
+    playerDiagnostics = []
+    playerDiagnosticsElement.hidden = true
+    hidePlayerMessage()
+  }
+
   function confirmVisiblePlayback(): void {
     if (
-      visiblePlaybackConfirmed ||
       !hasVerifiedVideoFrame(
         player.videoWidth,
         player.videoHeight,
         player.currentTime,
         decodedFrameBaseline,
         decodedVideoFrames(),
-      )
+      ) &&
+      !hasVisibleVideoTrack(
+        player.videoWidth,
+        player.videoHeight,
+        player.currentTime,
+      ) &&
+      !hasAdvancedPlaybackTimeline(player.currentTime)
     ) {
       return
     }
 
-    visiblePlaybackConfirmed = true
-    clearPlaybackWatchdog()
-    clearVideoDecodeWatchdog()
-    playerDiagnostics = []
-    playerDiagnosticsElement.hidden = true
-    hidePlayerMessage()
-  }
-
-  function watchForVideoTrack(): void {
-    if (visiblePlaybackConfirmed) {
-      return
-    }
-
-    const deadline = Date.now() + 8_000
-
-    if (videoDecodeWatchdog !== null) {
-      return
-    }
-
-    videoDecodeWatchdog = window.setInterval(() => {
-      confirmVisiblePlayback()
-
-      if (visiblePlaybackConfirmed) {
-        return
-      }
-
-      if (Date.now() < deadline) {
-        return
-      }
-
-      clearVideoDecodeWatchdog()
-      failActiveAttempt('no-video-frames', {
-        detail:
-          'The media pipeline advanced, but no decoded video frames could be verified.',
-        decodedFrames: decodedVideoFrames() ?? undefined,
-      })
-    }, 500)
+    confirmPlaybackStarted()
   }
 
   function persistProgress(): void {
@@ -2308,6 +2706,7 @@ function renderPlayer(): void {
       position: player.currentTime,
       updatedAt: lastResumeSaveAt,
       stream: activeItem,
+      duration: player.duration,
       completed: false,
     })
     saveCurrentResume()
@@ -2575,6 +2974,11 @@ function bindEvents(): void {
   }
 
   app.querySelectorAll<HTMLImageElement>('.live-channel-logo, .poster').forEach((image) => {
+    if (image.dataset.errorCheckScheduled === 'true') {
+      return
+    }
+
+    image.dataset.errorCheckScheduled = 'true'
     window.setTimeout(() => {
       if (!image.isConnected || (image.complete && image.naturalWidth > 0)) {
         return
@@ -2655,8 +3059,8 @@ async function handleAction(element: HTMLElement): Promise<void> {
       return
     }
 
-    if (element.dataset.resumeCard === 'true' && stream.streamType === 'episode') {
-      beginPlayback(stream)
+    if (element.dataset.resumeCard === 'true') {
+      await beginResumePlayback(stream)
     } else {
       await openDetails(stream)
     }
@@ -2736,7 +3140,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
       } else {
         expandedGlobalSearchSections.add(section)
       }
-      updateGlobalSearchView()
+      updateGlobalSearchView({ controls: false, fullResults: false, sections: [section] })
     }
     return
   }
@@ -3125,6 +3529,59 @@ async function loadCategory(category: Category | null): Promise<void> {
   }
 }
 
+async function beginResumePlayback(stream: StreamItem): Promise<void> {
+  if (stream.streamType !== 'episode') {
+    await openDetails(stream)
+
+    if (view === 'details' && selectedItem) {
+      beginPlayback(selectedItem)
+    }
+    return
+  }
+
+  if (stream.seriesId) {
+    await openDetails({
+      ...stream,
+      id: stream.seriesId,
+      name: stream.seriesTitle || stream.name,
+      cover: stream.seriesCover || stream.cover,
+      streamType: undefined,
+    })
+
+    const selectedEpisode =
+      selectedSeries &&
+      Object.values(selectedSeries.episodes)
+        .flat()
+        .find((candidate) => streamLookupKey(candidate) === streamLookupKey(stream))
+    const episode =
+      selectedEpisode ??
+      {
+        ...stream,
+        seriesId: selectedItem?.id ?? stream.seriesId,
+        seriesTitle: selectedSeries?.info.name ?? stream.seriesTitle,
+        seriesCover:
+          selectedSeries?.info.cover ?? selectedItem?.cover ?? stream.seriesCover,
+      }
+
+    if (view === 'details') {
+      beginPlayback(episode)
+    }
+    return
+  }
+
+  // A legacy entry without a recoverable parent still gets a detail screen as
+  // its player return point rather than leaving the user stranded on Home.
+  detailReturnPoint = captureReturnPoint()
+  pushRouteHistory()
+  startNavigation()
+  selectedItem = stream
+  selectedSeries = null
+  selectedVod = null
+  view = 'details'
+  render()
+  beginPlayback(stream)
+}
+
 async function openDetails(stream: StreamItem): Promise<void> {
   const activeClient = client
   detailReturnPoint = captureReturnPoint()
@@ -3156,8 +3613,44 @@ async function openDetails(stream: StreamItem): Promise<void> {
         return
       }
 
-      selectedSeries = series
-      Object.values(series.episodes).forEach(rememberStreams)
+      const seriesTitle = series.info.name ?? stream.name
+      const seriesCover =
+        series.info.cover || stream.cover || stream.metadata?.cover || stream.icon
+      const episodes = Object.fromEntries(
+        Object.entries(series.episodes).map(([season, episodes]) => [
+          season,
+          episodes.map((episode) => ({
+            ...episode,
+            cover: seriesCover || episode.cover,
+            seriesId: stream.seriesId ?? stream.id,
+            seriesTitle,
+            seriesCover,
+          })),
+        ]),
+      )
+      selectedSeries = { ...series, episodes }
+
+      let resumeEntriesChanged = false
+      Object.values(episodes).flat().forEach((episode) => {
+        const key = streamLookupKey(episode)
+        const existing = resumeEntries.get(key)
+
+        if (!existing?.stream) {
+          return
+        }
+
+        resumeEntries.set(key, {
+          ...existing,
+          stream: episode,
+        })
+        resumeEntriesChanged = true
+      })
+
+      if (resumeEntriesChanged && profile && !saveResume(profile.id, resumeEntries)) {
+        showToast(STORAGE_FAILURE_MESSAGE)
+      }
+
+      Object.values(episodes).forEach(rememberStreams)
     } else {
       const vod = await activeClient.vodInfo(stream.id, signal)
 
@@ -3344,56 +3837,212 @@ function globalSearchResultCount(results: StreamItem[], section: LibrarySection)
   )
 }
 
-function addSearchMatches(
+function yieldGlobalSearchWork(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, 0))
+}
+
+async function addSearchMatchesCooperatively(
   results: StreamItem[],
   knownKeys: Set<string>,
   streams: StreamItem[],
   query: string,
-): boolean {
+  signal: AbortSignal,
+): Promise<boolean> {
   let added = false
+  let sliceStartedAt = Date.now()
 
   for (const stream of streams) {
-    if (
-      stream.streamType === 'episode' ||
-      globalSearchResultCount(results, stream.section) >=
-        GLOBAL_SEARCH_SECTION_RESULT_LIMIT
-    ) {
-      continue
+    if (signal.aborted) {
+      return added
     }
 
-    const key = streamLookupKey(stream)
-
     if (
-      !knownKeys.has(key) &&
-      searchText(stream).includes(query) &&
-      visibleStream(stream)
+      stream.streamType !== 'episode' &&
+      globalSearchResultCount(results, stream.section) < GLOBAL_SEARCH_SECTION_RESULT_LIMIT
     ) {
-      knownKeys.add(key)
-      results.push(stream)
-      added = true
+      const key = streamLookupKey(stream)
+
+      if (!knownKeys.has(key) && searchText(stream).includes(query) && visibleStream(stream)) {
+        knownKeys.add(key)
+        results.push(stream)
+        added = true
+      }
+    }
+
+    if (Date.now() - sliceStartedAt >= GLOBAL_SEARCH_WORK_SLICE_MS) {
+      await yieldGlobalSearchWork()
+
+      if (signal.aborted) {
+        return added
+      }
+
+      sliceStartedAt = Date.now()
     }
   }
 
   return added
 }
 
-function renderGlobalSearchProgress(token: number, hasNewResults: boolean): void {
-  if (!isCurrentNavigation(token) || view !== 'search') {
+function appendGlobalSearchMatches(
+  session: GlobalSearchSession,
+  results: StreamItem[],
+  knownKeys: Set<string>,
+  section: LibrarySection,
+  matches: StreamItem[],
+): boolean {
+  if (!isCurrentGlobalSearchSession(session)) {
+    return false
+  }
+
+  const visibleMatches = matches.filter(
+    (stream) => visibleStream(stream) && stream.streamType !== 'episode',
+  )
+  rememberStreams(visibleMatches)
+
+  let added = false
+
+  for (const stream of visibleMatches) {
+    if (globalSearchResultCount(results, section) >= GLOBAL_SEARCH_SECTION_RESULT_LIMIT) {
+      break
+    }
+
+    const key = streamLookupKey(stream)
+
+    if (!knownKeys.has(key)) {
+      knownKeys.add(key)
+      results.push(stream)
+      added = true
+    }
+  }
+
+  if (added) {
+    globalSearchResults = results
+    scheduleGlobalSearchRender(session, [section])
+  }
+
+  return added
+}
+
+async function searchGlobalSection(
+  activeClient: XtreamClient,
+  session: GlobalSearchSession,
+  section: LibrarySection,
+  query: string,
+  results: StreamItem[],
+  resultKeys: Set<string>,
+): Promise<void> {
+  const { signal } = session.controller
+
+  const cachedMatches = await addSearchMatchesCooperatively(
+    results,
+    resultKeys,
+    cachedStreamsForSection(section),
+    query,
+    signal,
+  )
+
+  if (!isCurrentGlobalSearchSession(session)) {
     return
   }
 
-  if (hasNewResults) {
-    updateGlobalSearchView()
-    return
+  if (cachedMatches) {
+    globalSearchResults = results
+    scheduleGlobalSearchRender(session, [section])
   }
 
-  const status = document.querySelector<HTMLElement>('#global-search-status')
-  if (status) {
-    status.textContent = globalSearchStatus
+  const categoriesPromise = activeClient
+    .categories(section, signal)
+    .then((categories) => {
+      if (isCurrentGlobalSearchSession(session)) {
+        rememberCategories(section, categories)
+      }
+      return categories
+    })
+    .catch(() => [] as Category[])
+
+  try {
+    const matches = await activeClient.searchStreams(section, query, {
+      signal,
+      limit: Math.max(
+        1,
+        GLOBAL_SEARCH_SECTION_RESULT_LIMIT - globalSearchResultCount(results, section),
+      ),
+      excludeCategoryIds: settings.hideAdultContent
+        ? adultCategoryIds.get(section)
+        : undefined,
+      onMatches: (batch) => {
+        appendGlobalSearchMatches(session, results, resultKeys, section, batch)
+      },
+    })
+
+    if (isCurrentGlobalSearchSession(session)) {
+      appendGlobalSearchMatches(session, results, resultKeys, section, matches)
+    }
+
+    // A valid provider-wide response is authoritative, including zero matches.
+    // Do not turn an ordinary empty search into an unbounded category crawl.
+    return
+  } catch {
+    if (!isCurrentGlobalSearchSession(session)) {
+      return
+    }
+  }
+
+  // Some providers reject whole-library endpoints. In that case only, use a
+  // small, bounded category fallback. Every section runs independently, so one
+  // slow provider endpoint cannot block the other libraries.
+  const categories = await categoriesPromise
+  const fallbackCategories = categories
+    .filter((category) => !settings.hideAdultContent || !isAdult(category.name))
+    .map((category, index) => ({
+      category,
+      index,
+      score: categorySearchScore(category, query),
+    }))
+    .sort((left, right) => left.score - right.score || left.index - right.index)
+    .slice(0, 12)
+    .map(({ category }) => category)
+
+  for (const category of fallbackCategories) {
+    if (
+      !isCurrentGlobalSearchSession(session) ||
+      globalSearchResultCount(results, section) >= GLOBAL_SEARCH_SECTION_RESULT_LIMIT
+    ) {
+      return
+    }
+
+    try {
+      const streams =
+        cachedStreams(section, category.id) ??
+        await activeClient.streams(section, category.id, signal)
+
+      if (!isCurrentGlobalSearchSession(session)) {
+        return
+      }
+
+      cacheStreams(section, category.id, streams)
+      rememberStreams(streams)
+      const added = await addSearchMatchesCooperatively(
+        results,
+        resultKeys,
+        streams,
+        query,
+        signal,
+      )
+
+      if (added) {
+        globalSearchResults = results
+        scheduleGlobalSearchRender(session, [section])
+      }
+    } catch {
+      if (!isCurrentGlobalSearchSession(session)) {
+        return
+      }
+    }
   }
 }
 
-async function runGlobalSearch(queryOverride?: string): Promise<void> {
+async function runGlobalSearch(session?: GlobalSearchSession): Promise<void> {
   const activeClient = client
 
   if (!activeClient) {
@@ -3401,204 +4050,47 @@ async function runGlobalSearch(queryOverride?: string): Promise<void> {
   }
 
   const searchInput = document.querySelector<HTMLInputElement>('#global-search-input')
-  globalSearchQuery = (queryOverride ?? searchInput?.value ?? globalSearchQuery).trim()
+  const requestedQuery = (searchInput?.value ?? globalSearchQuery).trim()
+  const activeSession =
+    session ?? startGlobalSearchSession(requestedQuery, 'searching')
 
-  if (globalSearchQuery.length < MIN_GLOBAL_SEARCH_LENGTH) {
-    globalSearchResults = []
-    globalSearchLoading = false
-    globalSearchStatus = ''
-    view = 'search'
-
-    if (document.querySelector('#global-search-results')) {
-      updateGlobalSearchView()
-    } else {
-      renderGlobalSearch()
-    }
+  if (requestedQuery.length < MIN_GLOBAL_SEARCH_LENGTH) {
+    clearGlobalSearch()
     return
   }
 
-  const { token, signal } = startNavigation()
-  const query = globalSearchQuery.toLocaleLowerCase()
+  if (!session) {
+    globalSearchQuery = requestedQuery
+    globalSearchResults = []
+    globalSearchLoading = true
+    globalSearchStatus = 'Searching…'
+    expandedGlobalSearchSections.clear()
+    updateGlobalSearchView({ controls: true, fullResults: true })
+  }
+
+  if (!isCurrentGlobalSearchSession(activeSession)) {
+    return
+  }
+
+  activeSession.phase = 'searching'
+  const query = activeSession.query.toLocaleLowerCase()
   const results: StreamItem[] = []
   const resultKeys = new Set<string>()
-  const sections = GLOBAL_SEARCH_SECTIONS
 
-  expandedGlobalSearchSections.clear()
-  sections.forEach((section) => {
-    addSearchMatches(results, resultKeys, cachedStreamsForSection(section), query)
-  })
-  globalSearchResults = [...results]
-  globalSearchLoading = true
-  globalSearchStatus = 'Searching…'
-  view = 'search'
-
-  if (document.querySelector('#global-search-results')) {
-    updateGlobalSearchView()
-  } else {
-    renderGlobalSearch()
-  }
-
-  try {
-    const categoryResults = await Promise.allSettled(
-      sections.map(async (section) => ({
+  await Promise.allSettled(
+    GLOBAL_SEARCH_SECTIONS.map((section) =>
+      searchGlobalSection(
+        activeClient,
+        activeSession,
         section,
-        categories: await activeClient.categories(section, signal),
-      })),
-    )
+        query,
+        results,
+        resultKeys,
+      ),
+    ),
+  )
 
-    if (!isCurrentNavigation(token)) {
-      return
-    }
-
-    categoryResults.forEach((result) => {
-      if (result.status === 'fulfilled') {
-        rememberCategories(result.value.section, result.value.categories)
-      }
-    })
-  } catch {
-    // Name-based adult filtering remains active if category metadata is unavailable.
-  }
-
-  renderGlobalSearchProgress(token, results.length > 0)
-
-  for (const section of GLOBAL_SEARCH_EXECUTION_SECTIONS) {
-    if (!isCurrentNavigation(token)) {
-      break
-    }
-
-    const cachedMatches = addSearchMatches(
-      results,
-      resultKeys,
-      cachedStreamsForSection(section),
-      query,
-    )
-    globalSearchResults = [...results]
-    globalSearchStatus = 'Searching…'
-    renderGlobalSearchProgress(token, cachedMatches)
-
-    try {
-      globalSearchStatus = 'Searching…'
-      renderGlobalSearchProgress(token, false)
-
-      const onMatches = (matches: StreamItem[]): void => {
-        if (!isCurrentNavigation(token)) {
-          return
-        }
-
-        const visibleMatches = matches.filter(
-          (stream) => visibleStream(stream) && stream.streamType !== 'episode',
-        )
-        rememberStreams(visibleMatches)
-
-        let hasMatches = false
-
-        for (const stream of visibleMatches) {
-          if (
-            globalSearchResultCount(results, section) >=
-            GLOBAL_SEARCH_SECTION_RESULT_LIMIT
-          ) {
-            break
-          }
-
-          const key = streamLookupKey(stream)
-
-          if (!resultKeys.has(key)) {
-            resultKeys.add(key)
-            results.push(stream)
-            hasMatches = true
-          }
-        }
-
-        globalSearchResults = [...results]
-        renderGlobalSearchProgress(token, hasMatches)
-      }
-      const sectionMatches = await activeClient.searchStreams(section, query, {
-        signal,
-        limit: Math.max(
-          1,
-          GLOBAL_SEARCH_SECTION_RESULT_LIMIT - globalSearchResultCount(results, section),
-        ),
-        excludeCategoryIds: settings.hideAdultContent
-          ? adultCategoryIds.get(section)
-          : undefined,
-        onMatches,
-      })
-
-      if (!isCurrentNavigation(token)) {
-        return
-      }
-
-      onMatches(sectionMatches)
-      renderGlobalSearchProgress(token, false)
-      continue
-    } catch {
-      if (!isCurrentNavigation(token)) {
-        return
-      }
-
-      renderGlobalSearchProgress(token, false)
-    }
-
-    try {
-        const categories =
-        sectionCategories.get(section) ??
-        await activeClient.categories(section, signal)
-
-      if (!isCurrentNavigation(token)) {
-        return
-      }
-
-      rememberCategories(section, categories)
-
-      const categorySource = categories
-      const categoriesToSearch = categorySource
-        .filter((category) => !settings.hideAdultContent || !isAdult(category.name))
-        .map((category, index) => ({ category, index, score: categorySearchScore(category, query) }))
-        .sort((left, right) => left.score - right.score || left.index - right.index)
-        .map(({ category }) => category)
-
-      for (const category of categoriesToSearch) {
-        if (
-          !isCurrentNavigation(token) ||
-          globalSearchResultCount(results, section) >=
-            GLOBAL_SEARCH_SECTION_RESULT_LIMIT
-        ) {
-          break
-        }
-
-        try {
-          const streams =
-            cachedStreams(section, category.id) ??
-            await activeClient.streams(section, category.id, signal)
-
-          if (!isCurrentNavigation(token)) {
-            return
-          }
-
-          cacheStreams(section, category.id, streams)
-          rememberStreams(streams)
-          const hasMatches = addSearchMatches(results, resultKeys, streams, query)
-          globalSearchResults = [...results]
-          globalSearchStatus = 'Searching…'
-          renderGlobalSearchProgress(token, hasMatches)
-        } catch {
-          if (!isCurrentNavigation(token)) {
-            return
-          }
-
-          renderGlobalSearchProgress(token, false)
-        }
-      }
-    } catch {
-      if (!isCurrentNavigation(token)) {
-        return
-      }
-
-      renderGlobalSearchProgress(token, false)
-    }
-  }
-
-  if (!isCurrentNavigation(token)) {
+  if (!isCurrentGlobalSearchSession(activeSession)) {
     return
   }
 
@@ -3607,7 +4099,12 @@ async function runGlobalSearch(queryOverride?: string): Promise<void> {
   globalSearchStatus = results.length
     ? `${results.length} result${results.length === 1 ? '' : 's'}`
     : 'No results'
-  updateGlobalSearchView()
+  activeSession.phase = 'completed'
+  updateGlobalSearchView({
+    controls: true,
+    fullResults: false,
+    sections: GLOBAL_SEARCH_SECTIONS,
+  })
 }
 
 async function loadLiveDetails(stream: StreamItem): Promise<void> {
@@ -3949,7 +4446,11 @@ function switchToLastChannel(): void {
   }
 }
 
-function markStreamWatched(stream: StreamItem, completed: boolean): void {
+function markStreamWatched(
+  stream: StreamItem,
+  completed: boolean,
+  duration?: number,
+): void {
   if (stream.section === 'live' || !profile) {
     return
   }
@@ -3958,9 +4459,12 @@ function markStreamWatched(stream: StreamItem, completed: boolean): void {
   const existing = resumeEntries.get(key)
   resumeEntries.set(key, {
     streamKey: key,
-    position: completed ? stream.metadata?.durationSeconds ?? existing?.position ?? 0 : 0,
+    position: completed
+      ? duration ?? existing?.duration ?? stream.metadata?.durationSeconds ?? existing?.position ?? 0
+      : 0,
     updatedAt: Date.now(),
     stream,
+    duration: duration ?? existing?.duration ?? stream.metadata?.durationSeconds,
     completed,
   })
   if (!saveResume(profile.id, resumeEntries)) {
@@ -4125,6 +4629,11 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: XtreamClient):
   settings = loadSettings(nextProfile.id)
   favorites = loadFavorites(nextProfile.id)
   resumeEntries = loadResume(nextProfile.id)
+
+  if (repairResumeEpisodeContexts()) {
+    saveResume(nextProfile.id, resumeEntries)
+  }
+
   catalog = null
   catalogReturnPoint = null
   selectedItem = null
@@ -4173,17 +4682,6 @@ function renderError(reason: unknown, retry: () => void): void {
   document.querySelector<HTMLButtonElement>('#retry')?.addEventListener('click', retry)
   bindEvents()
   restoreFocus(snapshot)
-}
-
-function isBackKey(event: KeyboardEvent): boolean {
-  return (
-    event.key === 'Escape' ||
-    event.key === 'Back' ||
-    event.key === 'GoBack' ||
-    event.key === 'BrowserBack' ||
-    event.keyCode === 461 ||
-    event.keyCode === 10009
-  )
 }
 
 function navigateBack(): boolean {
@@ -4322,15 +4820,16 @@ function isReverseDirection(
 }
 
 function handleSpatialNavigation(event: KeyboardEvent): boolean {
-  if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) {
+  const direction = remoteDirection(event)
+
+  if (!direction) {
     return false
   }
 
-  const direction = event.key as NavigationDirection
   const active = document.activeElement
   if (
     (active instanceof HTMLInputElement || active instanceof HTMLSelectElement) &&
-    (event.key === 'ArrowLeft' || event.key === 'ArrowRight') &&
+    (direction === 'ArrowLeft' || direction === 'ArrowRight') &&
     editingInput === active
   ) {
     return false
@@ -4346,6 +4845,20 @@ function handleSpatialNavigation(event: KeyboardEvent): boolean {
   const { items, elements } = navigationLayout()
   const originFocusId = origin.dataset.focusId!
   const originZoneId = zone.dataset.navZone!
+  const isVertical = direction === 'ArrowUp' || direction === 'ArrowDown'
+
+  // Sticky column: capture origin X on first vertical press, clear on horizontal
+  if (isVertical) {
+    if (stickyColumnX === null || stickyColumnZone !== originZoneId) {
+      const originItem = items.find((item) => item.id === originFocusId)
+      stickyColumnX = originItem ? originItem.left + originItem.width / 2 : null
+      stickyColumnZone = originZoneId
+    }
+  } else {
+    stickyColumnX = null
+    stickyColumnZone = null
+  }
+
   const returningTarget =
     lastZoneTransition &&
     lastZoneTransition.toZoneId === originZoneId &&
@@ -4354,7 +4867,12 @@ function handleSpatialNavigation(event: KeyboardEvent): boolean {
       : null
   const targetId = returningTarget
     ? returningTarget.dataset.focusId ?? null
-    : resolveNavigationTarget(items, originFocusId, direction)
+    : resolveNavigationTarget(
+        items,
+        originFocusId,
+        direction,
+        isVertical ? stickyColumnX ?? undefined : undefined,
+      )
   const target = targetId ? elements.get(targetId) ?? null : null
 
   if (!target) {
@@ -4370,6 +4888,9 @@ function handleSpatialNavigation(event: KeyboardEvent): boolean {
       fromFocusId: originFocusId,
       direction,
     }
+    // Clear sticky column when leaving the zone
+    stickyColumnX = null
+    stickyColumnZone = null
   } else {
     lastZoneTransition = null
   }
@@ -4541,8 +5062,18 @@ async function releaseKeepAwake(): Promise<void> {
 window.addEventListener('keydown', (event) => {
   const activeElement = document.activeElement
   const activeInput = isTextInput(activeElement) ? activeElement : null
+  const direction = remoteDirection(event)
 
-  if (isBackKey(event)) {
+  if (isRemoteBack(event)) {
+    if (view === 'search' && globalSearchIsActive()) {
+      armSearchBackCancellation()
+      finishTextEditing()
+      cancelGlobalSearch()
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      return
+    }
+
     if (finishTextEditing()) {
       event.preventDefault()
       event.stopImmediatePropagation()
@@ -4555,6 +5086,10 @@ window.addEventListener('keydown', (event) => {
       event.preventDefault()
       event.stopImmediatePropagation()
       return
+    }
+
+    if (view === 'search') {
+      retainSearchOnNextPopState = false
     }
 
     if (requestAppBack()) {
@@ -4581,8 +5116,16 @@ window.addEventListener('keydown', (event) => {
       } else if (submittedInput.id === 'search-input') {
         scheduleCatalogSearch(submittedInput.value)
       }
+      return
     }
-    return
+
+    if (direction) {
+      const navigationOrigin = editingInput
+      finishTextEditing(navigationOrigin)
+      navigationOrigin.focus({ preventScroll: true })
+    } else {
+      return
+    }
   }
 
   if (handleColorShortcut(event) || handleNumericChannelInput(event)) {
@@ -4609,11 +5152,11 @@ window.addEventListener('keydown', (event) => {
     }
 
     const isPlayerControl = isFocusedPlayerControl()
-    const isSeekKey = event.key === 'ArrowLeft' || event.key === 'ArrowRight'
+    const isSeekKey = direction === 'ArrowLeft' || direction === 'ArrowRight'
 
     if (isSeekKey && !isPlayerControl) {
       event.preventDefault()
-      startPlayerSeek(event.key === 'ArrowLeft' ? -1 : 1)
+      startPlayerSeek(direction === 'ArrowLeft' ? -1 : 1)
       return
     }
 
@@ -4628,7 +5171,7 @@ window.addEventListener('keydown', (event) => {
       return
     }
 
-    if (!isPlayerControl && event.key === 'ArrowUp') {
+    if (!isPlayerControl && direction === 'ArrowUp') {
       event.preventDefault()
       setPlayerUiMode('focused')
       document.querySelector<HTMLElement>('[data-focus-id="player-play"]')?.focus({
@@ -4637,7 +5180,7 @@ window.addEventListener('keydown', (event) => {
       return
     }
 
-    if (!isPlayerControl && event.key === 'ArrowDown') {
+    if (!isPlayerControl && direction === 'ArrowDown') {
       event.preventDefault()
 
       if (playerCanSeek()) {
@@ -4665,12 +5208,14 @@ window.addEventListener('keydown', (event) => {
   if (handleSpatialNavigation(event)) {
     return
   }
-})
+}, true)
 
 window.addEventListener('keyup', (event) => {
+  const direction = remoteDirection(event)
+
   if (
     view === 'player' &&
-    (event.key === 'ArrowLeft' || event.key === 'ArrowRight')
+    (direction === 'ArrowLeft' || direction === 'ArrowRight')
   ) {
     cancelPlayerSeek()
   }
@@ -4715,6 +5260,24 @@ window.addEventListener(
 )
 
 window.addEventListener('popstate', (event) => {
+  // A webOS Back press can arrive only as browser history navigation. Consume
+  // active-search history before inspecting the state, because some webOS
+  // versions provide null/non-app state for that companion event.
+  if (view === 'search' && (retainSearchOnNextPopState || globalSearchIsActive())) {
+    if (isAppHistoryState(event.state)) {
+      appHistoryDepth = event.state.depth
+    } else {
+      appHistoryDepth = Math.max(0, appHistoryDepth - 1)
+    }
+
+    if (globalSearchIsActive()) {
+      cancelGlobalSearch()
+    }
+
+    retainSearchRouteAfterPopState()
+    return
+  }
+
   if (!isAppHistoryState(event.state)) {
     return
   }
@@ -4731,6 +5294,9 @@ window.addEventListener('popstate', (event) => {
 
 window.addEventListener('scroll', invalidateSpatialLayout, { passive: true })
 window.addEventListener('resize', invalidateSpatialLayout)
+window.addEventListener('pagehide', () => {
+  playerCleanup?.()
+})
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden && view === 'player') {

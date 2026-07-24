@@ -24,6 +24,7 @@ const API_TIMEOUT_MS = 15_000
  */
 const MAX_JSON_RESPONSE_BYTES = 64 * 1024 * 1024
 const SEARCH_TIMEOUT_MS = 60_000
+const SEARCH_WORK_SLICE_MS = 8
 const MAX_SEARCH_RECORD_CHARS = 2 * 1024 * 1024
 const NORMALIZATION_BATCH_SIZE = 400
 const RESPONSE_TOO_LARGE_MESSAGE =
@@ -501,7 +502,8 @@ export class XtreamClient {
     const abortFromCaller = (): void => controller.abort()
     const matches: StreamItem[] = []
     let pendingMatches: StreamItem[] = []
-    let objectBuffer = ''
+    let objectParts: string[] = []
+    let objectLength = 0
     let objectDepth = 0
     let inString = false
     let escaped = false
@@ -517,11 +519,28 @@ export class XtreamClient {
         return
       }
 
-      options.onMatches?.(pendingMatches)
+      const batch = pendingMatches
       pendingMatches = []
+
+      // Publish incrementally so cancellation requested by a consumer takes
+      // effect before any later match from the same network chunk is exposed.
+      for (const match of batch) {
+        if (controller.signal.aborted) {
+          break
+        }
+
+        options.onMatches?.([match])
+      }
     }
 
     const processRecord = (source: string): boolean => {
+      // Reject the overwhelming majority of records before JSON.parse. Whole
+      // IPTV libraries can contain hundreds of thousands of objects, and JSON
+      // parsing every non-match starves the webOS UI thread.
+      if (!source.toLocaleLowerCase().includes(normalizedQuery)) {
+        return false
+      }
+
       try {
         const record = readRecord(JSON.parse(source))
         const name = readString(record.name ?? record.title) ?? ''
@@ -549,31 +568,35 @@ export class XtreamClient {
       return matches.length >= limit
     }
 
-    const processChunk = (chunk: string): boolean => {
+    const processChunk = async (chunk: string): Promise<boolean> => {
+      let sliceStartedAt = Date.now()
+      let objectChunkStart = objectDepth > 0 ? 0 : -1
+
       for (let index = 0; index < chunk.length; index += 1) {
+        if (controller.signal.aborted) {
+          throw new Error('Request cancelled.')
+        }
+
         const character = chunk[index]
 
-        if (!objectBuffer) {
+        if (objectDepth === 0) {
           if (character === '{') {
-            objectBuffer = character
+            objectChunkStart = index
             objectDepth = 1
             inString = false
             escaped = false
           }
-          continue
-        }
-
-        objectBuffer += character
-
-        if (objectBuffer.length > MAX_SEARCH_RECORD_CHARS) {
-          objectBuffer = ''
+        } else if (
+          objectChunkStart >= 0 &&
+          objectLength + index - objectChunkStart + 1 > MAX_SEARCH_RECORD_CHARS
+        ) {
+          objectParts = []
+          objectLength = 0
           objectDepth = 0
+          objectChunkStart = -1
           inString = false
           escaped = false
-          continue
-        }
-
-        if (inString) {
+        } else if (inString) {
           if (escaped) {
             escaped = false
           } else if (character === '\\') {
@@ -581,19 +604,19 @@ export class XtreamClient {
           } else if (character === '"') {
             inString = false
           }
-          continue
-        }
-
-        if (character === '"') {
+        } else if (character === '"') {
           inString = true
         } else if (character === '{') {
           objectDepth += 1
         } else if (character === '}') {
           objectDepth -= 1
 
-          if (objectDepth === 0) {
-            const recordSource = objectBuffer
-            objectBuffer = ''
+          if (objectDepth === 0 && objectChunkStart >= 0) {
+            objectParts.push(chunk.slice(objectChunkStart, index + 1))
+            const recordSource = objectParts.join('')
+            objectParts = []
+            objectLength = 0
+            objectChunkStart = -1
 
             if (processRecord(recordSource)) {
               flushMatches()
@@ -601,9 +624,32 @@ export class XtreamClient {
             }
           }
         }
+
+        // Reading the clock for every character is itself a major cost on
+        // older webOS JavaScript engines. Check the cooperative budget in
+        // coarse blocks while still checking abort on every iteration.
+        if (
+          (index & 2047) === 2047 &&
+          Date.now() - sliceStartedAt >= SEARCH_WORK_SLICE_MS
+        ) {
+          flushMatches()
+          await yieldToBrowser()
+          sliceStartedAt = Date.now()
+        }
+      }
+
+      if (objectDepth > 0 && objectChunkStart >= 0) {
+        const part = chunk.slice(objectChunkStart)
+        objectParts.push(part)
+        objectLength += part.length
       }
 
       flushMatches()
+
+      if (controller.signal.aborted) {
+        throw new Error('Request cancelled.')
+      }
+
       return matches.length >= limit
     }
 
@@ -642,17 +688,17 @@ export class XtreamClient {
           const { done, value } = await reader.read()
 
           if (done) {
-            processChunk(decoder.decode())
+            await processChunk(decoder.decode())
             break
           }
 
-          if (value && processChunk(decoder.decode(value, { stream: true }))) {
+          if (value && await processChunk(decoder.decode(value, { stream: true }))) {
             await reader.cancel()
             break
           }
         }
       } else {
-        processChunk(await response.text())
+        await processChunk(await response.text())
       }
 
       flushMatches()

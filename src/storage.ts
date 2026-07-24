@@ -269,22 +269,29 @@ export function loadResume(profileId: string): Map<string, ResumeEntry> {
     }
 
     const stream = isStreamItem(candidate.stream) ? toStoredStream(candidate.stream) : undefined
+    const duration =
+      typeof candidate.duration === 'number' &&
+      Number.isFinite(candidate.duration) &&
+      candidate.duration > 0
+        ? candidate.duration
+        : undefined
     const completed = candidate.completed === true
 
     if (typeof candidate.streamKey === 'string') {
       entries.set(candidate.streamKey, {
         streamKey: candidate.streamKey,
         position,
-        updatedAt,
-        stream,
-        completed,
-      })
+          updatedAt,
+          stream,
+          duration,
+          completed,
+        })
       return
     }
 
     if (typeof candidate.streamId === 'string') {
       const streamKey = `legacy:${candidate.streamId}`
-      entries.set(streamKey, { streamKey, position, updatedAt, stream, completed })
+      entries.set(streamKey, { streamKey, position, updatedAt, stream, duration, completed })
     }
   })
 
@@ -300,6 +307,12 @@ export function saveResume(profileId: string, entries: Map<string, ResumeEntry>)
       position: entry.position,
       updatedAt: entry.updatedAt,
       stream: entry.stream ? toStoredStream(entry.stream) : undefined,
+      duration:
+        typeof entry.duration === 'number' &&
+        Number.isFinite(entry.duration) &&
+        entry.duration > 0
+          ? entry.duration
+          : undefined,
       completed: entry.completed === true,
     }))
 
@@ -343,6 +356,8 @@ function toStoredStream(stream: StreamItem): StreamItem {
     directSource: stream.directSource,
     season: stream.season,
     episodeNumber: stream.episodeNumber,
+    seriesTitle: stream.seriesTitle,
+    seriesCover: stream.seriesCover,
     searchName: stream.searchName ?? stream.name.toLocaleLowerCase(),
   }
 }
