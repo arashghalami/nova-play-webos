@@ -1071,11 +1071,12 @@ function renderHome(): void {
     .slice(0, 12)
 
   renderShell(`
-    <section class="hero">
-      <div>
+    <section class="hero hero-cinematic">
+      <div class="hero-copy">
         <p class="eyebrow">${escape(profile?.name ?? 'My IPTV')}</p>
         <h1>What would you like to watch?</h1>
         <p>${escape(expiry)}${escape(connectionSummary)}</p>
+        <div class="hero-status"><span class="status-pulse" aria-hidden="true"></span>Ready when you are</div>
       </div>
       <div class="hero-actions" data-nav-zone="home-hero">
         <button class="secondary-button" data-action="open-guide" data-focus-id="home-guide">TV Guide</button>
@@ -1085,7 +1086,7 @@ function renderHome(): void {
     ${
       continueEntries.length
         ? `<section class="home-rail">
-            <div class="rail-heading"><div><p class="eyebrow">Continue watching</p><h2>Pick up where you left off</h2></div></div>
+            <div class="rail-heading"><div><p class="eyebrow">Continue watching</p><h2>Pick up where you left off</h2></div><span class="rail-caption">Your next episode is waiting</span></div>
             <section class="content-grid continue-grid" data-nav-zone="home-continue" aria-label="Continue watching">
               ${continueEntries.map((entry) => streamCard(entry.stream!, entry)).join('')}
             </section>
@@ -1093,11 +1094,11 @@ function renderHome(): void {
         : ''
     }
     <section class="hub-grid" data-nav-zone="home-hub">
-      ${libraryCard('live', icon('live'), 'Watch TV channels now', 'Browse live channels, now and next information, and a TV guide.')}
-      ${libraryCard('vod', icon('movie'), 'Movies on demand', 'Explore rich movie information, trailers, and resume playback.')}
-      ${libraryCard('series', icon('series'), 'Series & episodes', 'Pick up a show where you left off, with next-episode playback.')}
-      <button class="hub-card" data-action="favorites" data-focus-id="home-favorites">
-        <span class="hub-icon favorite-icon">${icon('star')}</span><span class="hub-label">Favorites</span><span class="hub-description">Your saved channels and titles across every library.</span>
+      ${libraryCard('live', icon('live'), 'Live TV', 'Browse channels, current programmes, and the TV guide.')}
+      ${libraryCard('vod', icon('movie'), 'Movies', 'Explore rich movie details, trailers, and resume playback.')}
+      ${libraryCard('series', icon('series'), 'Series', 'Pick up a show where you left off, episode by episode.')}
+      <button class="hub-card favorites" data-action="favorites" data-focus-id="home-favorites">
+        <span class="hub-card-kicker">Your library</span><span class="hub-icon favorite-icon">${icon('star')}</span><span class="hub-label">Favorites</span><span class="hub-description">Your saved channels and titles in one place.</span>
       </button>
     </section>
   `)
@@ -1111,7 +1112,7 @@ function libraryCard(
 ): string {
   return `
     <button class="hub-card ${section}" data-action="open-section" data-section="${section}" data-focus-id="home-${section}">
-      <span class="hub-icon">${icon}</span><span class="hub-label">${title}</span><span class="hub-description">${description}</span>
+      <span class="hub-card-kicker">Explore</span><span class="hub-icon">${icon}</span><span class="hub-label">${title}</span><span class="hub-description">${description}</span>
     </button>
   `
 }
@@ -1442,25 +1443,29 @@ function renderDetails(): void {
   const metadata = detailsMetadata(item)
   const media = metadata.cover ?? item.cover ?? item.icon
   const description = metadata.plot ?? item.plot ?? 'No description provided by this IPTV provider.'
-  const details = [
+  const detailFacts = [
     metadata.genre,
     metadata.rating ?? item.rating,
     metadata.releaseDate ?? metadata.year ?? item.year,
     metadata.duration,
-  ]
-    .filter(Boolean)
-    .join(' · ')
+  ].filter((fact): fact is string => Boolean(fact))
+  const backdrop = metadata.backdrops?.[0] ?? media
 
   renderShell(`
-    <section class="detail-layout">
-      <div class="detail-art">${imageOrPlaceholder(media, item.name, 'detail-image')}</div>
-      <div class="detail-copy">
-        <p class="eyebrow">${item.section === 'series' ? 'Series' : item.streamType === 'episode' ? `Season ${escape(item.season ?? '')} · Episode ${escape(item.episodeNumber ?? '')}` : item.section === 'live' ? 'Live TV' : 'Movie'}</p>
-        <h1>${escape(selectedSeries?.info.name ?? item.name)}</h1>
-        <p class="metadata">${escape(details || 'Available now')}</p>
-        <p class="plot">${escape(description)}</p>
-        ${renderRichMetadata(metadata)}
-        ${detailActions(item, metadata)}
+    <section class="detail-hero">
+      <div class="detail-backdrop" aria-hidden="true">
+        ${backdrop ? `<img src="${escape(backdrop)}" alt="" />` : ''}
+      </div>
+      <div class="detail-layout detail-layout-cinematic">
+        <div class="detail-art">${imageOrPlaceholder(media, item.name, 'detail-image')}</div>
+        <div class="detail-copy">
+          <p class="eyebrow">${item.section === 'series' ? 'Series' : item.streamType === 'episode' ? `Season ${escape(item.season ?? '')} · Episode ${escape(item.episodeNumber ?? '')}` : item.section === 'live' ? 'Live TV' : 'Movie'}</p>
+          <h1>${escape(selectedSeries?.info.name ?? item.name)}</h1>
+          <div class="detail-chips">${detailFacts.length ? detailFacts.map((fact) => `<span>${escape(fact)}</span>`).join('') : '<span>Available now</span>'}</div>
+          <p class="plot">${escape(description)}</p>
+          ${renderRichMetadata(metadata)}
+          ${detailActions(item, metadata)}
+        </div>
       </div>
     </section>
     ${renderEpisodeList()}
@@ -2024,8 +2029,9 @@ function renderSettings(): void {
     </section>
     <section class="settings-layout">
       <section class="settings-panel">
-        <h2>Playback</h2>
-        <label class="setting-row"><span>Prefer HLS live streams</span><input id="setting-prefer-hls" data-focus-id="setting-prefer-hls" type="checkbox" ${settings.preferHls ? 'checked' : ''} /></label>
+        <p class="panel-kicker">Playback</p>
+        <h2>Make it yours</h2>
+        <label class="setting-row"><span>Prefer HLS live streams<small>Use adaptive streaming when available</small></span><input id="setting-prefer-hls" data-focus-id="setting-prefer-hls" type="checkbox" ${settings.preferHls ? 'checked' : ''} /></label>
         <label class="setting-row"><span>Live buffer</span><select id="setting-buffer" data-focus-id="setting-buffer">
           ${[10, 20, 30, 45, 60].map((value) => `<option value="${value}" ${settings.bufferSeconds === value ? 'selected' : ''}>${value} seconds</option>`).join('')}
         </select></label>
@@ -2033,21 +2039,23 @@ function renderSettings(): void {
           <option value="24h" ${settings.timeFormat === '24h' ? 'selected' : ''}>24-hour</option>
           <option value="12h" ${settings.timeFormat === '12h' ? 'selected' : ''}>12-hour</option>
         </select></label>
-        <label class="setting-row"><span>Hide adult categories</span><input id="setting-hide-adult" data-focus-id="setting-hide-adult" type="checkbox" ${settings.hideAdultContent ? 'checked' : ''} /></label>
+        <label class="setting-row"><span>Hide adult categories<small>Keep sensitive content out of the library</small></span><input id="setting-hide-adult" data-focus-id="setting-hide-adult" type="checkbox" ${settings.hideAdultContent ? 'checked' : ''} /></label>
         <label class="setting-row"><span>Parental PIN <small>Device-local deterrent</small></span><input id="setting-parental-pin" data-focus-id="setting-parental-pin" type="password" inputmode="numeric" maxlength="8" value="${escape(settings.parentalPin ?? '')}" placeholder="Optional PIN" readonly aria-label="Parental PIN. Press OK to type." /></label>
         <button class="primary-button" data-action="save-settings" data-focus-id="settings-save">Save settings</button>
       </section>
       <section class="settings-panel">
+        <p class="panel-kicker">Library</p>
         <h2>Playlists</h2>
-        <p class="hint">Favorites and watch history are separated per playlist.</p>
+        <p class="hint">Favorites and watch history stay separate for every playlist.</p>
         <div class="profile-list">
           ${profiles
             .map(
               (savedProfile) => `
                 <div class="profile-row ${savedProfile.id === profile?.id ? 'is-active' : ''}">
-                  <span>${escape(savedProfile.name)}</span>
+                  <span class="profile-name">${escape(savedProfile.name)}</span>
                   <div>
-                    <button class="secondary-button" data-action="switch-profile" data-profile-id="${escape(savedProfile.id)}" data-focus-id="settings-profile-${escape(savedProfile.id)}">${savedProfile.id === profile?.id ? 'Active' : 'Use'}</button>
+                    <span class="profile-state">${savedProfile.id === profile?.id ? 'Active' : 'Saved'}</span>
+                    <button class="secondary-button" data-action="switch-profile" data-profile-id="${escape(savedProfile.id)}" data-focus-id="settings-profile-${escape(savedProfile.id)}">${savedProfile.id === profile?.id ? 'Selected' : 'Use'}</button>
                     <button class="secondary-button danger-button" data-action="remove-profile" data-profile-id="${escape(savedProfile.id)}" data-focus-id="settings-remove-${escape(savedProfile.id)}">Remove</button>
                   </div>
                 </div>`,
@@ -2089,7 +2097,7 @@ function renderPlayer(): void {
       <section id="player-diagnostics" class="player-diagnostics" hidden aria-live="polite"></section>
       <div id="player-seek-feedback" class="player-seek-feedback" aria-live="polite" hidden></div>
       <div id="channel-number-overlay" class="channel-number-overlay" hidden></div>
-      <div id="player-controls" class="player-controls ${playerControlsClass}">
+      <div id="player-controls" class="player-controls player-control-dock ${playerControlsClass}">
         <button class="icon-button player-back" data-action="close-player" data-focus-id="player-close" aria-label="Close player">←</button>
         ${playerNavigationControls}
         <div class="player-title"><span>${escape(isLive ? 'LIVE' : 'PLAYING')}</span>${escape(streamDisplayTitle(item))}</div>
@@ -4715,7 +4723,16 @@ async function refreshAccount(silent = false): Promise<void> {
 
 function renderLoading(message: string): void {
   const snapshot = snapshotFocus()
-  app.innerHTML = `<main class="status-page"><div class="spinner"></div><h1>${escape(message)}</h1></main>`
+  app.innerHTML = `
+    <main class="status-page">
+      <section class="status-card" aria-live="polite">
+        <div class="status-orb"><div class="spinner"></div></div>
+        <p class="eyebrow">Nova Play</p>
+        <h1>${escape(message)}</h1>
+        <p>Just a moment while we prepare your next screen.</p>
+      </section>
+    </main>
+  `
   invalidateSpatialLayout()
   restoreFocus(snapshot)
 }
@@ -4723,7 +4740,17 @@ function renderLoading(message: string): void {
 function renderError(reason: unknown, retry: () => void): void {
   const snapshot = snapshotFocus()
   const message = reason instanceof Error ? reason.message : 'Something went wrong.'
-  app.innerHTML = `<main class="status-page"><div class="error-icon">!</div><h1>Unable to continue</h1><p>${escape(message)}</p><button class="primary-button" id="retry" data-focus-id="error-retry">Try again</button></main>`
+  app.innerHTML = `
+    <main class="status-page">
+      <section class="status-card status-card-error">
+        <div class="error-icon">!</div>
+        <p class="eyebrow">Connection issue</p>
+        <h1>Unable to continue</h1>
+        <p>${escape(message)}</p>
+        <button class="primary-button" id="retry" data-focus-id="error-retry">Try again</button>
+      </section>
+    </main>
+  `
   invalidateSpatialLayout()
   document.querySelector<HTMLButtonElement>('#retry')?.addEventListener('click', retry)
   bindEvents()
