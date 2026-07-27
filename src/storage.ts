@@ -18,7 +18,11 @@ const MAX_RESUME_ENTRIES = 100
 
 export const DEFAULT_SETTINGS: AppSettings = {
   preferHls: true,
-  preservePitch: true,
+  // Default OFF: on the target webOS TV, requesting pitch-preserving
+  // time-stretch (preservesPitch = true) makes audio go silent above 1x.
+  // Disabling it keeps the voice audible (slightly higher pitch) and never
+  // silent. Users can turn it on if their device time-stretches correctly.
+  preservePitch: false,
   bufferSeconds: 20,
   timeFormat: '24h',
   hideAdultContent: true,

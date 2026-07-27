@@ -3099,6 +3099,190 @@ kbd {
   }
 }
 
+/* Series page stability: provider artwork must never decide row height. */
+.series-detail-hero {
+  min-height: 0;
+  margin-bottom: 1.4rem;
+  padding-top: 1.5rem;
+  padding-bottom: 1.5rem;
+}
+
+.series-detail-layout {
+  grid-template-columns: 14rem minmax(0, 1fr);
+}
+
+.series-detail-layout .detail-art {
+  width: 14rem;
+  height: 20rem;
+}
+
+.series-episodes {
+  max-width: none;
+  margin-bottom: 2rem;
+  padding: 1.35rem 1.5rem 2rem;
+}
+
+.series-episodes-heading {
+  margin-bottom: 0.8rem;
+}
+
+.season-selector {
+  margin-bottom: 0.9rem;
+}
+
+.season-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.38rem 0.72rem;
+}
+
+.season-pill .season-label {
+  color: inherit;
+}
+
+.season-pill .season-count {
+  min-width: 0;
+  color: var(--text-muted);
+  background: transparent;
+  font-size: var(--fs-micro);
+}
+
+.season-pill:focus .season-count,
+.season-pill.is-active .season-count {
+  color: inherit;
+}
+
+.episode-list {
+  gap: 0.55rem;
+}
+
+.episode-card {
+  height: 9.2rem;
+  min-height: 9.2rem;
+  display: flex;
+  gap: 0;
+  align-items: stretch;
+}
+
+.episode-art {
+  position: relative;
+  width: 14.5rem;
+  min-width: 14.5rem;
+  height: 9.2rem;
+  min-height: 9.2rem;
+  flex: 0 0 14.5rem;
+  overflow: hidden;
+}
+
+.episode-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: cover;
+}
+
+.episode-image-fallback {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #c8efff;
+  background:
+    radial-gradient(circle at 75% 20%, rgb(110 225 255 / 28%), transparent 34%),
+    linear-gradient(145deg, #285b8d, #163554);
+  font-size: var(--fs-subtitle);
+  font-weight: 850;
+}
+
+.episode-art .episode-image + .episode-image-fallback {
+  display: none;
+}
+
+.episode-art.image-unavailable .episode-image {
+  display: none;
+}
+
+.episode-art.image-unavailable .episode-image + .episode-image-fallback {
+  display: grid;
+}
+
+.episode-card-copy {
+  min-width: 0;
+  min-height: 0;
+  height: 9.2rem;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  overflow: hidden;
+  padding: 0.75rem 1.1rem;
+}
+
+.episode-card-heading {
+  min-width: 0;
+  flex: 0 0 auto;
+}
+
+.episode-card-heading strong {
+  min-width: 0;
+}
+
+.episode-meta {
+  flex: 0 0 auto;
+}
+
+.episode-story {
+  min-height: 0;
+  margin-top: 0.08rem;
+}
+
+@media (max-height: 800px) and (min-width: 681px) {
+  .series-detail-hero {
+    padding-top: 1.15rem;
+    padding-bottom: 1.15rem;
+  }
+
+  .series-detail-layout .detail-art {
+    width: 11.5rem;
+    height: 16.5rem;
+  }
+
+  .episode-card,
+  .episode-art,
+  .episode-card-copy {
+    height: 7.5rem;
+    min-height: 7.5rem;
+  }
+
+  .episode-art {
+    width: 12rem;
+    min-width: 12rem;
+    flex-basis: 12rem;
+  }
+}
+
+@media (max-width: 680px) {
+  .series-detail-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .episode-card,
+  .episode-art,
+  .episode-card-copy {
+    height: 7.3rem;
+    min-height: 7.3rem;
+  }
+
+  .episode-art {
+    width: 8.8rem;
+    min-width: 8.8rem;
+    flex-basis: 8.8rem;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

@@ -48,6 +48,8 @@ import {
 } from './navigation'
 import { isRemoteBack, remoteDirection } from './remote-input'
 import { foldText, matchesQuery, normalizeQuery, queryTokens } from './search'
+import { focusScrollDelta } from './focus-scroll'
+import { episodeDisplayTitle, episodeThumbnailSources, seasonLabel } from './series-presentation'
 import {
   clampSeekPosition,
   hasAdvancedPlaybackTimeline,
@@ -728,6 +730,26 @@ function scrollDocumentBy(deltaY: number): void {
   }
 }
 
+function ensureFocusVisible(target: HTMLElement): void {
+  const topbarBottom = document.querySelector<HTMLElement>('.topbar')?.getBoundingClientRect().bottom ?? 0
+  const helpbarTop = document.querySelector<HTMLElement>('.helpbar')?.getBoundingClientRect().top
+  const rect = target.getBoundingClientRect()
+  const delta = focusScrollDelta(
+    rect.top,
+    rect.bottom,
+    window.innerHeight,
+    {
+      top: topbarBottom + 18,
+      bottom: (helpbarTop ?? window.innerHeight) - 18,
+    },
+  )
+
+  if (delta !== 0) {
+    window.scrollTo(0, window.scrollY + delta)
+    invalidateSpatialLayout()
+  }
+}
+
 function searchText(stream: StreamItem): string {
   return stream.searchName ?? foldText(stream.name)
 }
@@ -870,7 +892,9 @@ function restoreFocus(snapshot: FocusSnapshot | null): void {
       window.scrollTo(0, scrollY)
     }
 
-    focusTarget?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+    if (focusTarget) {
+      ensureFocusVisible(focusTarget)
+    }
   }, 0)
 }
 function cssEscape(value: string): string {
@@ -1367,13 +1391,26 @@ function liveArtwork(stream: StreamItem): string {
 }
 
 function posterArtwork(stream: StreamItem): string {
-  // Providers often return a truthy but unusable episode-art URL. Episodes are
-  // intentionally represented by their parent-series poster, which is the
-  // consistent artwork shown in the series catalog and detail view.
-  const source =
-    stream.streamType === 'episode'
-      ? stream.seriesCover || stream.cover || stream.metadata?.cover || stream.icon
-      : stream.cover || stream.metadata?.cover || stream.seriesCover || stream.icon
+  var source: string | undefined
+  var fallbackAttr = ''
+
+  if (stream.streamType === 'episode') {
+    // Attempt the per-episode still first (distinct thumbnail), falling back to
+    // the series poster on load error via data-fallback-src, then to the text
+    // tile via the existing image-unavailable path.
+    const sources = episodeThumbnailSources(stream)
+    source = sources.primary || stream.icon
+
+    const fallbackPoster = source
+      ? sources.fallback || (sources.primary !== stream.icon ? stream.icon : undefined)
+      : undefined
+
+    if (fallbackPoster && fallbackPoster !== source) {
+      fallbackAttr = ` data-fallback-src="${escape(fallbackPoster)}"`
+    }
+  } else {
+    source = stream.cover || stream.metadata?.cover || stream.seriesCover || stream.icon
+  }
 
   if (!source) {
     return imageOrPlaceholder(undefined, stream.name, 'poster')
@@ -1381,7 +1418,7 @@ function posterArtwork(stream: StreamItem): string {
 
   return `
     <span class="poster-artwork">
-      <img class="poster" src="${escape(source)}" alt="" loading="lazy" />
+      <img class="poster" src="${escape(source)}"${fallbackAttr} alt="" loading="lazy" />
       <span class="poster-fallback" aria-hidden="true">${escape(stream.name.slice(0, 1))}</span>
     </span>
   `
@@ -1617,11 +1654,20 @@ function nextSeriesEpisode(): StreamItem | null {
 }
 
 function episodeArtwork(episode: StreamItem): string {
-  const source = episode.cover || episode.metadata?.cover || episode.seriesCover
+  const sources = episodeThumbnailSources(episode)
 
-  return source
-    ? `<img class="episode-image" src="${escape(source)}" alt="" loading="lazy" />`
-    : `<span class="episode-image episode-image-fallback" aria-hidden="true">${escape(episodeIdentifier(episode))}</span>`
+  const fallback = `<span class="episode-image-fallback" aria-hidden="true">${escape(episodeIdentifier(episode))}</span>`
+
+  if (!sources.primary) {
+    return fallback
+  }
+
+  const fallbackAttr =
+    sources.fallback && sources.fallback !== sources.primary
+      ? ` data-fallback-src="${escape(sources.fallback)}"`
+      : ''
+
+  return `<img class="episode-image" src="${escape(sources.primary)}"${fallbackAttr} alt="" loading="lazy" />${fallback}`
 }
 
 function episodeMeta(episode: StreamItem, entry?: ResumeEntry): string {
@@ -1661,6 +1707,7 @@ function renderEpisodeList(): string {
     : preferredSeason
   activeSeriesSeason = selectedSeason
   const visibleEpisodes = seasons.find(([season]) => season === selectedSeason)?.[1] ?? []
+  const seriesTitle = selectedSeries.info.name
 
   return `
     <section class="series-episodes">
@@ -1672,7 +1719,7 @@ function renderEpisodeList(): string {
         ${seasons
           .map(
             ([season, episodes]) =>
-              `<button class="season-pill ${season === selectedSeason ? 'is-active' : ''}" data-action="select-series-season" data-season="${escape(season)}" data-focus-id="series-season-${escape(season)}" aria-pressed="${season === selectedSeason}">Season ${escape(season)} <span>${episodes.length}</span></button>`,
+              `<button class="season-pill ${season === selectedSeason ? 'is-active' : ''}" data-action="select-series-season" data-season="${escape(season)}" data-focus-id="series-season-${escape(season)}" aria-pressed="${season === selectedSeason}"><span class="season-label">${escape(seasonLabel(season))}</span><span class="season-count">${episodes.length} episodes</span></button>`,
           )
           .join('')}
       </div>
@@ -1685,14 +1732,20 @@ function renderEpisodeList(): string {
                 ? `<span class="episode-card-progress" style="--resume-progress:${resumePercent(entry, episode)}%"></span>`
                 : ''
             const story = episode.plot ?? episode.metadata?.plot ?? 'No episode description is available.'
+            const title = episodeDisplayTitle(
+              episode.name,
+              episode.seriesTitle ?? seriesTitle,
+              episode.season,
+              episode.episodeNumber,
+            )
 
             return `
               <button class="episode-card ${entry?.completed ? 'is-watched' : ''} ${entry?.position && !entry.completed ? 'is-in-progress' : ''}" data-action="play-episode" data-stream-key="${escape(streamLookupKey(episode))}" data-focus-id="episode-${escape(streamLookupKey(episode))}">
                 <span class="episode-art">${episodeArtwork(episode)}</span>
                 <span class="episode-card-copy">
-                  <span class="episode-card-heading"><span class="episode-number">${escape(episodeIdentifier(episode))}</span><strong>${escape(episode.name)}</strong>${entry?.completed ? '<span class="episode-state">✓ Watched</span>' : ''}</span>
+                  <span class="episode-card-heading"><span class="episode-number">${escape(episodeIdentifier(episode))}</span><strong>${escape(title)}</strong>${entry?.completed ? '<span class="episode-state">✓ Watched</span>' : ''}</span>
                   <span class="episode-meta">${episodeMeta(episode, entry)}</span>
-                  <span class="episode-story">${escape(story)}</span>
+                  <span class="episode-story" dir="auto">${escape(story)}</span>
                   ${progress}
                 </span>
               </button>`
@@ -3212,6 +3265,24 @@ function assignNavigationZones(): void {
   })
 }
 
+/**
+ * If an image has a data-fallback-src attribute, swap it to the fallback URL
+ * and remove the attribute so a second failure proceeds to the text tile.
+ * Returns true if a swap was performed (caller should skip adding
+ * image-unavailable), false if no fallback was available.
+ */
+function tryImageFallbackSwap(image: HTMLImageElement): boolean {
+  var fallbackSrc = image.getAttribute('data-fallback-src')
+
+  if (fallbackSrc && fallbackSrc !== image.src) {
+    image.removeAttribute('data-fallback-src')
+    image.src = fallbackSrc
+    return true
+  }
+
+  return false
+}
+
 function bindEvents(): void {
   invalidateSpatialLayout()
 
@@ -3246,7 +3317,14 @@ function bindEvents(): void {
           target.closest<HTMLElement>('.live-channel-artwork')?.classList.add('logo-unavailable')
         }
 
-        if (target.classList.contains('poster')) {
+        // Try swapping to the fallback image before marking unavailable.
+        if (tryImageFallbackSwap(target)) {
+          return
+        }
+
+        if (target.classList.contains('episode-image')) {
+          target.closest<HTMLElement>('.episode-art')?.classList.add('image-unavailable')
+        } else if (target.classList.contains('poster')) {
           target.closest<HTMLElement>('.poster-artwork')?.classList.add('image-unavailable')
         }
       },
@@ -3255,7 +3333,7 @@ function bindEvents(): void {
     liveLogoErrorHandlerBound = true
   }
 
-  app.querySelectorAll<HTMLImageElement>('.live-channel-logo, .poster').forEach((image) => {
+  app.querySelectorAll<HTMLImageElement>('.live-channel-logo, .poster, .episode-image').forEach((image) => {
     if (image.dataset.errorCheckScheduled === 'true') {
       return
     }
@@ -3266,8 +3344,15 @@ function bindEvents(): void {
         return
       }
 
+      // Try swapping to the fallback image before marking unavailable.
+      if (tryImageFallbackSwap(image)) {
+        return
+      }
+
       if (image.classList.contains('live-channel-logo')) {
         image.closest<HTMLElement>('.live-channel-artwork')?.classList.add('logo-unavailable')
+      } else if (image.classList.contains('episode-image')) {
+        image.closest<HTMLElement>('.episode-art')?.classList.add('image-unavailable')
       } else {
         image.closest<HTMLElement>('.poster-artwork')?.classList.add('image-unavailable')
       }
@@ -4603,6 +4688,10 @@ function beginPlayback(item: StreamItem): void {
   playerSourceOverride = null
   playerForceDirect = false
   showPlayerChannels = false
+  // Every newly opened stream must start at normal speed. Playback rate is
+  // module-level session state, so without this reset a speed chosen on a
+  // previous item would silently carry over to the next file.
+  playerPlaybackRate = 1
   view = 'player'
   render()
 }
@@ -5131,7 +5220,7 @@ function navigationLayout(): { items: NavigationItem[]; elements: Map<string, HT
 
 function moveFocus(target: HTMLElement): void {
   target.focus({ preventScroll: true })
-  target.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  ensureFocusVisible(target)
   invalidateSpatialLayout()
 }
 
