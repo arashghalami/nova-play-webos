@@ -6,6 +6,7 @@ import type {
   StreamItem,
   XtreamProfile,
 } from './types'
+import { foldText } from './search'
 
 const ACTIVE_PROFILE_KEY = 'nova-play.profile'
 const PROFILES_KEY = 'nova-play.profiles'
@@ -358,7 +359,11 @@ function toStoredStream(stream: StreamItem): StreamItem {
     episodeNumber: stream.episodeNumber,
     seriesTitle: stream.seriesTitle,
     seriesCover: stream.seriesCover,
-    searchName: stream.searchName ?? stream.name.toLocaleLowerCase(),
+    // Always re-fold rather than trusting a cached searchName: entries persisted
+    // by older versions stored an accent-preserving `toLocaleLowerCase()` value,
+    // which would no longer match the accent-folded query tokens. foldText is
+    // idempotent for already-folded ASCII, so re-persisting is safe.
+    searchName: foldText(stream.name),
   }
 }
 

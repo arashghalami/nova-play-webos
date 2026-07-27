@@ -46,6 +46,7 @@ import {
   type NavigationItem,
 } from './navigation'
 import { isRemoteBack, remoteDirection } from './remote-input'
+import { foldText, matchesQuery, normalizeQuery, queryTokens } from './search'
 import {
   clampSeekPosition,
   hasAdvancedPlaybackTimeline,
@@ -139,6 +140,9 @@ type GlobalSearchViewUpdate = {
 type PlayerUiMode = 'immersive' | 'overlay' | 'focused' | 'seeking'
 const CATALOG_PAGE_SIZE = 60
 const SEARCH_DEBOUNCE_MS = 240
+// Local, in-memory catalog filtering is cheap, so it can react faster than the
+// networked global search without feeling chatty.
+const CATALOG_SEARCH_DEBOUNCE_MS = 140
 const NUMERIC_CHANNEL_TIMEOUT_MS = 1600
 const NOW_NEXT_CONCURRENCY = 4
 const MAX_KNOWN_STREAMS = 5_000
@@ -261,7 +265,7 @@ const streamCache = new Map<string, CachedStreams>()
 const sectionCategories = new Map<LibrarySection, Category[]>()
 const adultCategoryIds = new Map<LibrarySection, Set<string>>()
 const nowNextCache = new Map<string, NowNext>()
-const nowNextLoading = new Set<string>()
+const nowNextLoading = new Map<string, AbortController>()
 
 if (profile && repairResumeEpisodeContexts()) {
   saveResume(profile.id, resumeEntries)
@@ -694,6 +698,7 @@ function startNavigation(): { token: number; signal: AbortSignal } {
   navigationToken += 1
   navigationController?.abort()
   nowNextPrefetchController?.abort()
+  nowNextLoading.clear()
   navigationController = new AbortController()
   nowNextPrefetchController = null
   return { token: navigationToken, signal: navigationController.signal }
@@ -721,7 +726,7 @@ function scrollDocumentBy(deltaY: number): void {
 }
 
 function searchText(stream: StreamItem): string {
-  return stream.searchName ?? stream.name.toLocaleLowerCase()
+  return stream.searchName ?? foldText(stream.name)
 }
 
 function cacheNowNext(key: string, value: NowNext): void {
@@ -928,7 +933,8 @@ function renderShell(content: string, title = currentViewTitle()): void {
 }
 
 function catalogResultsFor(activeCatalog: CatalogState): CatalogResults {
-  const normalizedQuery = activeCatalog.query.toLocaleLowerCase()
+  const normalizedQuery = normalizeQuery(activeCatalog.query)
+  const tokens = queryTokens(activeCatalog.query)
   const key = [
     activeCatalog.category?.id ?? 'categories',
     normalizedQuery,
@@ -945,14 +951,14 @@ function catalogResultsFor(activeCatalog: CatalogState): CatalogResults {
   const categories = sortCategories(
     activeCatalog.categories.filter(
       (category) =>
-        category.name.toLocaleLowerCase().includes(normalizedQuery) &&
+        matchesQuery(foldText(category.name), tokens) &&
         (!settings.hideAdultContent || !isAdult(category.name)),
     ),
   )
   const streams = sortStreams(
     activeCatalog.streams.filter(
       (stream) =>
-        searchText(stream).includes(normalizedQuery) &&
+        matchesQuery(searchText(stream), tokens) &&
         visibleStream(stream),
     ),
     activeCatalog.sort,
@@ -1175,13 +1181,42 @@ function renderCatalog(): void {
     ${renderCatalogPager(itemCount, pageCount)}
   `)
 
-  document.querySelector<HTMLInputElement>('#search-input')?.addEventListener('input', (event) => {
-    scheduleCatalogSearch((event.target as HTMLInputElement).value)
-  })
+  bindSearchInput(
+    document.querySelector<HTMLInputElement>('#search-input'),
+    scheduleCatalogSearch,
+  )
 
   if (catalog.section === 'live' && catalog.category !== null) {
     prefetchNowNext(pageStreams)
   }
+}
+
+// Wire a search input so it filters on debounced input but ignores events that
+// fire mid-IME-composition (which would otherwise search on half-typed text).
+function bindSearchInput(
+  input: HTMLInputElement | null | undefined,
+  schedule: (value: string) => void,
+): void {
+  if (!input) {
+    return
+  }
+
+  let composing = false
+
+  input.addEventListener('compositionstart', () => {
+    composing = true
+  })
+  input.addEventListener('compositionend', () => {
+    composing = false
+    schedule(input.value)
+  })
+  input.addEventListener('input', (event) => {
+    if (composing) {
+      return
+    }
+
+    schedule((event.target as HTMLInputElement).value)
+  })
 }
 
 function scheduleCatalogSearch(value: string): void {
@@ -1206,6 +1241,14 @@ function scheduleCatalogSearch(value: string): void {
       return
     }
 
+    // Skip a full catalog re-render when the effective query is unchanged (e.g.
+    // caret/selection moved, or trailing whitespace toggled). matchesQuery
+    // tokenizes on whitespace, so only a token-level change alters results.
+    if (normalizeQuery(catalog.query) === normalizeQuery(value)) {
+      catalog.query = value
+      return
+    }
+
     catalog.query = value
     catalog.page = 0
     requestFocus({ id: 'catalog-search', scrollY: window.scrollY, view: 'catalog' })
@@ -1222,7 +1265,7 @@ function scheduleCatalogSearch(value: string): void {
         replacement.setSelectionRange(selectionStart, selectionEnd)
       }, 0)
     }
-  }, SEARCH_DEBOUNCE_MS)
+  }, CATALOG_SEARCH_DEBOUNCE_MS)
 }
 
 function renderFavoriteGroups(streams: StreamItem[]): string {
@@ -1965,10 +2008,10 @@ function renderGlobalSearch(): void {
     <section id="global-search-results" class="global-search-groups">${renderGlobalSearchResults()}</section>
   `)
 
-  const input = document.querySelector<HTMLInputElement>('#global-search-input')
-  input?.addEventListener('input', () => {
-    scheduleGlobalSearch(input.value)
-  })
+  bindSearchInput(
+    document.querySelector<HTMLInputElement>('#global-search-input'),
+    scheduleGlobalSearch,
+  )
 }
 
 function renderSettings(): void {
@@ -3771,7 +3814,7 @@ async function openGuide(refresh = false): Promise<void> {
 }
 
 function categorySearchScore(category: Category, query: string): number {
-  const normalizedName = category.name.toLocaleLowerCase()
+  const normalizedName = foldText(category.name)
 
   if (normalizedName.includes(query)) {
     return 0
@@ -3850,6 +3893,7 @@ async function addSearchMatchesCooperatively(
 ): Promise<boolean> {
   let added = false
   let sliceStartedAt = Date.now()
+  const tokens = queryTokens(query)
 
   for (const stream of streams) {
     if (signal.aborted) {
@@ -3862,7 +3906,7 @@ async function addSearchMatchesCooperatively(
     ) {
       const key = streamLookupKey(stream)
 
-      if (!knownKeys.has(key) && searchText(stream).includes(query) && visibleStream(stream)) {
+      if (!knownKeys.has(key) && matchesQuery(searchText(stream), tokens) && visibleStream(stream)) {
         knownKeys.add(key)
         results.push(stream)
         added = true
@@ -4073,7 +4117,7 @@ async function runGlobalSearch(session?: GlobalSearchSession): Promise<void> {
   }
 
   activeSession.phase = 'searching'
-  const query = activeSession.query.toLocaleLowerCase()
+  const query = foldText(activeSession.query)
   const results: StreamItem[] = []
   const resultKeys = new Set<string>()
 
@@ -4221,7 +4265,7 @@ async function prefetchNowNext(streams: StreamItem[]): Promise<void> {
       const stream = queue[cursor]
       cursor += 1
       const key = streamLookupKey(stream)
-      nowNextLoading.add(key)
+      nowNextLoading.set(key, controller)
 
       try {
         const nowNext = await activeClient.nowNext(stream.id, signal)
@@ -4235,7 +4279,9 @@ async function prefetchNowNext(streams: StreamItem[]): Promise<void> {
           updateNowNextCard(key, undefined)
         }
       } finally {
-        nowNextLoading.delete(key)
+        if (nowNextLoading.get(key) === controller) {
+          nowNextLoading.delete(key)
+        }
       }
     }
   }

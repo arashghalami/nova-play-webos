@@ -45,6 +45,28 @@ describe('XtreamClient global search', () => {
     expect(batches.flat()).toEqual(['1', '3'])
   })
 
+  it('matches accented titles and multi-term, order-independent queries', async () => {
+    const fetchMock = vi.fn().mockImplementation(
+      () =>
+        new Response(
+          JSON.stringify([
+            { stream_id: '1', name: 'Pokémon Journeys', category_id: 'kids' },
+            { stream_id: '2', name: 'The Office (US)', category_id: 'comedy' },
+            { stream_id: '3', name: 'The Office (UK)', category_id: 'comedy' },
+          ]),
+          { status: 200 },
+        ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient(profile)
+
+    const accented = await client.searchStreams('vod', 'pokemon')
+    expect(accented.map((stream) => stream.id)).toEqual(['1'])
+
+    const multiTerm = await client.searchStreams('vod', 'us office')
+    expect(multiTerm.map((stream) => stream.id)).toEqual(['2'])
+  })
+
   it('observes cancellation after yielding parser work and publishes no late match batches', async () => {
     const originalNow = Date.now
     let now = 0
@@ -78,5 +100,156 @@ describe('XtreamClient global search', () => {
 
     expect(published).toEqual([['1']])
     Date.now = originalNow
+  })
+})
+
+describe('XtreamClient EPG', () => {
+  beforeEach(() => {
+    vi.stubGlobal('window', globalThis)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('accepts alternate EPG wrappers and field names without sending unsupported simple-EPG parameters', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          epg_list: [
+            {
+              title: 'TW9ybmluZyBOZXdz',
+              description: 'RGFpbHkgaGVhZGxpbmVz',
+              start_time: '20260101090000',
+              end_time: '20260101100000',
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient(profile)
+
+    const programs = await client.epg('42', 8)
+
+    expect(programs).toHaveLength(1)
+    expect(programs[0]).toMatchObject({
+      title: 'Morning News',
+      description: 'Daily headlines',
+    })
+    expect(programs[0].start).toEqual(new Date(2026, 0, 1, 9, 0, 0))
+    const requestUrl = new URL(String(fetchMock.mock.calls[0][0]))
+    expect(requestUrl.searchParams.get('action')).toBe('get_simple_data_table')
+    expect(requestUrl.searchParams.get('stream_id')).toBe('42')
+    expect(requestUrl.searchParams.has('limit')).toBe(false)
+  })
+
+  it('accepts direct-array EPG payloads, nested data payloads, and sorts programs chronologically', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify([
+            {
+              name: 'TGF0ZXI=',
+              start_timestamp: '1767271200',
+              end_timestamp: '1767274800',
+            },
+            {
+              name: 'RWFybGllcg==',
+              start_timestamp: '1767267600',
+              stop_timestamp: '1767271200',
+            },
+          ]),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: {
+              programs: [
+                {
+                  program_title: 'TmVzdGVk',
+                  start: '1767274800',
+                  stop: '1767278400',
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        ),
+      )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient(profile)
+
+    const directPrograms = await client.epg('42', 8)
+    const nestedPrograms = await client.epg('42', 8)
+
+    expect(directPrograms.map((program) => program.title)).toEqual(['Earlier', 'Later'])
+    expect(nestedPrograms.map((program) => program.title)).toEqual(['Nested'])
+  })
+
+  it('uses the same compatible parser for now/next fallback and selects the active program', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(150_000)
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ listings: [] }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: {
+              epg_listings: [
+                {
+                  title: 'UGFzdA==',
+                  start_timestamp: '0',
+                  stop_timestamp: '100',
+                },
+                {
+                  title: 'Tm93',
+                  start_timestamp: '100',
+                  stop_timestamp: '200',
+                },
+                {
+                  title: 'TmV4dA==',
+                  start_timestamp: '200',
+                  stop_timestamp: '300',
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        ),
+      )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient(profile)
+
+    const nowNext = await client.nowNext('42')
+
+    expect(nowNext.now?.title).toBe('Now')
+    expect(nowNext.next?.title).toBe('Next')
+    expect(new URL(String(fetchMock.mock.calls[0][0])).searchParams.get('limit')).toBe('2')
+    expect(new URL(String(fetchMock.mock.calls[1][0])).searchParams.has('limit')).toBe(false)
+  })
+
+  it('normalizes a pasted player_api.php server URL before building EPG requests', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ epg_listings: [] }), { status: 200 }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient({
+      ...profile,
+      serverUrl: 'https://example.test:8443/player_api.php?legacy=true#fragment',
+    })
+
+    await client.epg('42')
+
+    const requestUrl = new URL(String(fetchMock.mock.calls[0][0]))
+    expect(requestUrl.pathname).toBe('/player_api.php')
+    expect(requestUrl.port).toBe('8443')
   })
 })

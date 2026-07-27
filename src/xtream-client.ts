@@ -12,6 +12,7 @@ import type {
   VodDetails,
   XtreamProfile,
 } from './types'
+import { foldText, matchesQuery, queryTokens } from './search'
 
 type RawRecord = Record<string, unknown>
 
@@ -26,6 +27,9 @@ const MAX_JSON_RESPONSE_BYTES = 64 * 1024 * 1024
 const SEARCH_TIMEOUT_MS = 60_000
 const SEARCH_WORK_SLICE_MS = 8
 const MAX_SEARCH_RECORD_CHARS = 2 * 1024 * 1024
+// Cheap, allocation-free early-exit scan used to keep pure-ASCII search records
+// on the native lowercase fast path instead of the per-character accent fold.
+const NON_ASCII_PATTERN = /[^\x00-\x7f]/
 const NORMALIZATION_BATCH_SIZE = 400
 const RESPONSE_TOO_LARGE_MESSAGE =
   'This provider response is too large to load safely. Open a category to load a smaller portion of the catalog.'
@@ -62,13 +66,49 @@ function readArray(value: unknown): unknown[] {
 }
 
 function toBaseUrl(serverUrl: string): string {
-  const normalized = serverUrl.trim().replace(/\/+$/, '')
+  const source = serverUrl.trim()
 
-  if (!/^https?:\/\//i.test(normalized)) {
+  if (!/^https?:\/\//i.test(source)) {
     throw new Error('Use a full server URL beginning with http:// or https://.')
   }
 
-  return normalized
+  const url = new URL(source)
+  url.search = ''
+  url.hash = ''
+  url.pathname = url.pathname.replace(/\/player_api\.php\/?$/i, '').replace(/\/+$/, '')
+
+  return url.toString().replace(/\/+$/, '')
+}
+
+function epgListings(value: unknown): unknown[] {
+  if (Array.isArray(value)) {
+    return value
+  }
+
+  const payload = readRecord(value)
+  const candidates = [
+    payload.epg_listings,
+    payload.epg_list,
+    payload.listings,
+    payload.programs,
+    payload.data,
+  ]
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate
+    }
+
+    const nested = readRecord(candidate)
+
+    for (const key of ['epg_listings', 'epg_list', 'listings', 'programs']) {
+      if (Array.isArray(nested[key])) {
+        return nested[key]
+      }
+    }
+  }
+
+  return []
 }
 
 function parseTimestamp(value: unknown): Date | null {
@@ -485,12 +525,21 @@ export class XtreamClient {
     query: string,
     options: StreamSearchOptions = {},
   ): Promise<StreamItem[]> {
-    const normalizedQuery = query.trim().toLocaleLowerCase()
+    const tokens = queryTokens(query)
     const limit = Math.max(1, options.limit ?? 180)
 
-    if (!normalizedQuery) {
+    if (!tokens.length) {
       return []
     }
+
+    // Cheap single-token prefilter run against raw record text before JSON.parse.
+    // A record can only contain every token if it contains the longest one, so
+    // pick that to reject the most non-matches. Multi-token AND is confirmed
+    // against the parsed, folded name below.
+    const longestToken = tokens.reduce(
+      (longest, token) => (token.length > longest.length ? token : longest),
+      '',
+    )
 
     const actions: Record<LibrarySection, string> = {
       live: 'get_live_streams',
@@ -536,8 +585,15 @@ export class XtreamClient {
     const processRecord = (source: string): boolean => {
       // Reject the overwhelming majority of records before JSON.parse. Whole
       // IPTV libraries can contain hundreds of thousands of objects, and JSON
-      // parsing every non-match starves the webOS UI thread.
-      if (!source.toLocaleLowerCase().includes(normalizedQuery)) {
+      // parsing every non-match starves the webOS UI thread. Keep the common
+      // pure-ASCII record on the native lowercase fast path; only pay the
+      // per-character fold when the source actually contains accents (so an
+      // accented title still survives the prefilter, confirmed below).
+      const haystack = NON_ASCII_PATTERN.test(source)
+        ? foldText(source)
+        : source.toLowerCase()
+
+      if (!haystack.includes(longestToken)) {
         return false
       }
 
@@ -545,7 +601,7 @@ export class XtreamClient {
         const record = readRecord(JSON.parse(source))
         const name = readString(record.name ?? record.title) ?? ''
 
-        if (!name.toLocaleLowerCase().includes(normalizedQuery)) {
+        if (!matchesQuery(foldText(name), tokens)) {
           return false
         }
 
@@ -791,58 +847,34 @@ export class XtreamClient {
   }
 
   async epg(streamId: string, limit = 8, signal?: AbortSignal): Promise<Program[]> {
-    const payload = readRecord(
-      await this.getJson<RawRecord>(
-        'get_simple_data_table',
-        { stream_id: streamId, limit: String(limit) },
-        { signal },
-      ),
+    const payload = await this.getJson<unknown>(
+      'get_simple_data_table',
+      { stream_id: streamId },
+      { signal },
     )
 
-    return this.parsePrograms(payload.epg_listings)
+    return this.parsePrograms(epgListings(payload)).slice(0, Math.max(1, limit))
   }
 
   async nowNext(streamId: string, signal?: AbortSignal): Promise<NowNext> {
-    const payload = readRecord(
-      await this.getJson<RawRecord>(
-        'get_short_epg',
-        { stream_id: streamId, limit: '2' },
-        { signal },
-      ),
+    const payload = await this.getJson<unknown>(
+      'get_short_epg',
+      { stream_id: streamId, limit: '2' },
+      { signal },
     )
-    const programs = this.parsePrograms(payload.epg_listings ?? payload.epg_list ?? payload.listings)
+    const programs = this.parsePrograms(epgListings(payload))
 
     if (programs.length) {
-      return {
-        now: programs[0],
-        next: programs[1],
-      }
+      return this.selectNowNext(programs)
     }
 
-    const fallbackPayload = readRecord(
-      await this.getJson<RawRecord>(
-        'get_simple_data_table',
-        {
-          stream_id: streamId,
-          limit: '24',
-        },
-        { signal },
-      ),
+    const fallbackPayload = await this.getJson<unknown>(
+      'get_simple_data_table',
+      { stream_id: streamId },
+      { signal },
     )
-    const fallbackPrograms = this.parsePrograms(fallbackPayload.epg_listings)
-    const now = Date.now()
-    const activeIndex = fallbackPrograms.findIndex(
-      (program) => program.start.getTime() <= now && program.end.getTime() > now,
-    )
-    const nextIndex =
-      activeIndex >= 0
-        ? activeIndex + 1
-        : fallbackPrograms.findIndex((program) => program.start.getTime() > now)
 
-    return {
-      now: activeIndex >= 0 ? fallbackPrograms[activeIndex] : undefined,
-      next: fallbackPrograms[nextIndex] ?? fallbackPrograms[nextIndex + 1],
-    }
+    return this.selectNowNext(this.parsePrograms(epgListings(fallbackPayload)))
   }
 
   catchupUrl(item: StreamItem, start: Date, durationMinutes: number): string | null {
@@ -913,30 +945,64 @@ export class XtreamClient {
       channelNumber: readString(record.num),
       catchup: parseCatchup(record),
       directSource: readString(record.direct_source),
-      searchName: name.toLocaleLowerCase(),
+      searchName: foldText(name),
+    }
+  }
+
+  private selectNowNext(programs: Program[]): NowNext {
+    const now = Date.now()
+    const activeIndex = programs.findIndex(
+      (program) => program.start.getTime() <= now && program.end.getTime() > now,
+    )
+    const nextIndex =
+      activeIndex >= 0
+        ? activeIndex + 1
+        : programs.findIndex((program) => program.start.getTime() > now)
+
+    return {
+      now: activeIndex >= 0 ? programs[activeIndex] : undefined,
+      next: nextIndex >= 0 ? programs[nextIndex] : undefined,
     }
   }
 
   private parsePrograms(value: unknown): Program[] {
-    return readArray(value).flatMap((listing) => {
-      const record = readRecord(listing)
-      const start = parseTimestamp(record.start_timestamp ?? record.start)
-      const end = parseTimestamp(record.stop_timestamp ?? record.end)
+    return readArray(value)
+      .flatMap((listing) => {
+        const record = readRecord(listing)
+        const start = parseTimestamp(
+          record.start_timestamp ??
+            record.start ??
+            record.start_time ??
+            record.start_datetime ??
+            record.start_date,
+        )
+        const end = parseTimestamp(
+          record.stop_timestamp ??
+            record.end_timestamp ??
+            record.end ??
+            record.stop ??
+            record.end_time ??
+            record.stop_time ??
+            record.end_datetime ??
+            record.end_date,
+        )
 
-      if (!start || !end) {
-        return []
-      }
+        if (!start || !end || end.getTime() <= start.getTime()) {
+          return []
+        }
 
-      const encodedTitle = readString(record.title ?? record.name) ?? ''
-      const encodedDescription = readString(record.description ?? record.descr) ?? ''
+        const encodedTitle = readString(record.title ?? record.name ?? record.program_title) ?? ''
+        const encodedDescription =
+          readString(record.description ?? record.descr ?? record.program_description) ?? ''
 
-      return [{
-        title: this.decodeBase64(encodedTitle),
-        description: this.decodeBase64(encodedDescription),
-        start,
-        end,
-      }]
-    })
+        return [{
+          title: this.decodeBase64(encodedTitle),
+          description: this.decodeBase64(encodedDescription),
+          start,
+          end,
+        }]
+      })
+      .sort((left, right) => left.start.getTime() - right.start.getTime())
   }
 
   private decodeBase64(value: string): string {
