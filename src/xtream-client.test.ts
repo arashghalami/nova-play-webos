@@ -103,6 +103,72 @@ describe('XtreamClient global search', () => {
   })
 })
 
+describe('XtreamClient series details', () => {
+  beforeEach(() => {
+    vi.stubGlobal('window', globalThis)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('retains episode stories, stills, dates, durations, and alternate episode identifiers', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          info: {
+            name: 'Example Series',
+            cover: 'https://images.example/series.jpg',
+          },
+          episodes: {
+            '1': [
+              {
+                episode_id: 'episode-101',
+                episode_number: '1',
+                title: 'The Beginning',
+                info: {
+                  story: 'The team reunites for an unexpected case.',
+                  episode_image: 'https://images.example/episode-101.jpg',
+                  air_date: '2025-04-12',
+                  duration: '00:42:30',
+                  vote_average: '8.4',
+                },
+              },
+            ],
+          },
+        }),
+        { status: 200 },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient(profile)
+
+    const series = await client.seriesInfo('series-1')
+    const episode = series.episodes['1'][0]
+
+    expect(episode).toMatchObject({
+      id: 'episode-101',
+      name: 'The Beginning',
+      season: '1',
+      episodeNumber: '1',
+      cover: 'https://images.example/episode-101.jpg',
+      plot: 'The team reunites for an unexpected case.',
+    })
+    expect(episode.metadata).toMatchObject({
+      plot: 'The team reunites for an unexpected case.',
+      cover: 'https://images.example/episode-101.jpg',
+      releaseDate: '2025-04-12',
+      duration: '00:42:30',
+      durationSeconds: 2_550,
+      rating: '8.4',
+    })
+    expect(new URL(String(fetchMock.mock.calls[0][0])).searchParams.get('action')).toBe(
+      'get_series_info',
+    )
+  })
+})
+
 describe('XtreamClient EPG', () => {
   beforeEach(() => {
     vi.stubGlobal('window', globalThis)

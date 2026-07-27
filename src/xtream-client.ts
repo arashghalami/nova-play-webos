@@ -61,6 +61,19 @@ function readRecord(value: unknown): RawRecord {
   return value as RawRecord
 }
 
+/**
+ * Episode season fields vary by provider: some send a bare number ("1"), others
+ * send prefixed forms like "S01" or "Season 1". The UI's episodeIdentifier()
+ * prepends its own "S" and zero-pads, so a raw "S01" would render as "SS01".
+ * Only trust a purely numeric value; otherwise fall back to the reliable map
+ * grouping key.
+ */
+function normalizeSeasonNumber(raw: string | undefined, fallback: string): string {
+  const trimmed = raw?.trim()
+
+  return trimmed && /^\d+$/.test(trimmed) ? trimmed : fallback
+}
+
 function readArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
 }
@@ -309,21 +322,34 @@ function parseMetadata(record: RawRecord): RichMetadata {
     record.youtube_trailer ?? record.trailer ?? record.trailer_url ?? record.youtube,
   )
 
+  const duration = readString(record.duration ?? record.runtime ?? record.duration_formatted)
+
   return {
     originalTitle: readString(record.o_name ?? record.original_name),
-    plot: readString(record.plot ?? record.description),
-    cover: readString(record.movie_image ?? record.cover ?? record.cover_big),
+    plot: readString(record.plot ?? record.description ?? record.story ?? record.synopsis ?? record.overview),
+    cover: readString(
+      record.movie_image ??
+        record.episode_image ??
+        record.still_path ??
+        record.image ??
+        record.cover ??
+        record.cover_big,
+    ),
     backdrops: backdrops.length ? backdrops : undefined,
     genre: readString(record.genre),
     cast: readString(record.cast ?? record.actors),
     director: readString(record.director),
     country: readString(record.country),
-    releaseDate: readString(record.releasedate ?? record.release_date ?? record.releaseDate),
+    releaseDate: readString(
+      record.releasedate ?? record.release_date ?? record.releaseDate ?? record.air_date ?? record.aired,
+    ),
     year: readString(record.year),
-    rating: readString(record.rating),
+    rating: readString(record.rating ?? record.vote_average),
     ratingFiveBased: readString(record.rating_5based),
-    duration: readString(record.duration),
-    durationSeconds: parseDurationSeconds(record.duration_secs ?? record.duration_seconds),
+    duration,
+    durationSeconds: parseDurationSeconds(
+      record.duration_secs ?? record.duration_seconds ?? record.runtime_seconds ?? duration,
+    ),
     ageRating: readString(record.age ?? record.age_rating ?? record.mpaa_rating),
     tmdbId: readString(record.tmdb_id ?? record.tmdb),
     trailer,
@@ -808,7 +834,7 @@ export class XtreamClient {
       episodes[season] = values.flatMap((episode) => {
         const record = readRecord(episode)
         const info = readRecord(record.info)
-        const id = readString(record.id)
+        const id = readString(record.id ?? record.episode_id ?? record.stream_id ?? info.id)
 
         if (!id) {
           return []
@@ -818,17 +844,19 @@ export class XtreamClient {
 
         return [{
           id,
-          name: readString(record.title ?? record.name) ?? 'Untitled episode',
+          name: readString(record.title ?? record.name ?? info.title ?? info.name) ?? 'Untitled episode',
           section: 'series',
-          categoryId: '',
+          categoryId: readString(record.category_id ?? info.category_id) ?? '',
           cover: metadata.cover,
           rating: metadata.rating,
           year: metadata.year,
-          containerExtension: readString(record.container_extension) ?? 'mp4',
+          containerExtension: readString(record.container_extension ?? info.container_extension) ?? 'mp4',
           streamType: 'episode',
           plot: metadata.plot,
-          season,
-          episodeNumber: readString(record.episode_num ?? info.episode_num),
+          season: normalizeSeasonNumber(readString(record.season ?? info.season), season),
+          episodeNumber: readString(
+            record.episode_num ?? record.episode ?? record.episode_number ?? info.episode_num ?? info.episode,
+          ),
           directSource: readString(record.direct_source ?? info.direct_source),
           metadata,
         }]

@@ -16,8 +16,9 @@ const LEGACY_RESUME_KEY = 'nova-play.resume'
 const MAX_FAVORITES = 500
 const MAX_RESUME_ENTRIES = 100
 
-const DEFAULT_SETTINGS: AppSettings = {
+export const DEFAULT_SETTINGS: AppSettings = {
   preferHls: true,
+  preservePitch: true,
   bufferSeconds: 20,
   timeFormat: '24h',
   hideAdultContent: true,
@@ -109,6 +110,7 @@ export function loadSettings(profileId: string): AppSettings {
     ...(saved ?? {}),
     bufferSeconds: clampBufferSeconds(saved?.bufferSeconds),
     preferHls: saved?.preferHls ?? DEFAULT_SETTINGS.preferHls,
+    preservePitch: saved?.preservePitch ?? DEFAULT_SETTINGS.preservePitch,
     timeFormat: saved?.timeFormat === '12h' ? '12h' : '24h',
     hideAdultContent: saved?.hideAdultContent ?? DEFAULT_SETTINGS.hideAdultContent,
     parentalPin: typeof saved?.parentalPin === 'string' ? saved.parentalPin : undefined,

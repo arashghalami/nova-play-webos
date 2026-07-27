@@ -1,13 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import {
+  applyPlaybackRate,
   clampSeekPosition,
   hasAdvancedPlaybackTimeline,
   hasVerifiedVideoFrame,
   hasVisibleVideoTrack,
   isDoubleSeekTap,
+  type PitchControllableMedia,
   SEEK_DOUBLE_TAP_WINDOW_MS,
   seekFeedbackLabel,
   seekStepForHold,
+  timelinePercentFromPosition,
+  timelinePositionFromPercent,
+  TIMELINE_SEEK_STEP_SECONDS,
 } from './player-transport'
 
 describe('player transport behavior', () => {
@@ -59,5 +64,51 @@ describe('player transport behavior', () => {
   it('provides conventional directional seek feedback', () => {
     expect(seekFeedbackLabel(-10)).toBe('−10 seconds')
     expect(seekFeedbackLabel(60)).toBe('+60 seconds')
+  })
+
+  it('maps YouTube-style timeline previews between percentages and media positions', () => {
+    expect(TIMELINE_SEEK_STEP_SECONDS).toBe(5)
+    expect(timelinePositionFromPercent(25, 400)).toBe(100)
+    expect(timelinePositionFromPercent(-10, 400)).toBe(0)
+    expect(timelinePositionFromPercent(110, 400)).toBe(400)
+    expect(timelinePositionFromPercent(50, Number.NaN)).toBe(0)
+    expect(timelinePercentFromPosition(100, 400)).toBe(25)
+    expect(timelinePercentFromPosition(-5, 400)).toBe(0)
+    expect(timelinePercentFromPosition(450, 400)).toBe(100)
+    expect(timelinePercentFromPosition(100, 0)).toBe(0)
+  })
+
+  it('sets all vendor pitch flags true when preservePitch is enabled above 1x', () => {
+    const media: PitchControllableMedia = { playbackRate: 1 }
+    applyPlaybackRate(media, 1.5, true)
+    expect(media.preservesPitch).toBe(true)
+    expect(media.mozPreservesPitch).toBe(true)
+    expect(media.webkitPreservesPitch).toBe(true)
+    expect(media.playbackRate).toBe(1.5)
+  })
+
+  it('sets all vendor pitch flags false when preservePitch is disabled above 1x', () => {
+    const media: PitchControllableMedia = { playbackRate: 1 }
+    applyPlaybackRate(media, 2, false)
+    expect(media.preservesPitch).toBe(false)
+    expect(media.mozPreservesPitch).toBe(false)
+    expect(media.webkitPreservesPitch).toBe(false)
+    expect(media.playbackRate).toBe(2)
+  })
+
+  it('leaves pitch flags untouched at exactly 1x to preserve the default audio path', () => {
+    const media: PitchControllableMedia = { playbackRate: 2 }
+    applyPlaybackRate(media, 1, true)
+    expect(media.preservesPitch).toBeUndefined()
+    expect(media.mozPreservesPitch).toBeUndefined()
+    expect(media.webkitPreservesPitch).toBeUndefined()
+    expect(media.playbackRate).toBe(1)
+  })
+
+  it('applies a representative fast speed with pitch handling', () => {
+    const media: PitchControllableMedia = { playbackRate: 1 }
+    applyPlaybackRate(media, 2, true)
+    expect(media.playbackRate).toBe(2)
+    expect(media.preservesPitch).toBe(true)
   })
 })

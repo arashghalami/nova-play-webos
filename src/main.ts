@@ -5,6 +5,7 @@ import './style.css'
 import {
   clearProfile,
   continueWatching,
+  DEFAULT_SETTINGS,
   favoriteKey,
   favoriteStreams,
   hydrateFavorites,
@@ -52,9 +53,13 @@ import {
   hasAdvancedPlaybackTimeline,
   hasVerifiedVideoFrame,
   hasVisibleVideoTrack,
+  applyPlaybackRate,
   isDoubleSeekTap,
   seekFeedbackLabel,
   seekStepForHold,
+  timelinePercentFromPosition,
+  timelinePositionFromPercent,
+  TIMELINE_SEEK_STEP_SECONDS,
 } from './player-transport'
 import {
   describePlaybackFailure,
@@ -193,18 +198,14 @@ let profile = loadProfile()
 let client = profile ? new XtreamClient(profile) : null
 let settings: AppSettings = profile
   ? loadSettings(profile.id)
-  : {
-      preferHls: true,
-      bufferSeconds: 20,
-      timeFormat: '24h',
-      hideAdultContent: true,
-    }
+  : { ...DEFAULT_SETTINGS }
 let account: AccountSummary | null = null
 let view: AppView = profile ? 'home' : 'login'
 let renderedView: AppView | null = null
 let catalog: CatalogState | null = null
 let selectedItem: StreamItem | null = null
 let selectedSeries: SeriesDetails | null = null
+let activeSeriesSeason: string | null = null
 let selectedVod: VodDetails | null = null
 let playerItem: StreamItem | null = null
 let lastLiveItem: StreamItem | null = null
@@ -233,6 +234,8 @@ let playerSeekStartedAt = 0
 let playerSeekHoldTimer: number | null = null
 let playerSeekRepeatTimer: number | null = null
 let playerSeekFeedbackTimer: number | null = null
+let playerTimelinePreviewSeconds: number | null = null
+let playerTimelineWasPlaying = false
 let playerLastSeekDirection: -1 | 1 | null = null
 let playerLastSeekAt = 0
 let wakeLock: { release: () => Promise<void> } | null = null
@@ -817,7 +820,7 @@ function defaultFocusTarget(): HTMLElement | null {
             '.catalog-tools [data-focus-id]',
           ]
         : view === 'details'
-          ? ['[data-focus-id="detail-play"]', '.episodes [data-focus-id]']
+          ? ['[data-focus-id="detail-play-next"]', '[data-focus-id="detail-play"]', '.series-episodes [data-focus-id]']
           : view === 'guide'
             ? ['.guide-grid [data-focus-id]', '.catalog-tools [data-focus-id]']
             : view === 'search'
@@ -1451,12 +1454,14 @@ function renderDetails(): void {
   ].filter((fact): fact is string => Boolean(fact))
   const backdrop = metadata.backdrops?.[0] ?? media
 
+  const isParentSeries = item.section === 'series' && !item.streamType
+
   renderShell(`
-    <section class="detail-hero">
+    <section class="detail-hero ${isParentSeries ? 'series-detail-hero' : ''}">
       <div class="detail-backdrop" aria-hidden="true">
         ${backdrop ? `<img src="${escape(backdrop)}" alt="" />` : ''}
       </div>
-      <div class="detail-layout detail-layout-cinematic">
+      <div class="detail-layout detail-layout-cinematic ${isParentSeries ? 'series-detail-layout' : ''}">
         <div class="detail-art">${imageOrPlaceholder(media, item.name, 'detail-image')}</div>
         <div class="detail-copy">
           <p class="eyebrow">${item.section === 'series' ? 'Series' : item.streamType === 'episode' ? `Season ${escape(item.season ?? '')} · Episode ${escape(item.episodeNumber ?? '')}` : item.section === 'live' ? 'Live TV' : 'Movie'}</p>
@@ -1501,11 +1506,27 @@ function renderRichMetadata(metadata: RichMetadata): string {
 }
 
 function detailActions(item: StreamItem, metadata: RichMetadata): string {
+  const streamKey = streamLookupKey(item)
+
   if (item.section === 'series' && !item.streamType) {
-    return '<p class="hint">Choose an episode below to start watching.</p>'
+    const nextEpisode = nextSeriesEpisode()
+    const progress = selectedSeries
+      ? seriesProgressSummary(Object.values(selectedSeries.episodes).flat())
+      : ''
+
+    return `
+      ${progress}
+      <div class="action-row series-action-row">
+        ${
+          nextEpisode
+            ? `<button class="primary-button" data-action="play-next-episode" data-stream-key="${escape(streamLookupKey(nextEpisode))}" data-focus-id="detail-play-next">▶ ${resumeEntries.get(streamLookupKey(nextEpisode))?.position ? 'Continue' : 'Start'} ${escape(episodeIdentifier(nextEpisode))}</button>`
+            : ''
+        }
+        <button class="secondary-button" data-action="toggle-favorite" data-favorite-key="${escape(streamKey)}" data-favorite-style="label" data-focus-id="detail-favorite">${hasFavorite(favorites, item) ? '★ Saved to favorites' : '☆ Add to favorites'}</button>
+      </div>
+    `
   }
 
-  const streamKey = streamLookupKey(item)
   const resume = resumeEntries.get(streamKey)
   const canMarkWatched = item.section !== 'live'
   const canCatchup = item.section === 'live' && item.catchup?.available
@@ -1542,50 +1563,142 @@ function seriesProgressSummary(episodes: StreamItem[]): string {
   return `<p class="episode-summary">${watched} of ${total} watched${inProgress ? ` · ${inProgress} in progress` : ''}</p>`
 }
 
+function compareSeasonNames(left: string, right: string): number {
+  // Treat empty digit extraction as NaN so non-numeric names ("Specials",
+  // "Extras") never collapse to 0 and sort ahead of real numbered seasons.
+  const leftDigits = left.replace(/[^\d.]/g, '')
+  const rightDigits = right.replace(/[^\d.]/g, '')
+  const leftNumber = leftDigits ? Number(leftDigits) : Number.NaN
+  const rightNumber = rightDigits ? Number(rightDigits) : Number.NaN
+  const leftIsNumeric = Number.isFinite(leftNumber)
+  const rightIsNumeric = Number.isFinite(rightNumber)
+
+  if (leftIsNumeric && rightIsNumeric && leftNumber !== rightNumber) {
+    return leftNumber - rightNumber
+  }
+
+  // Numbered seasons sort before non-numeric ones (e.g. Season 3 before Specials).
+  if (leftIsNumeric !== rightIsNumeric) {
+    return leftIsNumeric ? -1 : 1
+  }
+
+  return left.localeCompare(right)
+}
+
+function orderedSeriesEpisodes(): StreamItem[] {
+  if (!selectedSeries) {
+    return []
+  }
+
+  return Object.entries(selectedSeries.episodes)
+    .sort(([left], [right]) => compareSeasonNames(left, right))
+    .flatMap(([, episodes]) =>
+      [...episodes].sort((left, right) => {
+        const leftNumber = Number(left.episodeNumber)
+        const rightNumber = Number(right.episodeNumber)
+
+        if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+          return leftNumber - rightNumber
+        }
+
+        return left.name.localeCompare(right.name)
+      }),
+    )
+}
+
+function nextSeriesEpisode(): StreamItem | null {
+  const episodes = orderedSeriesEpisodes()
+  const inProgress = episodes.find((episode) => {
+    const entry = resumeEntries.get(streamLookupKey(episode))
+    return Boolean(entry && !entry.completed && entry.position > 0)
+  })
+
+  return inProgress ?? episodes.find((episode) => !resumeEntries.get(streamLookupKey(episode))?.completed) ?? episodes[0] ?? null
+}
+
+function episodeArtwork(episode: StreamItem): string {
+  const source = episode.cover || episode.metadata?.cover || episode.seriesCover
+
+  return source
+    ? `<img class="episode-image" src="${escape(source)}" alt="" loading="lazy" />`
+    : `<span class="episode-image episode-image-fallback" aria-hidden="true">${escape(episodeIdentifier(episode))}</span>`
+}
+
+function episodeMeta(episode: StreamItem, entry?: ResumeEntry): string {
+  const values = [
+    episode.metadata?.duration ?? (episode.metadata?.durationSeconds ? formatDuration(episode.metadata.durationSeconds) : undefined),
+    episode.metadata?.releaseDate ?? episode.year,
+    episode.metadata?.rating ? `★ ${episode.metadata.rating}` : undefined,
+    entry?.completed ? 'Watched' : entry?.position ? resumeLabel(entry, episode) : undefined,
+  ].filter((value): value is string => Boolean(value))
+
+  return values.map((value) => `<span>${escape(value)}</span>`).join('')
+}
+
 function renderEpisodeList(): string {
   if (!selectedSeries) {
     return ''
   }
 
   const seasons = Object.entries(selectedSeries.episodes)
-  const allEpisodes = seasons.flatMap(([, episodes]) => episodes)
+    .filter(([, episodes]) => episodes.length)
+    .sort(([left], [right]) => compareSeasonNames(left, right))
+  const allEpisodes = orderedSeriesEpisodes()
 
   if (!seasons.length) {
     return '<section class="empty-state"><h2>No episodes available</h2><p>The provider did not return episode information for this series.</p></section>'
   }
 
-  return `
-    <section class="episodes">
-      <div class="episodes-heading"><h2>Episodes</h2>${seriesProgressSummary(allEpisodes)}</div>
-      ${seasons
-        .map(
-          ([season, episodes]) => `
-            <div class="season"><h3>Season ${escape(season)}</h3>
-            ${episodes
-              .map((episode) => {
-                const entry = resumeEntries.get(streamLookupKey(episode))
-                const status = entry
-                  ? resumeLabel(entry, episode)
-                  : 'Not watched'
-                const progress =
-                  entry && !entry.completed
-                    ? `<span class="episode-progress" style="--resume-progress:${resumePercent(entry, episode)}%"></span>`
-                    : ''
+  const preferredSeason =
+    seasons.find(([, episodes]) =>
+      episodes.some((episode) => {
+        const entry = resumeEntries.get(streamLookupKey(episode))
+        return Boolean(entry && !entry.completed && entry.position > 0)
+      }),
+    )?.[0] ?? seasons[0][0]
+  const selectedSeason = seasons.some(([season]) => season === activeSeriesSeason)
+    ? activeSeriesSeason!
+    : preferredSeason
+  activeSeriesSeason = selectedSeason
+  const visibleEpisodes = seasons.find(([season]) => season === selectedSeason)?.[1] ?? []
 
-                return `
-                  <button class="episode ${entry?.completed ? 'is-watched' : ''}" data-action="play-episode" data-stream-key="${escape(streamLookupKey(episode))}" data-focus-id="episode-${escape(streamLookupKey(episode))}">
-                    <span class="episode-indicator" aria-hidden="true">${entry?.completed ? '✓' : '▶'}</span>
-                    <span class="episode-copy">
-                      <strong><span class="episode-number">${escape(episodeIdentifier(episode))}</span>${escape(episode.name)}</strong>
-                      <small>${escape(status)}${episode.plot ? ` · ${escape(episode.plot)}` : ''}</small>
-                      ${progress}
-                    </span>
-                  </button>`
-              })
-              .join('')}
-            </div>`,
-        )
-        .join('')}
+  return `
+    <section class="series-episodes">
+      <div class="episodes-heading series-episodes-heading">
+        <div><p class="eyebrow">Episode guide</p><h2>Episodes</h2></div>
+        ${seriesProgressSummary(allEpisodes)}
+      </div>
+      <div class="season-selector" data-nav-zone="series-seasons" aria-label="Seasons">
+        ${seasons
+          .map(
+            ([season, episodes]) =>
+              `<button class="season-pill ${season === selectedSeason ? 'is-active' : ''}" data-action="select-series-season" data-season="${escape(season)}" data-focus-id="series-season-${escape(season)}" aria-pressed="${season === selectedSeason}">Season ${escape(season)} <span>${episodes.length}</span></button>`,
+          )
+          .join('')}
+      </div>
+      <section class="episode-list" data-nav-zone="series-episodes" aria-label="Season ${escape(selectedSeason)} episodes">
+        ${visibleEpisodes
+          .map((episode) => {
+            const entry = resumeEntries.get(streamLookupKey(episode))
+            const progress =
+              entry && !entry.completed
+                ? `<span class="episode-card-progress" style="--resume-progress:${resumePercent(entry, episode)}%"></span>`
+                : ''
+            const story = episode.plot ?? episode.metadata?.plot ?? 'No episode description is available.'
+
+            return `
+              <button class="episode-card ${entry?.completed ? 'is-watched' : ''} ${entry?.position && !entry.completed ? 'is-in-progress' : ''}" data-action="play-episode" data-stream-key="${escape(streamLookupKey(episode))}" data-focus-id="episode-${escape(streamLookupKey(episode))}">
+                <span class="episode-art">${episodeArtwork(episode)}</span>
+                <span class="episode-card-copy">
+                  <span class="episode-card-heading"><span class="episode-number">${escape(episodeIdentifier(episode))}</span><strong>${escape(episode.name)}</strong>${entry?.completed ? '<span class="episode-state">✓ Watched</span>' : ''}</span>
+                  <span class="episode-meta">${episodeMeta(episode, entry)}</span>
+                  <span class="episode-story">${escape(story)}</span>
+                  ${progress}
+                </span>
+              </button>`
+          })
+          .join('')}
+      </section>
     </section>
   `
 }
@@ -2032,6 +2145,7 @@ function renderSettings(): void {
         <p class="panel-kicker">Playback</p>
         <h2>Make it yours</h2>
         <label class="setting-row"><span>Prefer HLS live streams<small>Use adaptive streaming when available</small></span><input id="setting-prefer-hls" data-focus-id="setting-prefer-hls" type="checkbox" ${settings.preferHls ? 'checked' : ''} /></label>
+        <label class="setting-row"><span>Preserve pitch when speeding up<small>Keep voices natural above 1×. Turn off if audio is silent when fast.</small></span><input id="setting-preserve-pitch" data-focus-id="setting-preserve-pitch" type="checkbox" ${settings.preservePitch ? 'checked' : ''} /></label>
         <label class="setting-row"><span>Live buffer</span><select id="setting-buffer" data-focus-id="setting-buffer">
           ${[10, 20, 30, 45, 60].map((value) => `<option value="${value}" ${settings.bufferSeconds === value ? 'selected' : ''}>${value} seconds</option>`).join('')}
         </select></label>
@@ -2127,7 +2241,7 @@ function renderPlayer(): void {
           : ''
       }
       <div id="player-progress-wrap" class="player-progress-wrap ${playerProgressClass}">
-        <div class="player-time"><span id="player-current">0:00</span><span id="player-duration">0:00</span></div>
+        <div class="player-time"><span id="player-current">0:00</span><span id="player-preview-time" hidden></span><span id="player-duration">0:00</span></div>
         <input id="player-progress" data-focus-id="player-progress" aria-label="Playback position" type="range" min="0" max="100" value="0" step="0.1" />
       </div>
     </main>
@@ -2141,8 +2255,9 @@ function renderPlayer(): void {
   const progress = document.querySelector<HTMLInputElement>('#player-progress')
   const currentTime = document.querySelector<HTMLElement>('#player-current')
   const duration = document.querySelector<HTMLElement>('#player-duration')
+  const previewTime = document.querySelector<HTMLElement>('#player-preview-time')
 
-  if (!video || !message || !diagnostics || !progress || !currentTime || !duration) {
+  if (!video || !message || !diagnostics || !progress || !currentTime || !duration || !previewTime) {
     return
   }
 
@@ -2154,6 +2269,7 @@ function renderPlayer(): void {
   const playerProgress = progress
   const playerCurrentTime = currentTime
   const playerDuration = duration
+  const playerPreviewTime = previewTime
   let lastResumeSaveAt = 0
   let playbackWatchdog: number | null = null
   let visiblePlaybackConfirmed = false
@@ -2204,6 +2320,8 @@ function renderPlayer(): void {
   })
   playerDiagnostics = []
   playerDiagnosticsExpanded = false
+  playerTimelinePreviewSeconds = null
+  playerTimelineWasPlaying = false
 
   const cleanupActiveTransport = (): void => {
     activeHls?.destroy()
@@ -2234,6 +2352,7 @@ function renderPlayer(): void {
   }
 
   const cleanup = (): void => {
+    discardPlayerTimelinePreview()
     persistProgress()
     activeAttemptGeneration += 1
     clearPlaybackWatchdog()
@@ -2589,7 +2708,7 @@ function renderPlayer(): void {
     })
   }
 
-  player.playbackRate = playerPlaybackRate
+  applyPlaybackRate(player as any, playerPlaybackRate, settings.preservePitch)
   player.muted = playerMuted
 
   function restoreResume(): void {
@@ -2631,7 +2750,87 @@ function renderPlayer(): void {
     }
   }
 
+  function setPlayerTimelinePresentation(position: number): void {
+    if (!Number.isFinite(player.duration) || player.duration <= 0) {
+      return
+    }
+
+    const safePosition = clampSeekPosition(position, player.duration)
+    const percent = timelinePercentFromPosition(safePosition, player.duration)
+    playerProgress.value = String(percent)
+    playerProgress.style.setProperty('--timeline-progress', `${percent}%`)
+    playerCurrentTime.textContent = formatDuration(safePosition)
+  }
+
+  function updatePlayerTimelinePreview(position: number): void {
+    if (!Number.isFinite(player.duration) || player.duration <= 0) {
+      return
+    }
+
+    if (playerTimelinePreviewSeconds === null) {
+      playerTimelineWasPlaying = !player.paused
+    }
+
+    if (playerTimelineWasPlaying && !player.paused) {
+      player.pause()
+    }
+
+    playerTimelinePreviewSeconds = clampSeekPosition(position, player.duration)
+    setPlayerTimelinePresentation(playerTimelinePreviewSeconds)
+    playerPreviewTime.textContent = `Seek to ${formatDuration(playerTimelinePreviewSeconds)}`
+    playerPreviewTime.hidden = false
+  }
+
+  function commitPlayerTimelinePreview(): void {
+    const position = playerTimelinePreviewSeconds
+
+    if (position === null) {
+      return
+    }
+
+    const resumePlayback = playerTimelineWasPlaying
+    // Always clear preview state first so the player can never get stuck paused
+    // with a stale overlay when duration is momentarily unavailable (e.g. during
+    // a live-DVR manifest refresh).
+    playerTimelinePreviewSeconds = null
+    playerTimelineWasPlaying = false
+    playerPreviewTime.hidden = true
+
+    if (Number.isFinite(player.duration) && player.duration > 0) {
+      player.currentTime = clampSeekPosition(position, player.duration)
+      setPlayerTimelinePresentation(player.currentTime)
+      showPlayerSeekFeedback(`Seeking to ${formatDuration(player.currentTime)}`)
+    }
+
+    if (resumePlayback) {
+      void player.play().catch(() => showPlayerMessage('Press OK to continue playback.'))
+    }
+  }
+
+  function discardPlayerTimelinePreview(): void {
+    if (playerTimelinePreviewSeconds === null) {
+      return
+    }
+
+    playerTimelinePreviewSeconds = null
+    playerTimelineWasPlaying = false
+    setPlayerTimelinePresentation(player.currentTime)
+    playerPreviewTime.hidden = true
+  }
+
+  function updatePlayerPlayControl(): void {
+    const button = document.querySelector<HTMLElement>('[data-action="toggle-play"]')
+
+    if (button) {
+      button.textContent = player.paused ? '▶' : 'Ⅱ'
+      button.setAttribute('aria-label', player.paused ? 'Play' : 'Pause')
+    }
+  }
+
   player.addEventListener('loadedmetadata', () => {
+    // Re-assert rate + pitch after source (re)attach so HLS.js/mpegts.js/dash.js
+    // engine swaps don't silently reset the media element's playback properties.
+    applyPlaybackRate(player as any, playerPlaybackRate, settings.preservePitch)
     restoreResume()
     // On webOS, loaded metadata is the reliable native-playback readiness signal.
     // Do not destroy a stream that has already attached a playable media pipeline
@@ -2655,8 +2854,9 @@ function renderPlayer(): void {
       (activeItem.section !== 'live' || Boolean(playerSourceOverride)) &&
       Number.isFinite(player.duration)
     ) {
-      playerProgress.value = String((player.currentTime / player.duration) * 100)
-      playerCurrentTime.textContent = formatDuration(player.currentTime)
+      if (playerTimelinePreviewSeconds === null) {
+        setPlayerTimelinePresentation(player.currentTime)
+      }
       playerDuration.textContent = formatDuration(player.duration)
 
       if (activeItem.section !== 'live' && Date.now() - lastResumeSaveAt > 10_000) {
@@ -2664,7 +2864,10 @@ function renderPlayer(): void {
       }
     }
   })
-  player.addEventListener('pause', persistProgress)
+  player.addEventListener('pause', () => {
+    persistProgress()
+    updatePlayerPlayControl()
+  })
   player.addEventListener('ended', () => {
     if (activeItem.section !== 'live') {
       markStreamWatched(activeItem, true, player.duration)
@@ -2682,14 +2885,42 @@ function renderPlayer(): void {
     // The webOS emulator can render native video while exposing neither stable
     // dimensions nor decoded-frame statistics. Once the media element reports
     // playing, it must not be torn down by the visual-frame watchdog.
+    updatePlayerPlayControl()
     confirmPlaybackStarted()
   })
   player.addEventListener('resize', () => {
     confirmVisiblePlayback()
   })
+  playerProgress.addEventListener('focus', () => {
+    setPlayerTimelinePresentation(player.currentTime)
+  })
   playerProgress.addEventListener('input', () => {
-    if (Number.isFinite(player.duration)) {
-      player.currentTime = (Number(playerProgress.value) / 100) * player.duration
+    if (Number.isFinite(player.duration) && player.duration > 0) {
+      updatePlayerTimelinePreview(
+        timelinePositionFromPercent(Number(playerProgress.value), player.duration),
+      )
+    }
+  })
+  playerProgress.addEventListener('change', commitPlayerTimelinePreview)
+  playerProgress.addEventListener('nova-timeline-step', (event) => {
+    if (!Number.isFinite(player.duration) || player.duration <= 0) {
+      return
+    }
+
+    const seconds = (event as CustomEvent<number>).detail
+    const basePosition = playerTimelinePreviewSeconds ?? player.currentTime
+    updatePlayerTimelinePreview(basePosition + seconds)
+  })
+  playerProgress.addEventListener('nova-timeline-confirm', () => {
+    if (playerTimelinePreviewSeconds !== null) {
+      commitPlayerTimelinePreview()
+    } else {
+      togglePlayback()
+    }
+  })
+  playerProgress.addEventListener('blur', () => {
+    if (playerTimelinePreviewSeconds !== null) {
+      commitPlayerTimelinePreview()
     }
   })
   document.addEventListener('mousemove', revealControls)
@@ -2959,7 +3190,7 @@ function assignNavigationZones(): void {
     '.category-grid',
     '.catalog-pager',
     '.action-row',
-    '.episodes',
+    '.series-episodes',
     '.guide-grid',
     '.global-search-panel',
     '.global-search-group',
@@ -3208,6 +3439,26 @@ async function handleAction(element: HTMLElement): Promise<void> {
 
   if (action === 'play-selected' && selectedItem) {
     beginPlayback(selectedItem)
+    return
+  }
+
+  if (action === 'play-next-episode') {
+    const episode = streamFromKey(element.dataset.streamKey)
+
+    if (episode) {
+      beginPlayback(episode)
+    }
+    return
+  }
+
+  if (action === 'select-series-season' && selectedSeries) {
+    const season = element.dataset.season
+
+    if (season && selectedSeries.episodes[season]) {
+      activeSeriesSeason = season
+      requestFocus({ id: `series-season-${season}`, scrollY: window.scrollY, view: 'details' })
+      renderDetails()
+    }
     return
   }
 
@@ -3646,6 +3897,7 @@ async function openDetails(stream: StreamItem): Promise<void> {
   rememberStreams([stream])
   selectedItem = stream
   selectedSeries = null
+  activeSeriesSeason = null
   selectedVod = null
 
   if (stream.section === 'live') {
@@ -3672,7 +3924,7 @@ async function openDetails(stream: StreamItem): Promise<void> {
           season,
           episodes.map((episode) => ({
             ...episode,
-            cover: seriesCover || episode.cover,
+            cover: episode.cover || seriesCover,
             seriesId: stream.seriesId ?? stream.id,
             seriesTitle,
             seriesCover,
@@ -4413,7 +4665,7 @@ function cyclePlaybackSpeed(): void {
   const video = document.querySelector<HTMLVideoElement>('#video-player')
 
   if (video) {
-    video.playbackRate = playerPlaybackRate
+    applyPlaybackRate(video as any, playerPlaybackRate, settings.preservePitch)
   }
 
   const button = document.querySelector<HTMLElement>('[data-action="cycle-speed"]')
@@ -4642,6 +4894,7 @@ function saveCurrentSettings(): void {
   }
 
   const preferHls = document.querySelector<HTMLInputElement>('#setting-prefer-hls')
+  const preservePitch = document.querySelector<HTMLInputElement>('#setting-preserve-pitch')
   const buffer = document.querySelector<HTMLSelectElement>('#setting-buffer')
   const timeFormat = document.querySelector<HTMLSelectElement>('#setting-time-format')
   const hideAdult = document.querySelector<HTMLInputElement>('#setting-hide-adult')
@@ -4663,6 +4916,7 @@ function saveCurrentSettings(): void {
   settings = {
     ...settings,
     preferHls: preferHls?.checked ?? settings.preferHls,
+    preservePitch: preservePitch?.checked ?? settings.preservePitch,
     bufferSeconds: Number(buffer?.value ?? settings.bufferSeconds),
     timeFormat: timeFormat?.value === '12h' ? '12h' : '24h',
     hideAdultContent: nextHideAdultContent,
@@ -4692,6 +4946,7 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: XtreamClient):
   catalogReturnPoint = null
   selectedItem = null
   selectedSeries = null
+  activeSeriesSeason = null
   selectedVod = null
   playerItem = null
   liveQueue = []
@@ -5225,7 +5480,38 @@ window.addEventListener('keydown', (event) => {
     }
 
     const isPlayerControl = isFocusedPlayerControl()
+    const isTimeline = activeElement instanceof HTMLInputElement && activeElement.id === 'player-progress'
     const isSeekKey = direction === 'ArrowLeft' || direction === 'ArrowRight'
+    const isConfirmKey = event.key === 'Enter' || event.key === ' '
+
+    if (isTimeline && isSeekKey) {
+      event.preventDefault()
+      activeElement.dispatchEvent(
+        new CustomEvent<number>('nova-timeline-step', {
+          detail: direction === 'ArrowLeft'
+            ? -TIMELINE_SEEK_STEP_SECONDS
+            : TIMELINE_SEEK_STEP_SECONDS,
+        }),
+      )
+      return
+    }
+
+    if (isTimeline && isConfirmKey) {
+      event.preventDefault()
+      activeElement.dispatchEvent(new Event('nova-timeline-confirm'))
+      return
+    }
+
+    if (
+      isPlayerControl &&
+      isConfirmKey &&
+      activeElement instanceof HTMLElement &&
+      activeElement.dataset.action === 'toggle-play'
+    ) {
+      event.preventDefault()
+      togglePlayback()
+      return
+    }
 
     if (isSeekKey && !isPlayerControl) {
       event.preventDefault()

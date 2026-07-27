@@ -13,6 +13,7 @@ export interface XtreamProfile {
 export interface AppSettings {
   startupSection?: LibrarySection
   preferHls: boolean
+  preservePitch: boolean
   bufferSeconds: number
   timeFormat: '12h' | '24h'
   hideAdultContent: boolean
