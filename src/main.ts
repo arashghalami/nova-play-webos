@@ -213,6 +213,76 @@ function canChangePlaybackSpeed(): boolean {
   return supportsAudiblePlaybackRate(isWebOsRuntime())
 }
 
+/**
+ * Provision an Xtream profile from webOS launch parameters, so credentials can
+ * be injected from the terminal without an on-screen login. This exists because
+ * ares-shell is locked down on the target TV (no direct localStorage access),
+ * and an uninstall (ares-install -r) wipes the app's stored profile.
+ *
+ * Inject from a dev machine with, e.g.:
+ *   ares-launch -d lg-oled-g1 com.arash.novaplay -p '{"provisionProfile":{"name":"My IPTV","serverUrl":"http://host:port","username":"user","password":"pass"}}'
+ *
+ * The param is consumed once: after a successful save the profile lives in
+ * localStorage exactly as if it had been entered through the login form.
+ */
+function provisionProfileFromLaunchParams(): void {
+  try {
+    const launchParams = (
+      window as Window & { webOSSystem?: { launchParams?: string } }
+    ).webOSSystem?.launchParams
+
+    if (!launchParams) {
+      return
+    }
+
+    const parsed = JSON.parse(launchParams) as {
+      provisionProfile?: Partial<XtreamProfile>
+    }
+    const candidate = parsed.provisionProfile
+
+    if (
+      !candidate ||
+      typeof candidate.serverUrl !== 'string' ||
+      typeof candidate.username !== 'string' ||
+      typeof candidate.password !== 'string'
+    ) {
+      return
+    }
+
+    const injected: XtreamProfile = {
+      id: candidate.id && typeof candidate.id === 'string'
+        ? candidate.id
+        : crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${Date.now()}`,
+      name:
+        typeof candidate.name === 'string' && candidate.name.trim()
+          ? candidate.name.trim()
+          : 'My IPTV',
+      serverUrl: candidate.serverUrl.trim(),
+      username: candidate.username.trim(),
+      password: candidate.password,
+    }
+
+    // Skip if an identical profile is already stored, so relaunching with the
+    // same param is idempotent and does not disturb the active selection.
+    const alreadyStored = loadProfiles().some(
+      (existing) =>
+        existing.serverUrl === injected.serverUrl &&
+        existing.username === injected.username &&
+        existing.password === injected.password,
+    )
+
+    if (!alreadyStored) {
+      saveProfile(injected)
+    }
+  } catch {
+    // A malformed launch param must never block normal startup.
+  }
+}
+
+provisionProfileFromLaunchParams()
+
 let profile = loadProfile()
 let client = profile ? new XtreamClient(profile) : null
 let settings: AppSettings = profile
@@ -279,6 +349,7 @@ let stickyColumnX: number | null = null
 let stickyColumnZone: string | null = null
 let appHistoryDepth = 0
 let retainSearchOnNextPopState = false
+let playerAbsorbNextPopState = false
 const expandedGlobalSearchSections = new Set<LibrarySection>()
 let favorites = profile ? loadFavorites(profile.id) : new Map()
 let resumeEntries = profile ? loadResume(profile.id) : new Map<string, ResumeEntry>()
@@ -3106,7 +3177,13 @@ function setPlayerUiMode(mode: PlayerUiMode): void {
 
   if (mode === 'overlay' || mode === 'seeking') {
     playerControlsTimer = window.setTimeout(() => {
-      if (playerUiMode === 'overlay') {
+      // Match YouTube/VLC: never auto-hide the controls while the video is
+      // paused, otherwise the user is left on a frozen frame with no state
+      // indication. The controls stay up until playback resumes or Back is
+      // pressed. Seeking is transient, so it is allowed to time out.
+      const video = document.querySelector<HTMLVideoElement>('#video-player')
+
+      if (playerUiMode === 'overlay' && !video?.paused) {
         setPlayerUiMode('immersive')
       }
     }, 3500)
@@ -5528,6 +5605,12 @@ window.addEventListener('keydown', (event) => {
     if (view === 'player' && playerUiMode !== 'immersive') {
       cancelPlayerSeek()
       setPlayerUiMode('immersive')
+      // On webOS the physical Back button fires both a keydown AND a
+      // companion browser history.back() (popstate). We consumed the
+      // keydown here to only hide the controls; set a flag so the
+      // popstate handler absorbs the companion event instead of
+      // navigating away from the player.
+      playerAbsorbNextPopState = true
       event.preventDefault()
       event.stopImmediatePropagation()
       return
@@ -5640,9 +5723,14 @@ window.addEventListener('keydown', (event) => {
       event.preventDefault()
 
       if (playerUiMode === 'immersive') {
+        // First OK from the bare video surface only reveals the controls
+        // (YouTube/VLC behaviour). It must NOT toggle playback yet.
         setPlayerUiMode('overlay')
       } else {
-        setPlayerUiMode('immersive')
+        // Controls are already visible and focus is still on the surface:
+        // OK now toggles play/pause. togglePlayback() re-reveals the controls
+        // and, with the paused-aware auto-hide, keeps them up while paused.
+        togglePlayback()
       }
       return
     }
@@ -5736,6 +5824,30 @@ window.addEventListener(
 )
 
 window.addEventListener('popstate', (event) => {
+  // Back-button handling for the player must live here because on this webOS
+  // TV the physical Back arrives ONLY as a browser history.back() → popstate
+  // (no companion keydown). Rule: first Back with controls visible only hides
+  // them (stay in player); next Back (immersive) exits. The consumed history
+  // entry is re-pushed so a later Back still has an entry to pop.
+  //
+  // playerAbsorbNextPopState covers webOS versions that ALSO fire a keydown for
+  // Back: there the keydown already hid the controls and set the flag, so this
+  // companion popstate is simply absorbed.
+  if (view === 'player' && (playerAbsorbNextPopState || playerUiMode !== 'immersive')) {
+    playerAbsorbNextPopState = false
+    cancelPlayerSeek()
+    setPlayerUiMode('immersive')
+
+    if (isAppHistoryState(event.state)) {
+      appHistoryDepth = event.state.depth
+    } else {
+      appHistoryDepth = Math.max(0, appHistoryDepth - 1)
+    }
+
+    pushAppHistory()
+    return
+  }
+
   // A webOS Back press can arrive only as browser history navigation. Consume
   // active-search history before inspecting the state, because some webOS
   // versions provide null/non-app state for that companion event.
