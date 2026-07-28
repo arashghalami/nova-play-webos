@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest'
 import {
   applyPlaybackRate,
   clampSeekPosition,
+  effectivePreservePitch,
   hasAdvancedPlaybackTimeline,
   hasVerifiedVideoFrame,
   hasVisibleVideoTrack,
   isDoubleSeekTap,
+  supportsAudiblePlaybackRate,
   type PitchControllableMedia,
   SEEK_DOUBLE_TAP_WINDOW_MS,
   seekFeedbackLabel,
@@ -78,8 +80,25 @@ describe('player transport behavior', () => {
     expect(timelinePercentFromPosition(100, 0)).toBe(0)
   })
 
-  it('sets all vendor pitch flags true when preservePitch is enabled above 1x', () => {
-    const media: PitchControllableMedia = { playbackRate: 1 }
+  it('blocks accelerated playback on webOS because native fast playback mutes audio', () => {
+    expect(supportsAudiblePlaybackRate(true)).toBe(false)
+    expect(effectivePreservePitch(true, true)).toBe(false)
+    expect(effectivePreservePitch(false, true)).toBe(false)
+  })
+
+  it('allows accelerated playback and honors pitch preferences on non-webOS runtimes', () => {
+    expect(supportsAudiblePlaybackRate(false)).toBe(true)
+    expect(effectivePreservePitch(true, false)).toBe(true)
+    expect(effectivePreservePitch(false, false)).toBe(false)
+  })
+
+  it('sets available vendor pitch flags true when pitch preservation is enabled above 1x', () => {
+    const media: PitchControllableMedia = {
+      playbackRate: 1,
+      preservesPitch: false,
+      mozPreservesPitch: false,
+      webkitPreservesPitch: false,
+    }
     applyPlaybackRate(media, 1.5, true)
     expect(media.preservesPitch).toBe(true)
     expect(media.mozPreservesPitch).toBe(true)
@@ -87,8 +106,13 @@ describe('player transport behavior', () => {
     expect(media.playbackRate).toBe(1.5)
   })
 
-  it('sets all vendor pitch flags false when preservePitch is disabled above 1x', () => {
-    const media: PitchControllableMedia = { playbackRate: 1 }
+  it('sets available vendor pitch flags false when pitch preservation is disabled above 1x', () => {
+    const media: PitchControllableMedia = {
+      playbackRate: 1,
+      preservesPitch: true,
+      mozPreservesPitch: true,
+      webkitPreservesPitch: true,
+    }
     applyPlaybackRate(media, 2, false)
     expect(media.preservesPitch).toBe(false)
     expect(media.mozPreservesPitch).toBe(false)
@@ -96,19 +120,26 @@ describe('player transport behavior', () => {
     expect(media.playbackRate).toBe(2)
   })
 
-  it('leaves pitch flags untouched at exactly 1x to preserve the default audio path', () => {
-    const media: PitchControllableMedia = { playbackRate: 2 }
-    applyPlaybackRate(media, 1, true)
-    expect(media.preservesPitch).toBeUndefined()
-    expect(media.mozPreservesPitch).toBeUndefined()
-    expect(media.webkitPreservesPitch).toBeUndefined()
-    expect(media.playbackRate).toBe(1)
+  it('does not create unsupported pitch properties on older webOS media elements', () => {
+    const media: PitchControllableMedia = { playbackRate: 1 }
+    applyPlaybackRate(media, 1.5, false)
+    expect(media).not.toHaveProperty('preservesPitch')
+    expect(media).not.toHaveProperty('mozPreservesPitch')
+    expect(media).not.toHaveProperty('webkitPreservesPitch')
+    expect(media.playbackRate).toBe(1.5)
   })
 
-  it('applies a representative fast speed with pitch handling', () => {
-    const media: PitchControllableMedia = { playbackRate: 1 }
-    applyPlaybackRate(media, 2, true)
-    expect(media.playbackRate).toBe(2)
+  it('leaves pitch flags untouched at exactly 1x to preserve the default audio path', () => {
+    const media: PitchControllableMedia = {
+      playbackRate: 2,
+      preservesPitch: true,
+      mozPreservesPitch: true,
+      webkitPreservesPitch: true,
+    }
+    applyPlaybackRate(media, 1, false)
     expect(media.preservesPitch).toBe(true)
+    expect(media.mozPreservesPitch).toBe(true)
+    expect(media.webkitPreservesPitch).toBe(true)
+    expect(media.playbackRate).toBe(1)
   })
 })

@@ -106,17 +106,34 @@ export interface PitchControllableMedia {
 }
 
 /**
- * Apply playback rate and pitch handling in one place. When preservePitch is
- * true, request YouTube-style pitch-preserving time-stretch (natural voice);
- * when false, disable it so audio stays audible (higher pitch) instead of the
- * silence some webOS builds emit while time-stretching. Writes all vendor
- * variants because older webOS Chromium only honors the prefixed forms.
+ * LG webOS hardware can make audio silent for any native playbackRate above
+ * 1×, even when pitch preservation is disabled. The browser simulator uses a
+ * different media pipeline and cannot validate this hardware limitation.
  *
- * At exactly 1× there is no time-stretching to perform, so the pitch flags are
- * intentionally left untouched. Some webOS audio pipelines attach a broken
- * resampler node the moment preservesPitch is written and emit silence even at
- * normal speed; skipping the write at 1× preserves the untouched-default audio
- * path that plays correctly.
+ * There is no reliable browser API for detecting lost audio, so block the
+ * control on webOS rather than leaving viewers in a silent trick-play state.
+ */
+export function supportsAudiblePlaybackRate(isWebOsRuntime: boolean): boolean {
+  return !isWebOsRuntime
+}
+
+/**
+ * Pitch preservation is only meaningful where higher playback rates have an
+ * audible audio path. On webOS this remains disabled as a second line of
+ * defense for any pre-existing rate state.
+ */
+export function effectivePreservePitch(requested: boolean, isWebOsRuntime: boolean): boolean {
+  return requested && supportsAudiblePlaybackRate(isWebOsRuntime)
+}
+
+/**
+ * Apply playback rate and pitch handling in one place. At exactly 1× the
+ * pitch flags are intentionally untouched because some webOS audio pipelines
+ * attach a broken resampler as soon as a pitch flag is written.
+ *
+ * Only assign properties the media element actually exposes. Older webOS
+ * Chromium versions may not implement these flags; assigning an unknown flag
+ * creates a JavaScript expando rather than configuring native playback.
  */
 export function applyPlaybackRate(
   media: PitchControllableMedia,
@@ -124,9 +141,17 @@ export function applyPlaybackRate(
   preservePitch: boolean,
 ): void {
   if (rate !== 1) {
-    media.preservesPitch = preservePitch
-    media.mozPreservesPitch = preservePitch
-    media.webkitPreservesPitch = preservePitch
+    if ('preservesPitch' in media) {
+      media.preservesPitch = preservePitch
+    }
+
+    if ('mozPreservesPitch' in media) {
+      media.mozPreservesPitch = preservePitch
+    }
+
+    if ('webkitPreservesPitch' in media) {
+      media.webkitPreservesPitch = preservePitch
+    }
   }
 
   media.playbackRate = rate

@@ -30,7 +30,8 @@ Nova Play is a private Xtream Codes IPTV player for LG webOS TVs. It provides a 
 - Series season/episode browsing with watched indicators and next-episode autoplay
 - Resume positions with a **collision-safe composite identity** (`section:streamType:id`)
 - Continue Watching rail on Home, resume markers, and mark watched/unwatched controls
-- VOD and episode skip ±10 seconds, scrub control, playback speed, mute, and fit/fill aspect controls
+- VOD and episode skip ±10 seconds, scrub control, mute, and fit/fill aspect controls
+- Playback speed on desktop/browser runtimes with an audible accelerated-audio path; it is disabled on physical LG webOS TVs where the native media pipeline mutes audio above 1×
 - Character-by-character global search across Live TV, movies, and series, with debouncing, stale-request cancellation, streamed partial results when supported, and category fallback
 
 ### Library, profiles, and privacy
@@ -192,6 +193,7 @@ Feature availability varies by provider and stream:
 - **Guide data** depends on the provider returning valid short EPG/simple EPG records.
 - **Recording/PVR is intentionally not implemented.** A packaged webOS application does not have a reliable, user-approved background download/recording pipeline, durable large-media storage model, or a consistent provider-authorisation model for recordings. Implementing it would require a separate supported backend/service and explicit storage, rights, and legal design.
 - Screen wake/keep-alive calls are best-effort; TV firmware may still apply its own energy-saving policies.
+- **Playback speed:** the physical LG webOS media pipeline can advance video while muting audio for `HTMLMediaElement.playbackRate > 1`, regardless of pitch-preservation flags or whether native HLS, HLS.js, MPEG-TS, or DASH provides the source. The emulator uses a different implementation and may still produce sound. Nova Play therefore keeps LG playback at `1×` and hides the speed control rather than presenting silent trick-play. Audible accelerated playback would require a provider/server-side transcoded rendition (or a supported native player API), not a client-side web-app change.
 
 Test one H.264 live channel, one HEVC channel, one movie, one series episode, one archived programme, and any multi-audio/subtitle stream on the physical TV.
 

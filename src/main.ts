@@ -56,7 +56,9 @@ import {
   hasVerifiedVideoFrame,
   hasVisibleVideoTrack,
   applyPlaybackRate,
+  effectivePreservePitch,
   isDoubleSeekTap,
+  supportsAudiblePlaybackRate,
   seekFeedbackLabel,
   seekStepForHold,
   timelinePercentFromPosition,
@@ -195,6 +197,21 @@ if (!appElement) {
 }
 
 const app: HTMLDivElement = appElement
+
+function isWebOsRuntime(): boolean {
+  return Boolean(
+    (window as Window & { webOSSystem?: unknown }).webOSSystem ||
+      /web0s|webos/i.test(navigator.userAgent),
+  )
+}
+
+function playbackPreservesPitch(): boolean {
+  return effectivePreservePitch(settings.preservePitch, isWebOsRuntime())
+}
+
+function canChangePlaybackSpeed(): boolean {
+  return supportsAudiblePlaybackRate(isWebOsRuntime())
+}
 
 let profile = loadProfile()
 let client = profile ? new XtreamClient(profile) : null
@@ -2187,6 +2204,8 @@ function renderGlobalSearch(): void {
 
 function renderSettings(): void {
   const profiles = loadProfiles()
+  const webOsRuntime = isWebOsRuntime()
+  const preservePitch = playbackPreservesPitch()
 
   renderShell(`
     <section class="catalog-heading">
@@ -2198,7 +2217,7 @@ function renderSettings(): void {
         <p class="panel-kicker">Playback</p>
         <h2>Make it yours</h2>
         <label class="setting-row"><span>Prefer HLS live streams<small>Use adaptive streaming when available</small></span><input id="setting-prefer-hls" data-focus-id="setting-prefer-hls" type="checkbox" ${settings.preferHls ? 'checked' : ''} /></label>
-        <label class="setting-row"><span>Preserve pitch when speeding up<small>Keep voices natural above 1×. Turn off if audio is silent when fast.</small></span><input id="setting-preserve-pitch" data-focus-id="setting-preserve-pitch" type="checkbox" ${settings.preservePitch ? 'checked' : ''} /></label>
+        <label class="setting-row"><span>Preserve pitch when speeding up<small>${webOsRuntime ? 'Unavailable on this LG TV: its native media pipeline mutes audio above 1×.' : 'Keep voices natural above 1×. Turn off if audio is silent when fast.'}</small></span><input id="setting-preserve-pitch" data-focus-id="setting-preserve-pitch" type="checkbox" ${preservePitch ? 'checked' : ''} ${webOsRuntime ? 'disabled' : ''} /></label>
         <label class="setting-row"><span>Live buffer</span><select id="setting-buffer" data-focus-id="setting-buffer">
           ${[10, 20, 30, 45, 60].map((value) => `<option value="${value}" ${settings.bufferSeconds === value ? 'selected' : ''}>${value} seconds</option>`).join('')}
         </select></label>
@@ -2255,7 +2274,7 @@ function renderPlayer(): void {
     : '<button class="icon-button" data-action="skip-backward" data-focus-id="player-skip-backward" aria-label="Skip backward 10 seconds">−10</button>'
   const playerUtilityControls = isLive
     ? '<button class="icon-button" data-action="toggle-last-channel" data-focus-id="player-last-channel" aria-label="Return to last channel">↶</button>'
-    : `<button class="icon-button" data-action="skip-forward" data-focus-id="player-skip-forward" aria-label="Skip forward 10 seconds">+10</button><button class="icon-button" data-action="cycle-speed" data-focus-id="player-speed" aria-label="Playback speed">${playerPlaybackRate}×</button>`
+    : `<button class="icon-button" data-action="skip-forward" data-focus-id="player-skip-forward" aria-label="Skip forward 10 seconds">+10</button>${canChangePlaybackSpeed() ? `<button class="icon-button" data-action="cycle-speed" data-focus-id="player-speed" aria-label="Playback speed">${playerPlaybackRate}×</button>` : ''}`
 
   app.innerHTML = `
     <main id="player-surface" class="player-page player-aspect-${playerAspect}" tabindex="0" aria-label="Video player. Press OK to show controls.">
@@ -2338,19 +2357,16 @@ function renderPlayer(): void {
     player.canPlayType('application/vnd.apple.mpegurl') ||
       player.canPlayType('application/x-mpegURL'),
   )
-  const isWebOsRuntime = Boolean(
-    (window as Window & { webOSSystem?: unknown }).webOSSystem ||
-      /web0s|webos/i.test(navigator.userAgent),
-  )
+  const isWebOs = isWebOsRuntime()
   const mpegtsFeatures = Mpegts.isSupported() ? Mpegts.getFeatureList() : null
   const playbackCapabilities: PlaybackCapabilities = {
     nativeHls: nativeHlsSupport,
-    nativeTransportStream: Boolean(player.canPlayType('video/mp2t')) || isWebOsRuntime,
+    nativeTransportStream: Boolean(player.canPlayType('video/mp2t')) || isWebOs,
     nativeVideo: true,
     hlsJs: Hls.isSupported(),
     mpegts: Boolean(mpegtsFeatures?.mseLivePlayback),
     dash: typeof MediaSource !== 'undefined',
-    preferNativeTransport: isWebOsRuntime,
+    preferNativeTransport: isWebOs,
   }
   const playbackSources = discoverPlaybackSources({
     isLive: activeItem.section === 'live',
@@ -2761,7 +2777,7 @@ function renderPlayer(): void {
     })
   }
 
-  applyPlaybackRate(player as any, playerPlaybackRate, settings.preservePitch)
+  applyPlaybackRate(player as any, playerPlaybackRate, playbackPreservesPitch())
   player.muted = playerMuted
 
   function restoreResume(): void {
@@ -2883,7 +2899,7 @@ function renderPlayer(): void {
   player.addEventListener('loadedmetadata', () => {
     // Re-assert rate + pitch after source (re)attach so HLS.js/mpegts.js/dash.js
     // engine swaps don't silently reset the media element's playback properties.
-    applyPlaybackRate(player as any, playerPlaybackRate, settings.preservePitch)
+    applyPlaybackRate(player as any, playerPlaybackRate, playbackPreservesPitch())
     restoreResume()
     // On webOS, loaded metadata is the reliable native-playback readiness signal.
     // Do not destroy a stream that has already attached a playable media pipeline
@@ -4748,13 +4764,25 @@ function seekBy(seconds: number): void {
 }
 
 function cyclePlaybackSpeed(): void {
+  if (!canChangePlaybackSpeed()) {
+    playerPlaybackRate = 1
+    const video = document.querySelector<HTMLVideoElement>('#video-player')
+
+    if (video) {
+      applyPlaybackRate(video as any, playerPlaybackRate, false)
+    }
+
+    showToast('Speed control is unavailable on this LG TV because higher speeds mute audio.')
+    return
+  }
+
   const values = [1, 1.25, 1.5, 2]
   const index = values.indexOf(playerPlaybackRate)
   playerPlaybackRate = values[(index + 1) % values.length]
   const video = document.querySelector<HTMLVideoElement>('#video-player')
 
   if (video) {
-    applyPlaybackRate(video as any, playerPlaybackRate, settings.preservePitch)
+    applyPlaybackRate(video as any, playerPlaybackRate, playbackPreservesPitch())
   }
 
   const button = document.querySelector<HTMLElement>('[data-action="cycle-speed"]')
