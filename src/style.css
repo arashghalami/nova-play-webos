@@ -3283,6 +3283,170 @@ kbd {
   }
 }
 
+.metadata-section,
+.person-page {
+  margin-top: clamp(1.5rem, 3vw, 3rem);
+}
+
+.metadata-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.8rem;
+}
+
+.metadata-heading h2 {
+  margin: 0;
+  font-size: var(--fs-title);
+}
+
+.metadata-heading span,
+.metadata-attribution,
+.metadata-loading {
+  color: var(--text-secondary);
+  font-size: var(--fs-caption);
+}
+
+.metadata-loading {
+  padding: 0.8rem 0;
+}
+
+.metadata-people,
+.metadata-title-row {
+  display: grid;
+  grid-auto-columns: minmax(8.5rem, 10.5rem);
+  grid-auto-flow: column;
+  gap: 0.75rem;
+  overflow-x: auto;
+  padding: 0.25rem 0.3rem 0.7rem;
+  scrollbar-width: thin;
+}
+
+.person-card,
+.metadata-title-card {
+  min-width: 0;
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.4rem;
+  color: var(--text-primary);
+  background: rgb(13 34 59 / 68%);
+  border: 1px solid rgb(146 210 255 / 16%);
+  border-radius: var(--radius-sm);
+  text-align: left;
+}
+
+.person-card:focus,
+.metadata-title-card:focus {
+  outline: 0.2rem solid #77ddff;
+  outline-offset: 0.15rem;
+  border-color: #77ddff;
+  background: rgb(26 72 112 / 88%);
+}
+
+.person-portrait,
+.metadata-title-art {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  background: #132b48;
+  border-radius: calc(var(--radius-sm) - 0.15rem);
+  aspect-ratio: 2 / 3;
+}
+
+.person-portrait {
+  border-radius: 50%;
+  aspect-ratio: 1;
+}
+
+.person-image,
+.metadata-title-image,
+.person-detail-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.person-card-copy,
+.metadata-title-card > span:last-child {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.person-card strong,
+.metadata-title-card strong {
+  overflow: hidden;
+  font-size: var(--fs-label);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.person-card small,
+.metadata-title-card small {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--fs-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-tagline {
+  margin: 0.5rem 0;
+  color: #d5eaff;
+  font-style: italic;
+}
+
+.metadata-attribution {
+  margin-top: 1rem;
+}
+
+.person-header {
+  display: grid;
+  grid-template-columns: minmax(12rem, 18rem) minmax(0, 1fr);
+  gap: clamp(1.5rem, 4vw, 4rem);
+  align-items: start;
+}
+
+.person-detail-portrait {
+  width: min(18rem, 100%);
+  overflow: hidden;
+  background: #132b48;
+  border-radius: var(--radius-md);
+  aspect-ratio: 2 / 3;
+}
+
+.person-detail-copy h1 {
+  margin: 0.35rem 0 0.7rem;
+}
+
+.person-biography {
+  max-width: 56rem;
+  color: var(--text-secondary);
+  line-height: 1.65;
+  white-space: pre-line;
+}
+
+.person-links a {
+  text-decoration: none;
+}
+
+@media (max-width: 680px) {
+  .person-header {
+    grid-template-columns: 1fr;
+  }
+
+  .person-detail-portrait {
+    width: 11rem;
+  }
+
+  .metadata-people,
+  .metadata-title-row {
+    grid-auto-columns: minmax(7.5rem, 8.5rem);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

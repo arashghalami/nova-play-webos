@@ -27,6 +27,7 @@ Nova Play is a private Xtream Codes IPTV player for LG webOS TVs. It provides a 
 ### Movies and series
 
 - Rich movie detail lookup using Xtream `get_vod_info`: plot, cast, director, country, genre, release date, rating, duration, artwork/backdrops, and trailer links when supplied by the provider
+- Optional TMDB-proxy enrichment for movie and series pages: cast/crew portraits, role labels, recommendations, and remote-friendly internal person pages with biographies, approved profile links, and filmographies
 - Series season/episode browsing with watched indicators and next-episode autoplay
 - Resume positions with a **collision-safe composite identity** (`section:streamType:id`)
 - Continue Watching rail on Home, resume markers, and mark watched/unwatched controls
@@ -44,6 +45,39 @@ Nova Play is a private Xtream Codes IPTV player for LG webOS TVs. It provides a 
 - Credentials are stored only in device-local storage and are never embedded in source or the IPK
 - Defensive persistence: slim favorite/resume snapshots, bounded history, quota-error handling, and oldest-entry eviction retries
 - During playback, the app attempts standard Screen Wake Lock and guarded webOS keep-alive calls to reduce screensaver interruptions
+
+## Optional TMDB metadata proxy
+
+Rich people and filmography content is opt-in. Nova Play calls an application-specific HTTPS proxy, not TMDB directly, so the TMDB bearer token never reaches the television or the packaged IPK.
+
+Set the Vite build-time endpoint only:
+
+```cmd
+set VITE_METADATA_PROXY_URL=https://metadata.example.com
+npm run build
+```
+
+The proxy must keep its TMDB token in server-side environment secrets and expose only these normalized endpoints:
+
+```text
+POST /v1/resolve-title
+  { mediaType: "movie" | "tv", title, originalTitle?, year?, tmdbId? }
+
+GET /v1/person/:personId
+```
+
+`resolve-title` should return `tmdbId`, `mediaType`, optional `tagline`, plus bounded `cast`, `crew`, and `related` arrays. `person` should return a person profile and bounded `knownFor`/`credits` arrays. The exact normalized response shapes are represented in `src/types.ts` and validated defensively by `src/metadata-client.ts`.
+
+Proxy requirements:
+
+- Use HTTPS and restrict CORS to Nova Play deployments.
+- Validate media types, IDs, title/query lengths, and response sizes; do not proxy arbitrary TMDB URLs.
+- Cache normalized title/person responses, rate-limit requests, enforce timeouts, and return compact payloads suitable for webOS hardware.
+- Never accept, forward, log, or store IPTV URLs, Xtream usernames, passwords, or playback URLs.
+- Return only allowlisted HTTPS external profile links.
+- Include required TMDB attribution in the proxy/app experience.
+
+If `VITE_METADATA_PROXY_URL` is omitted or the proxy is unavailable, the player continues using Xtream metadata and playback unchanged; no metadata request is attempted.
 
 ## Security and parental-control notes
 
@@ -201,8 +235,9 @@ Test one H.264 live channel, one HEVC channel, one movie, one series episode, on
 
 ```text
 src/
-  main.ts           Views, spatial remote navigation, player, guide, settings
-  xtream-client.ts  Xtream API adapter, EPG, metadata, and stream URLs
+  main.ts             Views, spatial remote navigation, player, guide, settings
+  metadata-client.ts  Typed, bounded client for the optional secure metadata proxy
+  xtream-client.ts    Xtream API adapter, EPG, metadata, and stream URLs
   storage.ts        Profile-scoped device-local persistence and migrations
   types.ts          Shared application, metadata, and playback types
 public/

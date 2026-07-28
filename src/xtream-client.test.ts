@@ -318,4 +318,110 @@ describe('XtreamClient EPG', () => {
     expect(requestUrl.pathname).toBe('/player_api.php')
     expect(requestUrl.port).toBe('8443')
   })
+
+  it('parses space-separated datetime start/end fields (webOS Chromium safe)', async () => {
+    // Older webOS Chromium returns Invalid Date for the non-ISO space form, so
+    // the client must parse the components itself rather than trust new Date().
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          epg_listings: [
+            {
+              title: 'TW9ybmluZyBOZXdz',
+              description: 'RGFpbHkgaGVhZGxpbmVz',
+              start: '2026-01-01 09:00:00',
+              end: '2026-01-01 10:00:00',
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient(profile)
+
+    const programs = await client.epg('42', 8)
+
+    expect(programs).toHaveLength(1)
+    expect(programs[0]).toMatchObject({ title: 'Morning News', description: 'Daily headlines' })
+    expect(programs[0].start).toEqual(new Date(2026, 0, 1, 9, 0, 0))
+    expect(programs[0].end).toEqual(new Date(2026, 0, 1, 10, 0, 0))
+  })
+
+  it('parses space-separated datetime without seconds', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          epg_listings: [
+            { title: 'Tm9vbg==', start: '2026-01-01 12:00', end: '2026-01-01 13:00' },
+          ],
+        }),
+        { status: 200 },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient(profile)
+
+    const programs = await client.epg('42', 8)
+
+    expect(programs).toHaveLength(1)
+    expect(programs[0].start).toEqual(new Date(2026, 0, 1, 12, 0, 0))
+  })
+
+  it('keeps plain-text titles that are coincidentally valid base64', async () => {
+    // 'Film', 'Kids', 'Cinema' are valid base64 and would otherwise be decoded
+    // into garbage. The round-trip guard must keep them as plain text.
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          epg_listings: [
+            {
+              title: 'Film',
+              description: 'Cinema',
+              start_timestamp: '1767258000',
+              stop_timestamp: '1767261600',
+            },
+            {
+              title: 'News at Nine',
+              description: 'Plain sentence with spaces',
+              start_timestamp: '1767261600',
+              stop_timestamp: '1767265200',
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient(profile)
+
+    const programs = await client.epg('42', 8)
+
+    expect(programs.map((program) => program.title)).toEqual(['Film', 'News at Nine'])
+    expect(programs[0].description).toBe('Cinema')
+    expect(programs[1].description).toBe('Plain sentence with spaces')
+  })
+
+  it('still decodes genuinely base64-encoded titles', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          epg_listings: [
+            {
+              title: 'TW9ybmluZyBOZXdz',
+              start_timestamp: '1767258000',
+              stop_timestamp: '1767261600',
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient(profile)
+
+    const programs = await client.epg('42', 8)
+
+    expect(programs[0].title).toBe('Morning News')
+  })
 })

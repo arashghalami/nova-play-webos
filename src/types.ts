@@ -1,5 +1,14 @@
 export type LibrarySection = 'live' | 'vod' | 'series'
-export type AppView = 'login' | 'home' | 'catalog' | 'details' | 'player' | 'guide' | 'search' | 'settings'
+export type AppView =
+  | 'login'
+  | 'home'
+  | 'catalog'
+  | 'details'
+  | 'person'
+  | 'player'
+  | 'guide'
+  | 'search'
+  | 'settings'
 export type CatalogSort = 'default' | 'name' | 'recent' | 'rating' | 'year'
 
 export interface XtreamProfile {
@@ -35,6 +44,57 @@ export interface Trailer {
   url: string
 }
 
+export interface PersonSummary {
+  id: string
+  name: string
+  profileImage?: string
+  character?: string
+  job?: string
+  department?: string
+}
+
+export interface ExternalProfile {
+  label: string
+  url: string
+}
+
+export interface FilmographyCredit {
+  id: string
+  mediaType: 'movie' | 'tv'
+  title: string
+  originalTitle?: string
+  year?: string
+  poster?: string
+  character?: string
+  job?: string
+  rating?: string
+}
+
+export interface PersonDetails extends PersonSummary {
+  biography?: string
+  birthday?: string
+  deathday?: string
+  placeOfBirth?: string
+  knownForDepartment?: string
+  homepage?: string
+  externalProfiles?: ExternalProfile[]
+  knownFor?: FilmographyCredit[]
+  credits?: FilmographyCredit[]
+}
+
+export interface RelatedTitle extends FilmographyCredit {
+  overview?: string
+}
+
+export interface EnrichedTitleMetadata {
+  tmdbId: string
+  mediaType: 'movie' | 'tv'
+  tagline?: string
+  cast?: PersonSummary[]
+  crew?: PersonSummary[]
+  related?: RelatedTitle[]
+}
+
 export interface RichMetadata {
   originalTitle?: string
   plot?: string
@@ -53,6 +113,7 @@ export interface RichMetadata {
   ageRating?: string
   tmdbId?: string
   trailer?: Trailer
+  enrichment?: EnrichedTitleMetadata
 }
 
 export interface StreamItem {

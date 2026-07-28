@@ -78,6 +78,37 @@ function readArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
 }
 
+// A value that could plausibly be base64: only base64 alphabet characters with
+// optional "=" padding. Length being a multiple of 4 is checked separately.
+const BASE64_SHAPE = /^[A-Za-z0-9+/]+={0,2}$/
+// C0/C1 control characters (excluding tab/newline/carriage-return) plus the
+// Unicode replacement character. Their presence means a base64 "decode" of a
+// plain-text title produced binary garbage rather than real program text.
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARACTERS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\uFFFD]/
+// Letters/digits/space across Latin, Latin-1 supplement/extended, Greek,
+// Cyrillic, Hebrew, Arabic, Devanagari, Kana, and CJK/Hangul BMP ranges. Kept
+// to explicit BMP ranges to stay ES2015-compatible for the webOS bundle (no
+// Unicode property escapes / \p{L}).
+const LETTER_LIKE_CHARACTER =
+  /[0-9A-Za-z \u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u0590-\u05FF\u0600-\u06FF\u0900-\u097F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF]/
+
+function textReadabilityRatio(value: string): number {
+  if (!value.length) {
+    return 0
+  }
+
+  let readable = 0
+
+  for (let index = 0; index < value.length; index += 1) {
+    if (LETTER_LIKE_CHARACTER.test(value[index])) {
+      readable += 1
+    }
+  }
+
+  return readable / value.length
+}
+
 function toBaseUrl(serverUrl: string): string {
   const source = serverUrl.trim()
 
@@ -151,6 +182,30 @@ function parseTimestamp(value: unknown): Date | null {
     const timestamp = Number(source)
     const milliseconds = Math.abs(timestamp) < 1e12 ? timestamp * 1000 : timestamp
     const date = new Date(milliseconds)
+
+    return Number.isNaN(date.getTime()) ? null : date
+  }
+
+  // Many Xtream panels send "YYYY-MM-DD HH:MM(:SS)" for the start/end fields.
+  // The space-separated (non-ISO) form is implementation-defined for Date.parse:
+  // modern V8 accepts it, but the older webOS TV Chromium returns Invalid Date,
+  // which silently drops every EPG entry. Parse the components explicitly so the
+  // schedule renders on the TV. A trailing timezone offset (if present) is left
+  // to the engine; the common bare local form is handled here.
+  const spacedTimestamp = source.match(
+    /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/,
+  )
+
+  if (spacedTimestamp) {
+    const [, year, month, day, hour, minute, second] = spacedTimestamp
+    const date = new Date(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+      Number(hour),
+      Number(minute),
+      Number(second ?? '0'),
+    )
 
     return Number.isNaN(date.getTime()) ? null : date
   }
@@ -1034,12 +1089,32 @@ export class XtreamClient {
   }
 
   private decodeBase64(value: string): string {
+    // Providers are inconsistent: some base64-encode EPG titles/descriptions,
+    // others send them as plain text. Blindly calling atob() corrupts plain
+    // titles that happen to be valid base64 (e.g. "Film" -> "\u0016)f") because
+    // atob() succeeds instead of throwing, so a round-trip check is not enough.
+    // Only accept the decoded result when it is valid UTF-8 (decodeURIComponent
+    // does not throw), contains no control/replacement characters, and reads as
+    // mostly letters/digits/spaces across common scripts; otherwise keep the
+    // original plain text.
+    if (!value || value.length % 4 !== 0 || !BASE64_SHAPE.test(value)) {
+      return value
+    }
+
+    let decoded: string
+
     try {
-      return decodeURIComponent(
+      decoded = decodeURIComponent(
         Array.from(atob(value), (character) => `%${character.charCodeAt(0).toString(16).padStart(2, '0')}`).join(''),
       )
     } catch {
       return value
     }
+
+    if (CONTROL_CHARACTERS.test(decoded)) {
+      return value
+    }
+
+    return textReadabilityRatio(decoded) >= 0.6 ? decoded : value
   }
 }

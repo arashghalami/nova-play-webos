@@ -31,8 +31,13 @@ import type {
   AppView,
   CatalogSort,
   Category,
+  EnrichedTitleMetadata,
+  FilmographyCredit,
   LibrarySection,
+  RelatedTitle,
   NowNext,
+  PersonDetails,
+  PersonSummary,
   Program,
   RichMetadata,
   ResumeEntry,
@@ -41,6 +46,11 @@ import type {
   VodDetails,
   XtreamProfile,
 } from './types'
+import {
+  loadPersonMetadata,
+  loadTitleMetadata,
+  metadataServiceConfigured,
+} from './metadata-client'
 import {
   resolveNavigationTarget,
   type NavigationDirection,
@@ -341,6 +351,10 @@ let globalSearchStatus = ''
 let searchReturnView: AppView = 'home'
 let pendingFocus: FocusSnapshot | null = null
 let detailReturnPoint: ViewReturnPoint | null = null
+let personReturnPoint: ViewReturnPoint | null = null
+let selectedTitleEnrichment: EnrichedTitleMetadata | null = null
+let titleEnrichmentLoading = false
+let selectedPerson: PersonDetails | null = null
 let catalogReturnPoint: CatalogReturnPoint | null = null
 let playerReturnPoint: ViewReturnPoint | null = null
 let editingInput: HTMLInputElement | HTMLTextAreaElement | null = null
@@ -411,6 +425,7 @@ const currentViewTitle = (): string => {
   if (view === 'home') return 'Home'
   if (view === 'catalog') return catalog?.isFavorites ? 'Favorites' : catalog ? labels[catalog.section] : 'Library'
   if (view === 'details') return selectedItem?.name ?? 'Details'
+  if (view === 'person') return selectedPerson?.name ?? 'Person'
   if (view === 'guide') return 'TV Guide'
   if (view === 'search') return 'Search'
   if (view === 'settings') return 'Settings'
@@ -514,6 +529,15 @@ function streamDisplaySubtitle(stream: StreamItem): string {
   return stream.streamType === 'episode' && stream.seriesTitle
     ? stream.name
     : ''
+}
+
+function metadataLookupTitle(title: string): string {
+  return title
+    .replace(/^\s*[a-z]{2,4}\s*(?:[-|:]\s*)/i, '')
+    .replace(/\s*\(\d{4}\)\s*$/, '')
+    .replace(/\s+\b(4k|uhd|fhd|full\s*hd|hd|sd|web[- .]?dl|bluray|remux)\b.*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 function normalizedSeriesName(stream: StreamItem): string {
@@ -930,7 +954,9 @@ function defaultFocusTarget(): HTMLElement | null {
             '.catalog-tools [data-focus-id]',
           ]
         : view === 'details'
-          ? ['[data-focus-id="detail-play-next"]', '[data-focus-id="detail-play"]', '.series-episodes [data-focus-id]']
+          ? ['[data-focus-id="detail-play-next"]', '[data-focus-id="detail-play"]', '.metadata-people [data-focus-id]', '.series-episodes [data-focus-id]']
+          : view === 'person'
+            ? ['.person-filmography [data-focus-id]', '.person-header [data-focus-id]']
           : view === 'guide'
             ? ['.guide-grid [data-focus-id]', '.catalog-tools [data-focus-id]']
             : view === 'search'
@@ -1592,6 +1618,7 @@ function renderDetails(): void {
           <p class="eyebrow">${item.section === 'series' ? 'Series' : item.streamType === 'episode' ? `Season ${escape(item.season ?? '')} · Episode ${escape(item.episodeNumber ?? '')}` : item.section === 'live' ? 'Live TV' : 'Movie'}</p>
           <h1>${escape(selectedSeries?.info.name ?? item.name)}</h1>
           <div class="detail-chips">${detailFacts.length ? detailFacts.map((fact) => `<span>${escape(fact)}</span>`).join('') : '<span>Available now</span>'}</div>
+          ${selectedTitleEnrichment?.tagline ? `<p class="detail-tagline">${escape(selectedTitleEnrichment.tagline)}</p>` : ''}
           <p class="plot">${escape(description)}</p>
           ${renderRichMetadata(metadata)}
           ${detailActions(item, metadata)}
@@ -1620,6 +1647,57 @@ function detailsMetadata(item: StreamItem): RichMetadata {
   return item.metadata ?? {}
 }
 
+function renderPersonCard(person: PersonSummary, role: string, group: 'cast' | 'crew'): string {
+  return `
+    <button class="person-card" data-action="open-person" data-person-id="${escape(person.id)}" data-person-name="${escape(person.name)}" data-focus-id="${group}-person-${escape(person.id)}">
+      <span class="person-portrait">${imageOrPlaceholder(person.profileImage, person.name, 'person-image')}</span>
+      <span class="person-card-copy"><strong>${escape(person.name)}</strong><small>${escape(role)}</small></span>
+    </button>
+  `
+}
+
+function renderEnrichedMetadata(): string {
+  const enrichment = selectedTitleEnrichment
+
+  if (!enrichment) {
+    return titleEnrichmentLoading
+      ? '<section class="metadata-loading" aria-live="polite">Loading cast and crew…</section>'
+      : ''
+  }
+
+  const cast = enrichment.cast?.slice(0, 12) ?? []
+  const crew = enrichment.crew?.filter((person) => person.job || person.department).slice(0, 8) ?? []
+  const related = enrichment.related?.slice(0, 10) ?? []
+
+  return `
+    ${
+      cast.length
+        ? `<section class="metadata-section"><div class="metadata-heading"><h2>Cast</h2><span>Explore people</span></div><div class="metadata-people">${cast.map((person) => renderPersonCard(person, person.character ?? 'Cast', 'cast')).join('')}</div></section>`
+        : ''
+    }
+    ${
+      crew.length
+        ? `<section class="metadata-section"><div class="metadata-heading"><h2>Directors & crew</h2></div><div class="metadata-people">${crew.map((person) => renderPersonCard(person, person.job ?? person.department ?? 'Crew', 'crew')).join('')}</div></section>`
+        : ''
+    }
+    ${
+      related.length
+        ? `<section class="metadata-section"><div class="metadata-heading"><h2>You may also like</h2></div><div class="metadata-title-row">${related.map(renderMetadataTitleCard).join('')}</div></section>`
+        : ''
+    }
+    <p class="metadata-attribution">Metadata and images provided by TMDB.</p>
+  `
+}
+
+function renderMetadataTitleCard(title: RelatedTitle): string {
+  return `
+    <button class="metadata-title-card" data-action="open-related-title" data-tmdb-id="${escape(title.id)}" data-media-type="${title.mediaType}" data-title="${escape(title.title)}" data-year="${escape(title.year ?? '')}" data-focus-id="related-${title.mediaType}-${escape(title.id)}">
+      <span class="metadata-title-art">${imageOrPlaceholder(title.poster, title.title, 'metadata-title-image')}</span>
+      <span><strong>${escape(title.title)}</strong><small>${escape([title.year, title.rating ? `★ ${title.rating}` : ''].filter(Boolean).join(' · '))}</small></span>
+    </button>
+  `
+}
+
 function renderRichMetadata(metadata: RichMetadata): string {
   const details = [
     metadata.cast ? `<p><strong>Cast:</strong> ${escape(metadata.cast)}</p>` : '',
@@ -1627,7 +1705,8 @@ function renderRichMetadata(metadata: RichMetadata): string {
     metadata.country ? `<p><strong>Country:</strong> ${escape(metadata.country)}</p>` : '',
   ].filter(Boolean)
 
-  return details.length ? `<div class="rich-metadata">${details.join('')}</div>` : ''
+  const providerMetadata = details.length ? `<div class="rich-metadata">${details.join('')}</div>` : ''
+  return `${providerMetadata}${renderEnrichedMetadata()}`
 }
 
 function detailActions(item: StreamItem, metadata: RichMetadata): string {
@@ -1842,6 +1921,130 @@ function renderEpisodeList(): string {
       </section>
     </section>
   `
+}
+
+function renderFilmographyCredit(credit: FilmographyCredit): string {
+  return `
+    <button class="metadata-title-card" data-action="open-filmography-title" data-tmdb-id="${escape(credit.id)}" data-media-type="${credit.mediaType}" data-title="${escape(credit.title)}" data-year="${escape(credit.year ?? '')}" data-focus-id="filmography-${credit.mediaType}-${escape(credit.id)}">
+      <span class="metadata-title-art">${imageOrPlaceholder(credit.poster, credit.title, 'metadata-title-image')}</span>
+      <span><strong>${escape(credit.title)}</strong><small>${escape([credit.year, credit.character ?? credit.job ?? ''].filter(Boolean).join(' · '))}</small></span>
+    </button>
+  `
+}
+
+function renderPerson(): void {
+  const person = selectedPerson
+
+  if (!person) {
+    navigateBack()
+    return
+  }
+
+  const facts = [
+    person.knownForDepartment,
+    person.birthday ? `Born ${person.birthday}` : undefined,
+    person.placeOfBirth,
+  ].filter((fact): fact is string => Boolean(fact))
+  const credits = (person.credits ?? []).slice(0, 30)
+  const links = [person.homepage ? { label: 'Official site', url: person.homepage } : null, ...(person.externalProfiles ?? [])]
+    .filter((link): link is { label: string; url: string } => Boolean(link))
+
+  renderShell(`
+    <section class="person-page">
+      <section class="person-header">
+        <div class="person-detail-portrait">${imageOrPlaceholder(person.profileImage, person.name, 'person-detail-image')}</div>
+        <div class="person-detail-copy">
+          <p class="eyebrow">${escape(person.knownForDepartment ?? 'Cast & crew')}</p>
+          <h1>${escape(person.name)}</h1>
+          ${facts.length ? `<div class="detail-chips">${facts.map((fact) => `<span>${escape(fact)}</span>`).join('')}</div>` : ''}
+          <p class="person-biography">${escape(person.biography ?? 'Biography is not available yet.')}</p>
+          ${links.length ? `<div class="action-row person-links">${links.map((link, index) => `<a class="secondary-button" href="${escape(link.url)}" target="_blank" rel="noopener noreferrer" data-focus-id="person-link-${index}">${escape(link.label)} ↗</a>`).join('')}</div>` : ''}
+        </div>
+      </section>
+      ${
+        person.knownFor?.length
+          ? `<section class="metadata-section"><div class="metadata-heading"><h2>Known for</h2></div><div class="metadata-title-row">${person.knownFor.slice(0, 10).map(renderFilmographyCredit).join('')}</div></section>`
+          : ''
+      }
+      <section class="metadata-section person-filmography">
+        <div class="metadata-heading"><h2>Filmography</h2><span>${credits.length ? `${credits.length} titles` : 'Loading credits…'}</span></div>
+        ${credits.length ? `<div class="metadata-title-row">${credits.map(renderFilmographyCredit).join('')}</div>` : '<p class="hint">No filmography was returned for this person.</p>'}
+      </section>
+      <p class="metadata-attribution">Metadata and images provided by TMDB.</p>
+    </section>
+  `)
+}
+
+function localStreamForCredit(
+  tmdbId: string,
+  mediaType: 'movie' | 'tv',
+  title: string,
+  year: string | undefined,
+): StreamItem | null {
+  const targetSection: LibrarySection = mediaType === 'movie' ? 'vod' : 'series'
+  const normalizedTitle = foldText(title)
+  const exactTmdb = [...knownStreams.values()].find(
+    (stream) =>
+      stream.section === targetSection &&
+      stream.metadata?.tmdbId === tmdbId,
+  )
+
+  if (exactTmdb) {
+    return exactTmdb
+  }
+
+  return (
+    [...knownStreams.values()].find(
+      (stream) =>
+        stream.section === targetSection &&
+        foldText(stream.name) === normalizedTitle &&
+        (!year || stream.year === year || stream.metadata?.year === year),
+    ) ?? null
+  )
+}
+
+async function openPerson(personId: string, name: string): Promise<void> {
+  if (!personId || !metadataServiceConfigured()) {
+    showToast('Person metadata is unavailable.')
+    return
+  }
+
+  personReturnPoint = captureReturnPoint()
+  pushRouteHistory()
+  const { token, signal } = startNavigation()
+  selectedPerson = { id: personId, name }
+  view = 'person'
+  renderPerson()
+
+  try {
+    const person = await loadPersonMetadata(personId, signal)
+
+    if (isCurrentNavigation(token) && view === 'person') {
+      selectedPerson = person
+      renderPerson()
+    }
+  } catch {
+    if (isCurrentNavigation(token) && view === 'person') {
+      renderPerson()
+      showToast('Person details are unavailable right now.')
+    }
+  }
+}
+
+async function openFilmographyTitle(
+  tmdbId: string,
+  mediaType: 'movie' | 'tv',
+  title: string,
+  year: string | undefined,
+): Promise<void> {
+  const stream = localStreamForCredit(tmdbId, mediaType, title, year)
+
+  if (!stream) {
+    showToast('This title is not available in the loaded IPTV library.')
+    return
+  }
+
+  await openDetails(stream)
 }
 
 function renderGuide(): void {
@@ -3336,6 +3539,10 @@ function assignNavigationZones(): void {
     '.category-grid',
     '.catalog-pager',
     '.action-row',
+    '.metadata-people',
+    '.metadata-title-row',
+    '.person-filmography',
+    '.person-header',
     '.series-episodes',
     '.guide-grid',
     '.global-search-panel',
@@ -3612,6 +3819,27 @@ async function handleAction(element: HTMLElement): Promise<void> {
 
   if (action === 'refresh-guide') {
     await openGuide(true)
+    return
+  }
+
+  if (action === 'open-person') {
+    const personId = element.dataset.personId
+    const name = element.dataset.personName
+
+    if (personId && name) {
+      await openPerson(personId, name)
+    }
+    return
+  }
+
+  if (action === 'open-related-title' || action === 'open-filmography-title') {
+    const tmdbId = element.dataset.tmdbId
+    const mediaType = element.dataset.mediaType
+    const title = element.dataset.title
+
+    if (tmdbId && title && (mediaType === 'movie' || mediaType === 'tv')) {
+      await openFilmographyTitle(tmdbId, mediaType, title, element.dataset.year)
+    }
     return
   }
 
@@ -4062,6 +4290,39 @@ async function beginResumePlayback(stream: StreamItem): Promise<void> {
   beginPlayback(stream)
 }
 
+async function enrichSelectedTitle(
+  item: StreamItem,
+  metadata: RichMetadata,
+  token: number,
+  signal: AbortSignal,
+): Promise<void> {
+  if (!metadataServiceConfigured() || item.section === 'live') {
+    return
+  }
+
+  try {
+    const enrichment = await loadTitleMetadata({
+      mediaType: item.section === 'series' ? 'tv' : 'movie',
+      title: metadataLookupTitle(selectedSeries?.info.name ?? item.name),
+      originalTitle: metadata.originalTitle,
+      year: metadata.year ?? item.year,
+      tmdbId: metadata.tmdbId,
+      signal,
+    })
+
+    if (isCurrentNavigation(token) && view === 'details' && selectedItem === item) {
+      selectedTitleEnrichment = enrichment
+      titleEnrichmentLoading = false
+      renderDetails()
+    }
+  } catch {
+    if (isCurrentNavigation(token) && view === 'details' && selectedItem === item) {
+      titleEnrichmentLoading = false
+      renderDetails()
+    }
+  }
+}
+
 async function openDetails(stream: StreamItem): Promise<void> {
   const activeClient = client
   detailReturnPoint = captureReturnPoint()
@@ -4077,6 +4338,8 @@ async function openDetails(stream: StreamItem): Promise<void> {
   selectedSeries = null
   activeSeriesSeason = null
   selectedVod = null
+  selectedTitleEnrichment = null
+  titleEnrichmentLoading = metadataServiceConfigured() && stream.section !== 'live'
 
   if (stream.section === 'live') {
     view = 'details'
@@ -4153,6 +4416,7 @@ async function openDetails(stream: StreamItem): Promise<void> {
 
     view = 'details'
     render()
+    void enrichSelectedTitle(selectedItem, detailsMetadata(selectedItem), token, signal)
   } catch (reason) {
     if (isCurrentNavigation(token)) {
       renderError(reason, () => void openDetails(stream))
@@ -4650,7 +4914,8 @@ async function showEpg(
       panel.innerHTML = renderEpg(stream, programs, showCatchupActions)
       bindEvents()
     }
-  } catch {
+  } catch (reason) {
+    console.warn('EPG schedule load failed', stream.id, reason)
     if (isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
       panel.innerHTML = '<div class="epg"><h2>Schedule</h2><p>Schedule information is unavailable for this channel.</p></div>'
     }
@@ -4712,7 +4977,10 @@ async function prefetchNowNext(streams: StreamItem[]): Promise<void> {
           cacheNowNext(key, nowNext)
           updateNowNextCard(key, nowNext)
         }
-      } catch {
+      } catch (reason) {
+        if (!signal.aborted) {
+          console.warn('Now/Next prefetch failed', stream.id, reason)
+        }
         if (!signal.aborted && isCurrentNavigation(token)) {
           updateNowNextCard(key, undefined)
         }
@@ -5142,6 +5410,10 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: XtreamClient):
   selectedSeries = null
   activeSeriesSeason = null
   selectedVod = null
+  selectedTitleEnrichment = null
+  titleEnrichmentLoading = false
+  selectedPerson = null
+  personReturnPoint = null
   playerItem = null
   liveQueue = []
   guideStreams = []
@@ -5217,15 +5489,29 @@ function navigateBack(): boolean {
     return true
   }
 
+  if (view === 'person') {
+    const returnPoint = personReturnPoint
+    personReturnPoint = null
+    selectedPerson = null
+    startNavigation()
+    view = returnPoint?.view === 'details' && selectedItem ? 'details' : 'home'
+    requestFocus(returnPoint?.focus ?? null)
+    render()
+    return true
+  }
+
   if (view === 'details') {
     const returnPoint = detailReturnPoint
     detailReturnPoint = null
     startNavigation()
-    view = returnPoint?.view === 'search' || returnPoint?.view === 'guide' || returnPoint?.view === 'catalog'
-      ? returnPoint.view
-      : catalog
-        ? 'catalog'
-        : 'home'
+    view =
+      returnPoint?.view === 'person' && selectedPerson
+        ? 'person'
+        : returnPoint?.view === 'search' || returnPoint?.view === 'guide' || returnPoint?.view === 'catalog'
+          ? returnPoint.view
+          : catalog
+            ? 'catalog'
+            : 'home'
     requestFocus(returnPoint?.focus ?? null)
     render()
     return true
@@ -5279,6 +5565,7 @@ function render(): void {
   if (view === 'home') renderHome()
   else if (view === 'catalog') renderCatalog()
   else if (view === 'details') renderDetails()
+  else if (view === 'person') renderPerson()
   else if (view === 'guide') renderGuide()
   else if (view === 'search') renderGlobalSearch()
   else if (view === 'settings') renderSettings()
