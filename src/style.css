@@ -571,6 +571,13 @@ h3 {
   text-shadow: 0 0.25rem 0.8rem rgb(0 0 0 / 28%);
 }
 
+/* Deferred artwork has no src until it is close enough to the viewport. Keep
+ * the existing tile visible during that period instead of showing an empty
+ * gradient, then let the image cover it as soon as it is admitted. */
+.poster-artwork .poster:not([src]) + .poster-fallback {
+  display: grid;
+}
+
 .poster-artwork.image-unavailable .poster {
   display: none;
 }
@@ -1306,6 +1313,58 @@ select:focus,
   margin-left: 0.4rem;
   color: #7ff0b0;
   content: '✓';
+}
+
+.content-guidance {
+  display: flex;
+  max-width: max-content;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  margin-top: 0.85rem;
+  padding: 0;
+  color: #d9e9f6;
+  background: transparent;
+  border: 0;
+  border-radius: 0.55rem;
+  font: inherit;
+  text-align: left;
+}
+
+.content-guidance-value {
+  padding: 0.28rem 0.55rem;
+  background: rgb(10 28 45 / 66%);
+  border: 1px solid rgb(161 213 245 / 24%);
+  border-radius: 0.45rem;
+}
+
+.content-guidance-separator {
+  color: #86dcff;
+  font-weight: 800;
+}
+
+.content-guidance strong {
+  color: #86dcff;
+}
+
+.content-guidance-provenance {
+  display: none;
+  width: 100%;
+  padding: 0.2rem 0.55rem;
+  color: #b8d9ec;
+  font-size: var(--fs-caption);
+  font-weight: 650;
+}
+
+.content-guidance:focus,
+.content-guidance:focus-visible {
+  outline: 3px solid #42d7ff;
+  outline-offset: 0.3rem;
+}
+
+.content-guidance:focus .content-guidance-provenance,
+.content-guidance:focus-visible .content-guidance-provenance {
+  display: block;
 }
 
 .rich-metadata {
@@ -3201,6 +3260,10 @@ kbd {
   display: none;
 }
 
+.episode-art .episode-image:not([src]) + .episode-image-fallback {
+  display: grid;
+}
+
 .episode-art.image-unavailable .episode-image {
   display: none;
 }
@@ -3445,6 +3508,112 @@ kbd {
   .metadata-title-row {
     grid-auto-columns: minmax(7.5rem, 8.5rem);
   }
+}
+
+/* ── Continue Watching options menu ────────────────────────── */
+.continue-menu {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: 9;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  min-width: min(22rem, 80vw);
+  padding: 1.6rem 1.4rem;
+  background: rgb(5 16 30 / 96%);
+  border: 1px solid rgb(131 221 255 / 24%);
+  border-radius: 0.9rem;
+  box-shadow: 0 2rem 4rem rgb(0 0 0 / 60%);
+}
+
+.continue-menu-title {
+  margin: 0 0 0.35rem;
+  padding-bottom: 0.5rem;
+  color: #70dfff;
+  font-size: 1rem;
+  font-weight: 600;
+  border-bottom: 1px solid rgb(131 221 255 / 14%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.continue-menu-button {
+  display: block;
+  width: 100%;
+  padding: 0.85rem 1rem;
+  color: #e8f6ff;
+  font-size: 0.95rem;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 0.45rem;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.continue-menu-button:hover,
+.continue-menu-button:focus {
+  outline: 0;
+  color: #06101f;
+  background: #72e0ff;
+  border-color: #72e0ff;
+}
+
+.continue-menu-button.danger-button {
+  color: #ffd6d8;
+}
+
+.continue-menu-button.danger-button:hover,
+.continue-menu-button.danger-button:focus {
+  color: #340608;
+  background: #ff8a90;
+  border-color: #ff8a90;
+}
+
+/* The webOS 6 compositor visibly staggers separate card and poster transforms
+ * under remote navigation. Keep focus feedback immediate and static on TV. */
+html[data-webos-runtime='true'] .hub-card,
+html[data-webos-runtime='true'] .hub-card::after,
+html[data-webos-runtime='true'] .category-card,
+html[data-webos-runtime='true'] .category-card-icon,
+html[data-webos-runtime='true'] .media-select,
+html[data-webos-runtime='true'] .media-select .artwork,
+html[data-webos-runtime='true'] .media-select .poster,
+html[data-webos-runtime='true'] .primary-button,
+html[data-webos-runtime='true'] .secondary-button,
+html[data-webos-runtime='true'] .icon-button,
+html[data-webos-runtime='true'] .guide-row,
+html[data-webos-runtime='true'] .season-pill,
+html[data-webos-runtime='true'] .episode-card,
+html[data-webos-runtime='true'] .person-card,
+html[data-webos-runtime='true'] .metadata-title-card,
+html[data-webos-runtime='true'] .content-guidance,
+html[data-webos-runtime='true'] .continue-menu-button,
+html[data-webos-runtime='true'] .channel-overlay button {
+  transition: none !important;
+}
+
+html[data-webos-runtime='true'] .media-select:focus,
+html[data-webos-runtime='true'] .media-select:hover,
+html[data-webos-runtime='true'] .hub-card:focus,
+html[data-webos-runtime='true'] .hub-card:hover,
+html[data-webos-runtime='true'] .category-card:focus {
+  transform: none;
+}
+
+html[data-webos-runtime='true'] .media-select:focus {
+  box-shadow: 0 0 0 3px var(--focus);
+}
+
+html[data-webos-runtime='true'] .media-select:focus .artwork {
+  box-shadow: none;
+}
+
+html[data-webos-runtime='true'] .media-select:focus .poster {
+  transform: none;
 }
 
 @media (prefers-reduced-motion: reduce) {

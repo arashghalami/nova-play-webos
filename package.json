@@ -7,13 +7,17 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "test": "vitest run",
+    "test:proxy": "vitest run metadata-proxy/worker.test.ts",
     "preview": "vite preview",
+    "proxy:dev": "wrangler dev --config metadata-proxy/wrangler.toml",
+    "proxy:deploy": "wrangler deploy --config metadata-proxy/wrangler.toml",
     "package:webos": "npm run build && ares-package webos-app -o packages"
   },
   "devDependencies": {
     "typescript": "~6.0.2",
     "vite": "^8.1.1",
-    "vitest": "^2.1.9"
+    "vitest": "^2.1.9",
+    "wrangler": "4.29.1"
   },
   "dependencies": {
     "dashjs": "^5.2.0",

@@ -1,0 +1,20 @@
+=====================================================
+NOVA PLAY METADATA PROXY DEPLOYMENT CONFIRMATION
+=====================================================
+1. Cloudflare Login Status: CONFIRMED
+   - Account: novaplay.devp@gmail.com
+   - Subdomain: novaplay-devp.workers.dev
+   - Worker Name: nova-play-metadata
+
+2. Secrets Configuration: CONFIRMED & ACTIVE
+   - Secret 'TMDB_BEARER_TOKEN' uploaded and bound in Cloudflare Worker.
+   - Secret 'TRAKT_CLIENT_ID' uploaded and bound in Cloudflare Worker.
+
+3. Deployed Live Worker Endpoint:
+   - URL: https://nova-play-metadata.novaplay-devp.workers.dev
+   - Verified active: POST /v1/resolve-title tested & working with Netherlands Kijkwijzer guidance + Trakt fallback support.
+
+4. WebOS IPK Build:
+   - Package: packages/com.arash.novaplay_1.0.3_all.ipk
+   - Built with VITE_METADATA_PROXY_URL=https://nova-play-metadata.novaplay-devp.workers.dev
+=====================================================

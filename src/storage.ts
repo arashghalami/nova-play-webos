@@ -7,6 +7,7 @@ import type {
   XtreamProfile,
 } from './types'
 import { foldText } from './search'
+import { performanceTrace } from './performance-trace'
 
 const ACTIVE_PROFILE_KEY = 'nova-play.profile'
 const PROFILES_KEY = 'nova-play.profiles'
@@ -428,40 +429,72 @@ function parseJson<T>(raw: string | null, fallback: T): T {
   }
 
   try {
-    return JSON.parse(raw) as T
+    return performanceTrace.measure(
+      'storage',
+      'json-parse',
+      () => JSON.parse(raw) as T,
+      { bytes: raw.length },
+    )
   } catch {
+    performanceTrace.event('storage', 'json-parse-failed', { bytes: raw.length })
     return fallback
   }
 }
 
 function writeJson(key: string, value: unknown): boolean {
   try {
-    return writeStoredItem(key, JSON.stringify(value))
+    const serialized = performanceTrace.measure(
+      'storage',
+      'json-serialize',
+      () => JSON.stringify(value),
+    )
+    return writeStoredItem(key, serialized)
   } catch {
+    performanceTrace.event('storage', 'json-serialize-failed')
     return false
   }
 }
 
 function readStoredItem(key: string): string | null {
   try {
-    return localStorage.getItem(key)
+    const value = performanceTrace.measure(
+      'storage',
+      'local-storage-read',
+      () => localStorage.getItem(key),
+    )
+    performanceTrace.event('storage', 'local-storage-read-complete', {
+      found: value !== null,
+      bytes: value?.length ?? 0,
+    })
+    return value
   } catch {
+    performanceTrace.event('storage', 'local-storage-read-failed')
     return null
   }
 }
 
 function writeStoredItem(key: string, value: string): boolean {
   try {
-    localStorage.setItem(key, value)
+    performanceTrace.measure(
+      'storage',
+      'local-storage-write',
+      () => localStorage.setItem(key, value),
+      { bytes: value.length },
+    )
     return true
   } catch {
+    performanceTrace.event('storage', 'local-storage-write-failed', { bytes: value.length })
     return false
   }
 }
 
 function removeStoredItem(key: string): void {
   try {
-    localStorage.removeItem(key)
+    performanceTrace.measure(
+      'storage',
+      'local-storage-remove',
+      () => localStorage.removeItem(key),
+    )
   } catch {
     // Local storage can be disabled or unavailable on some webOS targets.
   }

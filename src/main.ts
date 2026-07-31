@@ -42,6 +42,7 @@ import type {
   RichMetadata,
   ResumeEntry,
   SeriesDetails,
+  RatingCandidate,
   StreamItem,
   VodDetails,
   XtreamProfile,
@@ -49,6 +50,7 @@ import type {
 import {
   loadPersonMetadata,
   loadTitleMetadata,
+  loadTvMazeSeriesMetadata,
   metadataServiceConfigured,
 } from './metadata-client'
 import {
@@ -56,8 +58,12 @@ import {
   type NavigationDirection,
   type NavigationItem,
 } from './navigation'
+import { createFrameNavigationScheduler } from './frame-navigation'
+import { createSpatialLayoutCache } from './spatial-layout-cache'
 import { isRemoteBack, remoteDirection } from './remote-input'
 import { foldText, matchesQuery, normalizeQuery, queryTokens } from './search'
+import { LruTtlCache } from './lru-ttl-cache'
+import { SearchCatalogWarmQueue } from './search-catalog-queue'
 import { focusScrollDelta } from './focus-scroll'
 import { episodeDisplayTitle, episodeThumbnailSources, seasonLabel } from './series-presentation'
 import {
@@ -87,6 +93,17 @@ import {
   type PlaybackFailureKind,
 } from './playback-fallback'
 import { XtreamClient } from './xtream-client'
+import {
+  isProviderError,
+  isProviderRefusal,
+  isRetryableProviderFailure,
+} from './provider-error'
+import {
+  dedupeRatingCandidates,
+  ratingSourceSummary,
+  resolveContentRating,
+} from './content-rating'
+import { performanceTrace } from './performance-trace'
 
 type CatalogResults = {
   key: string
@@ -107,6 +124,17 @@ type CatalogState = {
 }
 
 type CachedStreams = {
+  streams: StreamItem[]
+  updatedAt: number
+}
+
+type GlobalSearchSectionOutcome = {
+  authoritative: boolean
+  cacheable: boolean
+  warmAfterSearch?: boolean
+}
+
+type CompleteSearchCatalog = {
   streams: StreamItem[]
   updatedAt: number
 }
@@ -134,6 +162,11 @@ type ZoneTransition = {
   direction: NavigationDirection
 }
 
+type NavigationLayout = {
+  items: NavigationItem[]
+  elements: Map<string, HTMLElement>
+}
+
 type AppHistoryState = {
   novaPlay: true
   depth: number
@@ -158,6 +191,7 @@ type GlobalSearchViewUpdate = {
 
 type PlayerUiMode = 'immersive' | 'overlay' | 'focused' | 'seeking'
 const CATALOG_PAGE_SIZE = 60
+const WEBOS_CATALOG_PAGE_SIZE = 24
 const SEARCH_DEBOUNCE_MS = 240
 // Local, in-memory catalog filtering is cheap, so it can react faster than the
 // networked global search without feeling chatty.
@@ -170,11 +204,29 @@ const MAX_CACHED_STREAM_ITEMS = 12_000
 const STREAM_CACHE_TTL_MS = 15 * 60_000
 const GLOBAL_SEARCH_SECTION_RESULT_LIMIT = 60
 const GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT = 12
+const GLOBAL_SEARCH_RESULT_CACHE_MAX_ENTRIES = 20
+const GLOBAL_SEARCH_RESULT_CACHE_TTL_MS = 15 * 60_000
+const COMPLETE_SEARCH_CATALOG_TTL_MS = 15 * 60_000
+const COMPLETE_SEARCH_CATALOG_RETRY_DELAY_MS = 5 * 60_000
+const MAX_COMPLETE_SEARCH_CATALOG_ITEMS = 12_000
+const MAX_COMPLETE_SEARCH_CATALOG_SECTION_ITEMS = 6_000
 const GLOBAL_SEARCH_RENDER_INTERVAL_MS = 80
 const GLOBAL_SEARCH_WORK_SLICE_MS = 8
+// Some Xtream panels accept categories but never answer provider-wide library
+// endpoints. Fail fast enough to reach the bounded fallback rather than leave
+// a TV search in its loading state for the general 60-second stream timeout.
+const GLOBAL_SEARCH_PROVIDER_TIMEOUT_MS = 10_000
+const GLOBAL_SEARCH_CATEGORY_TIMEOUT_MS = 6_000
 const MIN_GLOBAL_SEARCH_LENGTH = 1
 const MAX_NOW_NEXT_ENTRIES = 600
 const PLAYBACK_ATTEMPT_TIMEOUT_MS = 12_000
+// Older webOS Chromium eagerly decodes every image in a 60-card DOM grid even
+// when loading="lazy" is present. Admit only nearby artwork and limit active
+// decodes so category rendering cannot monopolize the UI thread.
+const DEFERRED_IMAGE_CONCURRENCY = 4
+const WEBOS_DEFERRED_IMAGE_CONCURRENCY = 1
+const DEFERRED_IMAGE_PREFETCH_PX = 0
+const WEBOS_DEFERRED_IMAGE_COOLDOWN_MS = 180
 const AMPERSAND = String.fromCharCode(38)
 const ESCAPE_PATTERN = /[&<>"']/g
 const ESCAPED_CHARACTERS: Record<string, string> = {
@@ -210,9 +262,21 @@ const app: HTMLDivElement = appElement
 
 function isWebOsRuntime(): boolean {
   return Boolean(
-    (window as Window & { webOSSystem?: unknown }).webOSSystem ||
+    (window as Window & { webOSSystem?: unknown; PalmSystem?: unknown }).webOSSystem ||
+      (window as Window & { PalmSystem?: unknown }).PalmSystem ||
       /web0s|webos/i.test(navigator.userAgent),
   )
+}
+
+if (isWebOsRuntime()) {
+  document.documentElement.dataset.webosRuntime = 'true'
+}
+
+function catalogPageSize(): number {
+  // On the webOS 6 emulator, a 60-card grid adds 129 focusable nodes and
+  // schedules a large number of image decodes. A 24-card page keeps the grid
+  // TV-sized while preserving explicit Next/Previous access to the full list.
+  return isWebOsRuntime() ? WEBOS_CATALOG_PAGE_SIZE : CATALOG_PAGE_SIZE
 }
 
 function playbackPreservesPitch(): boolean {
@@ -300,6 +364,7 @@ let settings: AppSettings = profile
   : { ...DEFAULT_SETTINGS }
 let account: AccountSummary | null = null
 let view: AppView = profile ? 'home' : 'login'
+performanceTrace.setView(view)
 let renderedView: AppView | null = null
 let catalog: CatalogState | null = null
 let selectedItem: StreamItem | null = null
@@ -361,9 +426,47 @@ let editingInput: HTMLInputElement | HTMLTextAreaElement | null = null
 let lastZoneTransition: ZoneTransition | null = null
 let stickyColumnX: number | null = null
 let stickyColumnZone: string | null = null
+let pendingSpatialInteractionId: number | null = null
+let deferredImageLoads = 0
+let deferredImageScheduleHandle: number | null = null
+const spatialLayoutCache = createSpatialLayoutCache<HTMLElement, NavigationLayout>()
+const frameNavigation = createFrameNavigationScheduler(
+  (direction) => {
+    const interactionId = pendingSpatialInteractionId
+    pendingSpatialInteractionId = null
+    const moved = performanceTrace.measure(
+      'navigation',
+      'spatial-move',
+      () => handleSpatialNavigation(direction),
+      { direction },
+      { interactionId: interactionId ?? undefined },
+    )
+
+    window.requestAnimationFrame(() => {
+      performanceTrace.endInteraction(interactionId, 'spatial-painted', {
+        direction,
+        moved,
+      })
+    })
+  },
+  {
+    requestFrame: (callback) => window.requestAnimationFrame(callback),
+    cancelFrame: (handle) => window.cancelAnimationFrame(handle),
+  },
+)
 let appHistoryDepth = 0
 let retainSearchOnNextPopState = false
 let playerAbsorbNextPopState = false
+let continueMenuHoldTimer: number | null = null
+let continueMenuHoldCard: HTMLElement | null = null
+// True while OK is still physically held after a long-press opened the menu.
+// webOS keeps firing keydown repeats for the held key; without swallowing them
+// the still-down OK would immediately activate the focused menu button.
+let continueMenuHoldConsumeOk = false
+let continueMenuAbsorbNextPopState = false
+let continueMenuEl: HTMLElement | null = null
+let lastRemovedResume: { key: string; entry: ResumeEntry } | null = null
+let undoResumeTimer: number | null = null
 const expandedGlobalSearchSections = new Set<LibrarySection>()
 let favorites = profile ? loadFavorites(profile.id) : new Map()
 let resumeEntries = profile ? loadResume(profile.id) : new Map<string, ResumeEntry>()
@@ -373,6 +476,22 @@ const sectionCategories = new Map<LibrarySection, Category[]>()
 const adultCategoryIds = new Map<LibrarySection, Set<string>>()
 const nowNextCache = new Map<string, NowNext>()
 const nowNextLoading = new Map<string, AbortController>()
+const globalSearchResultCache = new LruTtlCache<StreamItem[]>(
+  GLOBAL_SEARCH_RESULT_CACHE_MAX_ENTRIES,
+  GLOBAL_SEARCH_RESULT_CACHE_TTL_MS,
+)
+const completeSearchCatalogs = new Map<LibrarySection, CompleteSearchCatalog>()
+const completeSearchCatalogQueue = new SearchCatalogWarmQueue<LibrarySection>({
+  retryDelayMs: COMPLETE_SEARCH_CATALOG_RETRY_DELAY_MS,
+  load: loadCompleteSearchCatalog,
+  onStateChange: (section, state) => {
+    performanceTrace.event('cache', 'global-search-catalog-state', {
+      section,
+      state,
+      catalogItemCount: completeSearchCatalogItemCount(),
+    })
+  },
+})
 
 if (profile && repairResumeEpisodeContexts()) {
   saveResume(profile.id, resumeEntries)
@@ -399,7 +518,7 @@ function icon(name: AppIcon, className = ''): string {
   }
 
   if (name === 'star' || name === 'starFilled') {
-    return `<svg ${attributes} ${name === 'starFilled' ? 'fill="currentColor"' : ''}><path d="m12 3.35 2.7 5.48 6.05.88-4.38 4.27 1.03 6.02L12 17.16 6.6 20l1.03-6.02-4.38-4.27 6.05-.88L12 3.35Z"></path></svg>`
+    return `<svg ${attributes}><path ${name === 'starFilled' ? 'fill="currentColor"' : ''} d="m12 3.35 2.7 5.48 6.05.88-4.38 4.27 1.03 6.02L12 17.16 6.6 20l1.03-6.02-4.38-4.27 6.05-.88L12 3.35Z"></path></svg>`
   }
 
   if (name === 'settings') {
@@ -678,16 +797,26 @@ function cachedStreams(section: LibrarySection, categoryId?: string): StreamItem
   const cached = streamCache.get(key)
 
   if (!cached) {
+    performanceTrace.event('cache', 'stream-memory-miss', { section })
     return null
   }
 
   if (Date.now() - cached.updatedAt > STREAM_CACHE_TTL_MS) {
     streamCache.delete(key)
+    performanceTrace.event('cache', 'stream-memory-expired', {
+      section,
+      itemCount: cached.streams.length,
+    })
     return null
   }
 
   streamCache.delete(key)
   streamCache.set(key, cached)
+  performanceTrace.event('cache', 'stream-memory-hit', {
+    section,
+    itemCount: cached.streams.length,
+    ageMs: Date.now() - cached.updatedAt,
+  })
   return cached.streams
 }
 
@@ -704,10 +833,19 @@ function cacheStreams(section: LibrarySection, categoryId: string | undefined, s
   streamCache.delete(key)
 
   if (streams.length > MAX_CACHED_STREAM_ITEMS) {
+    performanceTrace.event('cache', 'stream-memory-skip-oversized', {
+      section,
+      itemCount: streams.length,
+    })
     return
   }
 
   streamCache.set(key, { streams, updatedAt: Date.now() })
+  performanceTrace.event('cache', 'stream-memory-write', {
+    section,
+    itemCount: streams.length,
+    cacheEntries: streamCache.size,
+  })
 
   while (
     streamCache.size > MAX_STREAM_CACHE_ENTRIES ||
@@ -752,6 +890,128 @@ function cachedStreamsForSection(section: LibrarySection): StreamItem[] {
   })
 
   return [...streams.values()]
+}
+
+function globalSearchCacheKey(query: string): string {
+  return `${settings.hideAdultContent ? 'hide-adult' : 'show-adult'}:${normalizeQuery(query)}`
+}
+
+function clearGlobalSearchResultCache(): void {
+  globalSearchResultCache.clear()
+}
+
+function completeSearchCatalogItemCount(): number {
+  let count = 0
+
+  completeSearchCatalogs.forEach((catalog) => {
+    count += catalog.streams.length
+  })
+
+  return count
+}
+
+function pruneExpiredCompleteSearchCatalogs(now = Date.now()): number {
+  let removed = 0
+
+  completeSearchCatalogs.forEach((catalog, section) => {
+    if (now - catalog.updatedAt > COMPLETE_SEARCH_CATALOG_TTL_MS) {
+      completeSearchCatalogs.delete(section)
+      completeSearchCatalogQueue.invalidate(section)
+      removed += 1
+      performanceTrace.event('cache', 'global-search-catalog-expired', { section })
+    }
+  })
+
+  return removed
+}
+
+function cachedCompleteSearchCatalog(section: LibrarySection): StreamItem[] | null {
+  pruneExpiredCompleteSearchCatalogs()
+  return completeSearchCatalogs.get(section)?.streams ?? null
+}
+
+function clearCompleteSearchCatalogs(): void {
+  completeSearchCatalogQueue.clear()
+  completeSearchCatalogs.clear()
+}
+
+function pauseCompleteSearchCatalogWarming(reason: string): void {
+  completeSearchCatalogQueue.cancel()
+  performanceTrace.event('search', 'global-search-catalog-warm-paused', { reason })
+}
+
+async function loadCompleteSearchCatalog(
+  section: LibrarySection,
+  signal: AbortSignal,
+): Promise<'complete' | 'oversized'> {
+  const activeClient = client
+
+  if (!activeClient) {
+    throw new Error('No active IPTV provider.')
+  }
+
+  const startedAt = Date.now()
+  performanceTrace.event('search', 'global-search-catalog-warm-start', { section })
+
+  // Only fetch category metadata while it is needed to enforce the adult
+  // category filter. In the normal visible-content mode, catalog warming stays
+  // to one provider-wide stream request.
+  if (settings.hideAdultContent && !sectionCategories.has(section)) {
+    const categories = await activeClient.categories(section, signal)
+
+    if (signal.aborted || activeClient !== client) {
+      throw new Error('Catalog warming was cancelled.')
+    }
+
+    rememberCategories(section, categories)
+  }
+
+  // A blank query matches every valid record. Unlike streams(), this keeps the
+  // provider response incremental, yields between parser slices, and stops as
+  // soon as the bounded catalog limit proves retention is unsafe on a TV.
+  const streams = await activeClient.searchStreams(section, '', {
+    signal,
+    limit: MAX_COMPLETE_SEARCH_CATALOG_SECTION_ITEMS + 1,
+    matchAll: true,
+  })
+
+  if (signal.aborted || activeClient !== client) {
+    throw new Error('Catalog warming was cancelled.')
+  }
+
+  pruneExpiredCompleteSearchCatalogs()
+  const cachedItemCount = completeSearchCatalogItemCount()
+  const canStore =
+    streams.length <= MAX_COMPLETE_SEARCH_CATALOG_SECTION_ITEMS &&
+    cachedItemCount + streams.length <= MAX_COMPLETE_SEARCH_CATALOG_ITEMS
+
+  if (!canStore) {
+    performanceTrace.event('cache', 'global-search-catalog-skip-oversized', {
+      section,
+      itemCount: streams.length,
+      cachedItemCount,
+      durationMs: Date.now() - startedAt,
+    })
+    return 'oversized'
+  }
+
+  completeSearchCatalogs.set(section, { streams, updatedAt: Date.now() })
+  performanceTrace.event('cache', 'global-search-catalog-write', {
+    section,
+    itemCount: streams.length,
+    cacheEntries: completeSearchCatalogs.size,
+    totalItemCount: completeSearchCatalogItemCount(),
+    durationMs: Date.now() - startedAt,
+  })
+  return 'complete'
+}
+
+function warmCompleteSearchCatalog(section: LibrarySection): void {
+  if (cachedCompleteSearchCatalog(section)) {
+    return
+  }
+
+  completeSearchCatalogQueue.request(section)
 }
 
 function isAppHistoryState(value: unknown): value is AppHistoryState {
@@ -808,6 +1068,10 @@ function retainSearchRouteAfterPopState(): void {
 }
 
 function startNavigation(): { token: number; signal: AbortSignal } {
+  performanceTrace.event('route', 'navigation-start', {
+    nextNavigationToken: navigationToken + 1,
+  })
+
   if (view === 'search') {
     stopGlobalSearchWork()
   }
@@ -825,8 +1089,23 @@ function isCurrentNavigation(token: number): boolean {
   return token === navigationToken && !navigationController?.signal.aborted
 }
 
-function invalidateSpatialLayout(): void {
-  // Geometry is measured on every D-pad event because scrolling changes viewport coordinates.
+function invalidateSpatialLayout(reason = 'unspecified'): void {
+  const wasPopulated = spatialLayoutCache.populated
+  spatialLayoutCache.invalidate()
+  performanceTrace.event('navigation', 'layout-invalidated', {
+    reason,
+    wasPopulated,
+  })
+}
+
+function cancelPendingSpatialNavigation(): void {
+  if (frameNavigation.pending) {
+    performanceTrace.event('navigation', 'spatial-navigation-cancelled')
+  }
+
+  performanceTrace.endInteraction(pendingSpatialInteractionId, 'spatial-cancelled')
+  pendingSpatialInteractionId = null
+  frameNavigation.cancel()
 }
 
 function scrollDocumentBy(deltaY: number): void {
@@ -838,15 +1117,19 @@ function scrollDocumentBy(deltaY: number): void {
 
   if (nextScroll !== window.scrollY) {
     window.scrollTo(0, nextScroll)
-    invalidateSpatialLayout()
+    invalidateSpatialLayout('programmatic-scroll')
   }
 }
 
-function ensureFocusVisible(target: HTMLElement): void {
-  const topbarBottom = document.querySelector<HTMLElement>('.topbar')?.getBoundingClientRect().bottom ?? 0
+function focusVisibilityDelta(target: HTMLElement): number {
+  // Keep all geometry reads together before focus or scrolling writes. This
+  // avoids a second forced layout in the D-pad hot path.
+  const topbarBottom =
+    document.querySelector<HTMLElement>('.topbar')?.getBoundingClientRect().bottom ?? 0
   const helpbarTop = document.querySelector<HTMLElement>('.helpbar')?.getBoundingClientRect().top
   const rect = target.getBoundingClientRect()
-  const delta = focusScrollDelta(
+
+  return focusScrollDelta(
     rect.top,
     rect.bottom,
     window.innerHeight,
@@ -855,11 +1138,17 @@ function ensureFocusVisible(target: HTMLElement): void {
       bottom: (helpbarTop ?? window.innerHeight) - 18,
     },
   )
+}
 
+function applyFocusVisibility(delta: number): void {
   if (delta !== 0) {
     window.scrollTo(0, window.scrollY + delta)
-    invalidateSpatialLayout()
+    invalidateSpatialLayout('focus-scroll')
   }
+}
+
+function ensureFocusVisible(target: HTMLElement): void {
+  applyFocusVisibility(focusVisibilityDelta(target))
 }
 
 function searchText(stream: StreamItem): string {
@@ -954,7 +1243,7 @@ function defaultFocusTarget(): HTMLElement | null {
             '.catalog-tools [data-focus-id]',
           ]
         : view === 'details'
-          ? ['[data-focus-id="detail-play-next"]', '[data-focus-id="detail-play"]', '.metadata-people [data-focus-id]', '.series-episodes [data-focus-id]']
+          ? ['[data-focus-id="detail-play-next"]', '[data-focus-id="detail-play"]', '[data-focus-id="detail-content-guidance"]', '.metadata-people [data-focus-id]', '.series-episodes [data-focus-id]']
           : view === 'person'
             ? ['.person-filmography [data-focus-id]', '.person-header [data-focus-id]']
           : view === 'guide'
@@ -1040,7 +1329,11 @@ function toTransportStreamUrl(source: string): string {
 }
 
 function renderShell(content: string, title = currentViewTitle()): void {
+  cancelPendingSpatialNavigation()
   const snapshot = snapshotFocus()
+  const renderId = performanceTrace.beginRender(view, {
+    htmlCharacters: content.length,
+  })
   app.innerHTML = `
     <div class="app-shell">
       <header class="topbar">
@@ -1067,8 +1360,13 @@ function renderShell(content: string, title = currentViewTitle()): void {
       </footer>
     </div>
   `
-  invalidateSpatialLayout()
+  invalidateSpatialLayout('shell-replaced')
   bindEvents()
+  performanceTrace.trackImages(app, { renderId: renderId ?? undefined })
+  performanceTrace.endRender(renderId, {
+    focusableCount: app.querySelectorAll('[data-focus-id]').length,
+    imageCount: app.querySelectorAll('img').length,
+  })
   renderedView = view
   restoreFocus(snapshot)
 }
@@ -1111,7 +1409,8 @@ function catalogResultsFor(activeCatalog: CatalogState): CatalogResults {
 
 function renderLogin(): void {
   const snapshot = snapshotFocus()
-  invalidateSpatialLayout()
+  const renderId = performanceTrace.beginRender('login')
+  invalidateSpatialLayout('login-replaced')
   const profiles = profileSummaries()
 
   app.innerHTML = `
@@ -1200,6 +1499,10 @@ function renderLogin(): void {
   })
 
   bindEvents()
+  performanceTrace.trackImages(app, { renderId: renderId ?? undefined })
+  performanceTrace.endRender(renderId, {
+    focusableCount: app.querySelectorAll('[data-focus-id]').length,
+  })
   renderedView = view
   restoreFocus(snapshot)
 }
@@ -1269,11 +1572,12 @@ function renderCatalog(): void {
   const visibleCategories = results.categories
   const filteredStreams = results.streams
   const itemCount = catalog.category === null ? visibleCategories.length : filteredStreams.length
-  const pageCount = Math.max(1, Math.ceil(itemCount / CATALOG_PAGE_SIZE))
+  const pageSize = catalogPageSize()
+  const pageCount = Math.max(1, Math.ceil(itemCount / pageSize))
   catalog.page = Math.max(0, Math.min(catalog.page, pageCount - 1))
-  const pageStart = catalog.page * CATALOG_PAGE_SIZE
-  const pageCategories = visibleCategories.slice(pageStart, pageStart + CATALOG_PAGE_SIZE)
-  const pageStreams = filteredStreams.slice(pageStart, pageStart + CATALOG_PAGE_SIZE)
+  const pageStart = catalog.page * pageSize
+  const pageCategories = visibleCategories.slice(pageStart, pageStart + pageSize)
+  const pageStreams = filteredStreams.slice(pageStart, pageStart + pageSize)
   const activeCategory = catalog.category?.name ?? 'All categories'
   const catalogLabel = catalog.isFavorites ? 'Favorites' : labels[catalog.section]
   const searchTarget = catalog.isFavorites
@@ -1504,9 +1808,19 @@ function liveArtwork(stream: StreamItem): string {
   `
 }
 
+function catalogArtworkSource(source: string): string {
+  // Provider catalogues frequently return TMDB's `original` artwork. A card
+  // never displays enough pixels to justify decoding a 2K–3K image on webOS;
+  // request TMDB's poster-sized rendition before the deferred loader admits it.
+  return source.replace(
+    /(https?:\/\/image\.tmdb\.org\/t\/p\/)(?:original|w\d+(?:_and_h\d+_bestv2)?)(\/)/i,
+    '$1w342$2',
+  )
+}
+
 function posterArtwork(stream: StreamItem): string {
   var source: string | undefined
-  var fallbackAttr = ''
+  var fallbackSource: string | undefined
 
   if (stream.streamType === 'episode') {
     // Attempt the per-episode still first (distinct thumbnail), falling back to
@@ -1520,7 +1834,7 @@ function posterArtwork(stream: StreamItem): string {
       : undefined
 
     if (fallbackPoster && fallbackPoster !== source) {
-      fallbackAttr = ` data-fallback-src="${escape(fallbackPoster)}"`
+      fallbackSource = fallbackPoster
     }
   } else {
     source = stream.cover || stream.metadata?.cover || stream.seriesCover || stream.icon
@@ -1530,9 +1844,18 @@ function posterArtwork(stream: StreamItem): string {
     return imageOrPlaceholder(undefined, stream.name, 'poster')
   }
 
+  const optimizedSource = catalogArtworkSource(source)
+  const optimizedFallback = fallbackSource
+    ? catalogArtworkSource(fallbackSource)
+    : undefined
+  const fallbackAttr =
+    optimizedFallback && optimizedFallback !== optimizedSource
+      ? ` data-fallback-src="${escape(optimizedFallback)}"`
+      : ''
+
   return `
-    <span class="poster-artwork">
-      <img class="poster" src="${escape(source)}"${fallbackAttr} alt="" loading="lazy" />
+    <span class="poster-artwork image-deferred">
+      <img class="poster" data-deferred-src="${escape(optimizedSource)}"${fallbackAttr} alt="" />
       <span class="poster-fallback" aria-hidden="true">${escape(stream.name.slice(0, 1))}</span>
     </span>
   `
@@ -1594,7 +1917,7 @@ function renderDetails(): void {
     return
   }
 
-  const metadata = detailsMetadata(item)
+  const metadata = metadataForCurrentDetail()
   const media = metadata.cover ?? item.cover ?? item.icon
   const description = metadata.plot ?? item.plot ?? 'No description provided by this IPTV provider.'
   const detailFacts = [
@@ -1620,11 +1943,13 @@ function renderDetails(): void {
           <div class="detail-chips">${detailFacts.length ? detailFacts.map((fact) => `<span>${escape(fact)}</span>`).join('') : '<span>Available now</span>'}</div>
           ${selectedTitleEnrichment?.tagline ? `<p class="detail-tagline">${escape(selectedTitleEnrichment.tagline)}</p>` : ''}
           <p class="plot">${escape(description)}</p>
+          ${renderContentGuidance(metadata)}
           ${renderRichMetadata(metadata)}
           ${detailActions(item, metadata)}
         </div>
       </div>
     </section>
+    ${item.section !== 'live' ? renderEnrichedMetadata() : ''}
     ${renderEpisodeList()}
     <section id="now-next-panel"></section>
     <section id="epg-panel"></section>
@@ -1648,26 +1973,60 @@ function detailsMetadata(item: StreamItem): RichMetadata {
 }
 
 function renderPersonCard(person: PersonSummary, role: string, group: 'cast' | 'crew'): string {
+  const canOpenProfile = metadataServiceConfigured() && !person.id.startsWith('tvmaze-')
+
   return `
-    <button class="person-card" data-action="open-person" data-person-id="${escape(person.id)}" data-person-name="${escape(person.name)}" data-focus-id="${group}-person-${escape(person.id)}">
+    <button class="person-card" ${canOpenProfile ? `data-action="open-person" data-person-id="${escape(person.id)}" data-person-name="${escape(person.name)}"` : 'disabled'} data-focus-id="${group}-person-${escape(person.id)}">
       <span class="person-portrait">${imageOrPlaceholder(person.profileImage, person.name, 'person-image')}</span>
       <span class="person-card-copy"><strong>${escape(person.name)}</strong><small>${escape(role)}</small></span>
     </button>
   `
 }
 
-function renderEnrichedMetadata(): string {
-  const enrichment = selectedTitleEnrichment
+function isRatingCandidate(value: unknown): value is RatingCandidate {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'provider' in value &&
+    'sourceLabel' in value
+  )
+}
 
-  if (!enrichment) {
+function metadataForCurrentDetail(): RichMetadata {
+  const metadata = selectedItem ? detailsMetadata(selectedItem) : {}
+  const candidates = dedupeRatingCandidates(
+    [
+      ...(metadata.contentRatings ?? []),
+      ...(selectedTitleEnrichment?.contentRatings ?? []),
+      metadata.contentRating,
+      selectedTitleEnrichment?.contentRating,
+    ].filter(isRatingCandidate),
+  )
+  const resolution = resolveContentRating(candidates)
+
+  return {
+    ...metadata,
+    contentRatings: candidates.length ? candidates : undefined,
+    ratingResolution: resolution,
+    contentRating: resolution.selected,
+    ageGuidance: resolution.ageGuidance,
+  }
+}
+
+function renderEnrichedMetadata(): string {
+  const metadata = metadataForCurrentDetail()
+  const enrichment = selectedTitleEnrichment
+  const cast = effectivePeople(metadata, 'cast').slice(0, 12)
+  const crew = effectivePeople(metadata, 'crew')
+    .filter((person) => person.job || person.department)
+    .slice(0, 8)
+  const related = enrichment?.related?.slice(0, 10) ?? []
+
+  if (!enrichment && !cast.length && !crew.length) {
     return titleEnrichmentLoading
       ? '<section class="metadata-loading" aria-live="polite">Loading cast and crew…</section>'
       : ''
   }
-
-  const cast = enrichment.cast?.slice(0, 12) ?? []
-  const crew = enrichment.crew?.filter((person) => person.job || person.department).slice(0, 8) ?? []
-  const related = enrichment.related?.slice(0, 10) ?? []
 
   return `
     ${
@@ -1685,7 +2044,13 @@ function renderEnrichedMetadata(): string {
         ? `<section class="metadata-section"><div class="metadata-heading"><h2>You may also like</h2></div><div class="metadata-title-row">${related.map(renderMetadataTitleCard).join('')}</div></section>`
         : ''
     }
-    <p class="metadata-attribution">Metadata and images provided by TMDB.</p>
+    <p class="metadata-attribution">${
+      enrichment?.tmdbId.startsWith('tvmaze-')
+        ? 'Cast portraits provided by TVmaze.'
+        : enrichment
+          ? 'Metadata and images provided by TMDB.'
+          : 'People details supplied by your IPTV provider.'
+    }</p>
   `
 }
 
@@ -1698,6 +2063,43 @@ function renderMetadataTitleCard(title: RelatedTitle): string {
   `
 }
 
+function renderContentGuidance(metadata: RichMetadata): string {
+  const rating = metadata.contentRating?.value ?? '-'
+  const age = metadata.ageGuidance?.suggestedMinimumAge === undefined
+    ? '-'
+    : `${metadata.ageGuidance.suggestedMinimumAge}+`
+  const provenance = metadata.ratingResolution
+    ? ratingSourceSummary(metadata.ratingResolution)
+    : ''
+  const accessibleName = [
+    'Content classification',
+    `PG: ${rating}`,
+    `Age: ${age}`,
+    provenance,
+  ].filter(Boolean).join('. ')
+
+  return `
+    <button class="content-guidance" type="button" data-focus-id="detail-content-guidance" aria-label="${escape(accessibleName)}">
+      <span class="content-guidance-value"><strong>PG:</strong> ${escape(rating)}</span>
+      <span class="content-guidance-separator" aria-hidden="true">·</span>
+      <span class="content-guidance-value"><strong>Age:</strong> ${escape(age)}</span>
+      ${provenance ? `<small class="content-guidance-provenance">${escape(provenance)}</small>` : ''}
+    </button>
+  `
+}
+
+function effectivePeople(metadata: RichMetadata, group: 'cast' | 'crew'): PersonSummary[] {
+  const enriched = group === 'cast'
+    ? selectedTitleEnrichment?.cast
+    : selectedTitleEnrichment?.crew
+
+  return enriched?.length
+    ? enriched
+    : group === 'cast'
+      ? metadata.providerCast ?? []
+      : metadata.providerCrew ?? []
+}
+
 function renderRichMetadata(metadata: RichMetadata): string {
   const details = [
     metadata.cast ? `<p><strong>Cast:</strong> ${escape(metadata.cast)}</p>` : '',
@@ -1705,8 +2107,7 @@ function renderRichMetadata(metadata: RichMetadata): string {
     metadata.country ? `<p><strong>Country:</strong> ${escape(metadata.country)}</p>` : '',
   ].filter(Boolean)
 
-  const providerMetadata = details.length ? `<div class="rich-metadata">${details.join('')}</div>` : ''
-  return `${providerMetadata}${renderEnrichedMetadata()}`
+  return details.length ? `<div class="rich-metadata">${details.join('')}</div>` : ''
 }
 
 function detailActions(item: StreamItem, metadata: RichMetadata): string {
@@ -1829,12 +2230,16 @@ function episodeArtwork(episode: StreamItem): string {
     return fallback
   }
 
+  const optimizedPrimary = catalogArtworkSource(sources.primary)
+  const optimizedFallback = sources.fallback
+    ? catalogArtworkSource(sources.fallback)
+    : undefined
   const fallbackAttr =
-    sources.fallback && sources.fallback !== sources.primary
-      ? ` data-fallback-src="${escape(sources.fallback)}"`
+    optimizedFallback && optimizedFallback !== optimizedPrimary
+      ? ` data-fallback-src="${escape(optimizedFallback)}"`
       : ''
 
-  return `<img class="episode-image" src="${escape(sources.primary)}"${fallbackAttr} alt="" loading="lazy" />${fallback}`
+  return `<img class="episode-image" data-deferred-src="${escape(optimizedPrimary)}"${fallbackAttr} alt="" />${fallback}`
 }
 
 function episodeMeta(episode: StreamItem, entry?: ResumeEntry): string {
@@ -2537,6 +2942,11 @@ function renderPlayer(): void {
   }
 
   const snapshot = snapshotFocus()
+  const renderId = performanceTrace.beginRender('player')
+  const playbackInteractionId = performanceTrace.startInteraction('playback-start', {
+    section: item.section,
+    streamType: item.streamType === 'episode' ? 'episode' : 'title',
+  })
   const isLive = item.section === 'live'
   const hasSeekableTimeline = !isLive || Boolean(playerSourceOverride)
   const playerControlsClass = playerUiMode === 'immersive' ? 'concealed' : ''
@@ -2592,8 +3002,12 @@ function renderPlayer(): void {
       </div>
     </main>
   `
-  invalidateSpatialLayout()
+  invalidateSpatialLayout('player-replaced')
   bindEvents()
+  performanceTrace.trackImages(app, { renderId: renderId ?? undefined })
+  performanceTrace.endRender(renderId, {
+    focusableCount: app.querySelectorAll('[data-focus-id]').length,
+  })
 
   const video = document.querySelector<HTMLVideoElement>('#video-player')
   const message = document.querySelector<HTMLElement>('#player-message')
@@ -2695,6 +3109,10 @@ function renderPlayer(): void {
   }
 
   const cleanup = (): void => {
+    performanceTrace.event('playback', 'session-cleanup', undefined, {
+      interactionId: playbackInteractionId ?? undefined,
+    })
+    performanceTrace.endInteraction(playbackInteractionId, 'playback-cleanup')
     discardPlayerTimelinePreview()
     persistProgress()
     activeAttemptGeneration += 1
@@ -2733,6 +3151,17 @@ function renderPlayer(): void {
       return
     }
 
+    performanceTrace.event(
+      'playback',
+      'attempt-failed',
+      {
+        engine: attempt.engine,
+        source: attempt.source.kind,
+        kind,
+        generation,
+      },
+      { interactionId: playbackInteractionId ?? undefined },
+    )
     const failure: PlaybackFailure = {
       engine: attempt.engine,
       source: attempt.source.kind,
@@ -2846,12 +3275,26 @@ function renderPlayer(): void {
 
     if (!attempt) {
       activeAttempt = null
+      performanceTrace.endInteraction(playbackInteractionId, 'playback-failed', {
+        attempts: playbackFailures.length,
+      })
       showPlayerMessage(describePlaybackFailure(playbackFailures))
       renderPlayerDiagnostics(true)
       return
     }
 
     activeAttempt = attempt
+    performanceTrace.event(
+      'playback',
+      'attempt-start',
+      {
+        engine: attempt.engine,
+        source: attempt.source.kind,
+        attemptIndex: nextAttemptIndex,
+        generation: activeAttemptGeneration,
+      },
+      { interactionId: playbackInteractionId ?? undefined },
+    )
     visiblePlaybackConfirmed = false
     decodedFrameBaseline = decodedVideoFrames()
     const generation = activeAttemptGeneration
@@ -3171,6 +3614,11 @@ function renderPlayer(): void {
   }
 
   player.addEventListener('loadedmetadata', () => {
+    performanceTrace.event('playback', 'loadedmetadata', {
+      videoWidth: player.videoWidth,
+      videoHeight: player.videoHeight,
+      durationKnown: Number.isFinite(player.duration),
+    }, { interactionId: playbackInteractionId ?? undefined })
     // Re-assert rate + pitch after source (re)attach so HLS.js/mpegts.js/dash.js
     // engine swaps don't silently reset the media element's playback properties.
     applyPlaybackRate(player as any, playerPlaybackRate, playbackPreservesPitch())
@@ -3184,6 +3632,10 @@ function renderPlayer(): void {
   player.addEventListener('durationchange', restoreResume)
   player.addEventListener('error', () => {
     const error = player.error
+    performanceTrace.event('playback', 'media-error', {
+      code: error?.code ?? 0,
+      messagePresent: Boolean(error?.message),
+    }, { interactionId: playbackInteractionId ?? undefined })
 
     failActiveAttempt(
       error?.code === 3 ? 'decode' : 'network',
@@ -3207,11 +3659,28 @@ function renderPlayer(): void {
       }
     }
   })
+  player.addEventListener('waiting', () => {
+    performanceTrace.event('playback', 'waiting', undefined, {
+      interactionId: playbackInteractionId ?? undefined,
+    })
+  })
+  player.addEventListener('canplay', () => {
+    performanceTrace.event('playback', 'canplay', undefined, {
+      interactionId: playbackInteractionId ?? undefined,
+    })
+  })
   player.addEventListener('pause', () => {
+    performanceTrace.event('playback', 'paused', undefined, {
+      interactionId: playbackInteractionId ?? undefined,
+    })
     persistProgress()
     updatePlayerPlayControl()
   })
   player.addEventListener('ended', () => {
+    performanceTrace.event('playback', 'ended', undefined, {
+      interactionId: playbackInteractionId ?? undefined,
+    })
+    performanceTrace.endInteraction(playbackInteractionId, 'playback-ended')
     if (activeItem.section !== 'live') {
       markStreamWatched(activeItem, true, player.duration)
       const nextEpisode = findNextEpisode(activeItem)
@@ -3225,6 +3694,9 @@ function renderPlayer(): void {
     }
   })
   player.addEventListener('playing', () => {
+    performanceTrace.event('playback', 'playing', undefined, {
+      interactionId: playbackInteractionId ?? undefined,
+    })
     // The webOS emulator can render native video while exposing neither stable
     // dimensions nor decoded-frame statistics. Once the media element reports
     // playing, it must not be torn down by the visual-frame watchdog.
@@ -3287,6 +3759,10 @@ function renderPlayer(): void {
     }
 
     visiblePlaybackConfirmed = true
+    performanceTrace.endInteraction(playbackInteractionId, 'playback-ready', {
+      engine: activeAttempt?.engine ?? 'unknown',
+      attemptIndex: nextAttemptIndex,
+    })
     clearPlaybackWatchdog()
     playerDiagnostics = []
     playerDiagnosticsElement.hidden = true
@@ -3539,6 +4015,7 @@ function assignNavigationZones(): void {
     '.category-grid',
     '.catalog-pager',
     '.action-row',
+    '.content-guidance',
     '.metadata-people',
     '.metadata-title-row',
     '.person-filmography',
@@ -3571,20 +4048,156 @@ function assignNavigationZones(): void {
  * Returns true if a swap was performed (caller should skip adding
  * image-unavailable), false if no fallback was available.
  */
+function deferredImageContainer(image: HTMLImageElement): HTMLElement | null {
+  return image.closest<HTMLElement>('.poster-artwork, .episode-art, .live-channel-artwork')
+}
+
+function deferredImageIsNearby(image: HTMLImageElement): boolean {
+  const rect = image.getBoundingClientRect()
+
+  return (
+    rect.bottom >= -DEFERRED_IMAGE_PREFETCH_PX &&
+    rect.top <= window.innerHeight + DEFERRED_IMAGE_PREFETCH_PX
+  )
+}
+
+function deferredImageConcurrency(): number {
+  return isWebOsRuntime()
+    ? WEBOS_DEFERRED_IMAGE_CONCURRENCY
+    : DEFERRED_IMAGE_CONCURRENCY
+}
+
+function scheduleDeferredImageLoads(): void {
+  if (deferredImageScheduleHandle !== null) {
+    return
+  }
+
+  deferredImageScheduleHandle = window.requestAnimationFrame(() => {
+    deferredImageScheduleHandle = null
+
+    const concurrency = deferredImageConcurrency()
+
+    if (deferredImageLoads >= concurrency) {
+      return
+    }
+
+    const pending = Array.from(
+      app.querySelectorAll<HTMLImageElement>(
+        'img[data-deferred-src]:not([data-deferred-loading="true"])',
+      ),
+    )
+      .filter(deferredImageIsNearby)
+      .sort((left, right) => {
+        const leftDistance = Math.abs(left.getBoundingClientRect().top)
+        const rightDistance = Math.abs(right.getBoundingClientRect().top)
+        return leftDistance - rightDistance
+      })
+
+    for (const image of pending) {
+      if (deferredImageLoads >= concurrency) {
+        break
+      }
+
+      const source = image.dataset.deferredSrc
+
+      if (!source) {
+        continue
+      }
+
+      const container = deferredImageContainer(image)
+      deferredImageLoads += 1
+      image.dataset.deferredLoading = 'true'
+      container?.classList.add('image-loading')
+
+      const settle = (outcome: 'load' | 'error'): void => {
+        deferredImageLoads = Math.max(0, deferredImageLoads - 1)
+        delete image.dataset.deferredLoading
+        container?.classList.remove('image-loading')
+        performanceTrace.event('image', 'deferred-settled', {
+          outcome,
+          queuedRemaining: app.querySelectorAll('img[data-deferred-src]').length,
+          concurrency,
+        })
+        window.setTimeout(
+          scheduleDeferredImageLoads,
+          isWebOsRuntime() ? WEBOS_DEFERRED_IMAGE_COOLDOWN_MS : 0,
+        )
+      }
+
+      image.addEventListener('load', () => settle('load'), { once: true })
+      image.addEventListener('error', () => settle('error'), { once: true })
+      delete image.dataset.deferredSrc
+      scheduleImageErrorCheck(image)
+      image.src = source
+      performanceTrace.event('image', 'deferred-admitted', {
+        queuedRemaining: app.querySelectorAll('img[data-deferred-src]').length,
+        concurrency,
+      })
+      performanceTrace.trackImages(app)
+    }
+  })
+}
+
 function tryImageFallbackSwap(image: HTMLImageElement): boolean {
   var fallbackSrc = image.getAttribute('data-fallback-src')
 
   if (fallbackSrc && fallbackSrc !== image.src) {
+    performanceTrace.event('image', 'fallback-swapped', {
+      imageType: image.className || 'unclassified',
+      fallbackPresent: true,
+    })
     image.removeAttribute('data-fallback-src')
     image.src = fallbackSrc
     return true
   }
 
+  performanceTrace.event('image', 'fallback-unavailable', {
+    imageType: image.className || 'unclassified',
+  })
   return false
 }
 
+function scheduleImageErrorCheck(image: HTMLImageElement): void {
+  if (image.dataset.errorCheckScheduled === 'true') {
+    return
+  }
+
+  image.dataset.errorCheckScheduled = 'true'
+  window.setTimeout(() => {
+    if (
+      !image.isConnected ||
+      image.dataset.deferredSrc ||
+      image.dataset.deferredLoading === 'true' ||
+      (image.complete && image.naturalWidth > 0)
+    ) {
+      return
+    }
+
+    performanceTrace.event('image', 'timeout-without-load', {
+      imageType: image.className || 'unclassified',
+      complete: image.complete,
+      naturalWidth: image.naturalWidth,
+    })
+
+    if (tryImageFallbackSwap(image)) {
+      delete image.dataset.errorCheckScheduled
+      scheduleImageErrorCheck(image)
+      return
+    }
+
+    if (image.classList.contains('live-channel-logo')) {
+      image.closest<HTMLElement>('.live-channel-artwork')?.classList.add('logo-unavailable')
+    } else if (image.classList.contains('episode-image')) {
+      image.closest<HTMLElement>('.episode-art')?.classList.add('image-unavailable')
+    } else {
+      image.closest<HTMLElement>('.poster-artwork')?.classList.add('image-unavailable')
+    }
+  }, 5_000)
+}
+
 function bindEvents(): void {
-  invalidateSpatialLayout()
+  invalidateSpatialLayout('event-binding')
+  performanceTrace.trackImages(app)
 
   if (!delegatedEventsBound) {
     app.addEventListener('click', (event) => {
@@ -3596,10 +4209,38 @@ function bindEvents(): void {
 
       const actionElement = target.closest<HTMLElement>('[data-action]')
 
-      if (actionElement && app.contains(actionElement)) {
-        void handleAction(actionElement)
+        if (actionElement && app.contains(actionElement)) {
+          const interactionId = performanceTrace.startInteraction('click-action', {
+            action: actionElement.dataset.action ?? 'unknown',
+          })
+          void handleAction(actionElement).finally(() => {
+            performanceTrace.endInteraction(interactionId, 'click-action-complete')
+          })
+        }
+    })
+
+    // The continue-menu overlay is appended to document.body (outside #app).
+    // Delegate its action clicks from the body so handleAction receives them.
+    document.body.addEventListener('click', function (event) {
+      var target = event.target
+      if (!(target instanceof Element)) {
+        return
+      }
+      var menu = document.querySelector('#continue-menu')
+      if (!menu) {
+        return
+      }
+      var actionElement = target.closest<HTMLElement>('[data-action]')
+      if (actionElement && menu.contains(actionElement)) {
+        const interactionId = performanceTrace.startInteraction('overlay-action', {
+          action: actionElement.dataset.action ?? 'unknown',
+        })
+        void handleAction(actionElement).finally(() => {
+          performanceTrace.endInteraction(interactionId, 'overlay-action-complete')
+        })
       }
     })
+
     delegatedEventsBound = true
   }
 
@@ -3612,6 +4253,12 @@ function bindEvents(): void {
         if (!(target instanceof HTMLImageElement)) {
           return
         }
+
+        performanceTrace.event('image', 'fallback-handler-error', {
+          imageType: target.className || 'unclassified',
+          connected: target.isConnected,
+          naturalWidth: target.naturalWidth,
+        })
 
         if (target.classList.contains('live-channel-logo')) {
           target.closest<HTMLElement>('.live-channel-artwork')?.classList.add('logo-unavailable')
@@ -3633,31 +4280,11 @@ function bindEvents(): void {
     liveLogoErrorHandlerBound = true
   }
 
-  app.querySelectorAll<HTMLImageElement>('.live-channel-logo, .poster, .episode-image').forEach((image) => {
-    if (image.dataset.errorCheckScheduled === 'true') {
-      return
-    }
-
-    image.dataset.errorCheckScheduled = 'true'
-    window.setTimeout(() => {
-      if (!image.isConnected || (image.complete && image.naturalWidth > 0)) {
-        return
-      }
-
-      // Try swapping to the fallback image before marking unavailable.
-      if (tryImageFallbackSwap(image)) {
-        return
-      }
-
-      if (image.classList.contains('live-channel-logo')) {
-        image.closest<HTMLElement>('.live-channel-artwork')?.classList.add('logo-unavailable')
-      } else if (image.classList.contains('episode-image')) {
-        image.closest<HTMLElement>('.episode-art')?.classList.add('image-unavailable')
-      } else {
-        image.closest<HTMLElement>('.poster-artwork')?.classList.add('image-unavailable')
-      }
-    }, 5_000)
-  })
+  app
+    .querySelectorAll<HTMLImageElement>(
+      '.live-channel-logo[src], .poster[src], .episode-image[src]',
+    )
+    .forEach(scheduleImageErrorCheck)
 
   app.querySelectorAll<HTMLElement>('button, input, select, [tabindex="0"]').forEach((element) => {
     if (!element.dataset.focusId) {
@@ -3671,6 +4298,7 @@ function bindEvents(): void {
   })
 
   assignNavigationZones()
+  scheduleDeferredImageLoads()
 }
 
 async function handleAction(element: HTMLElement): Promise<void> {
@@ -3731,6 +4359,47 @@ async function handleAction(element: HTMLElement): Promise<void> {
     } else {
       await openDetails(stream)
     }
+    return
+  }
+
+  if (action === 'resume-continue') {
+    var resumeStream = streamFromKey(element.dataset.streamKey)
+    closeContinueMenu()
+    if (resumeStream) {
+      await beginResumePlayback(resumeStream)
+    }
+    return
+  }
+
+  if (action === 'remove-continue') {
+    var removeKey = element.dataset.streamKey
+    if (removeKey && profile) {
+      var removedEntry = resumeEntries.get(removeKey)
+      if (removedEntry) {
+        // Store for undo before deleting.
+        lastRemovedResume = { key: removeKey, entry: removedEntry }
+        if (undoResumeTimer !== null) {
+          window.clearTimeout(undoResumeTimer)
+        }
+        undoResumeTimer = window.setTimeout(function () {
+          lastRemovedResume = null
+          undoResumeTimer = null
+        }, 6000)
+
+        resumeEntries.delete(removeKey)
+        if (!saveResume(profile.id, resumeEntries)) {
+          showToast(STORAGE_FAILURE_MESSAGE)
+        }
+      }
+    }
+
+    closeContinueMenu()
+
+    // Re-render the home view. restoreFocus inside renderHome will land on
+    // the next continue-watching card or fall back to the first hub card.
+    renderHome()
+
+    showToast('Removed \u2014 press Green to undo')
     return
   }
 
@@ -3903,6 +4572,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
 
     playerReturnPoint = captureReturnPoint()
     pushRouteHistory()
+    pauseCompleteSearchCatalogWarming('catchup-playback-start')
     startNavigation()
     playerCleanup?.()
     playerCleanup = null
@@ -4045,6 +4715,8 @@ async function handleAction(element: HTMLElement): Promise<void> {
     pushRouteHistory()
     startNavigation()
     clearProfile()
+    clearGlobalSearchResultCache()
+    clearCompleteSearchCatalogs()
     profile = null
     client = null
     account = null
@@ -4139,33 +4811,30 @@ async function openSection(section: LibrarySection): Promise<void> {
       return
     }
 
-    try {
-      await activeClient.validate(signal)
-      renderError(
-        new Error(
-          'Your login is valid, but this provider is not responding to its category service. Please try again shortly.',
-        ),
-        () => void openSection(section),
-      )
-    } catch (validationReason) {
-      const validationMessage =
-        validationReason instanceof Error ? validationReason.message : ''
-
-      if (
-        validationMessage.includes('rejected that username or password') ||
-        validationMessage.includes('invalid response')
-      ) {
-        renderError(validationReason, () => void openSection(section))
-      } else {
-        renderError(
-          new Error(
-            'The IPTV provider is currently unreachable or too slow. This is a provider/network failure, not a confirmed login rejection.',
-          ),
-          () => void openSection(section),
-        )
-      }
-    }
+    /*
+     * This previously issued an extra validate() request to decide whether the
+     * login or the provider was at fault, which doubled traffic exactly when the
+     * provider was already refusing it. The failure now carries its own
+     * classification, so the same distinction costs no additional request.
+     */
+    renderError(categoryFailureReason(reason), () => void openSection(section))
   }
+}
+
+/*
+ * Refusals already carry an accurate user-facing message: a rejected login, or
+ * an explicit rate limit. Everything else is reported as a provider/network
+ * fault rather than a confirmed login rejection, because a stalled category
+ * endpoint proves nothing about the credentials.
+ */
+function categoryFailureReason(reason: unknown): Error {
+  if (isProviderError(reason) && isProviderRefusal(reason)) {
+    return reason
+  }
+
+  return new Error(
+    'The IPTV provider is currently unreachable or too slow. This is a provider/network failure, not a confirmed login rejection.',
+  )
 }
 
 async function loadCategory(category: Category | null): Promise<void> {
@@ -4296,27 +4965,50 @@ async function enrichSelectedTitle(
   token: number,
   signal: AbortSignal,
 ): Promise<void> {
-  if (!metadataServiceConfigured() || item.section === 'live') {
+  if (item.section === 'live') {
     return
   }
 
+  const configured = metadataServiceConfigured()
+  performanceTrace.event('metadata', 'enrichment-start', {
+    section: item.section,
+    configured,
+    navigationToken: token,
+  })
+
   try {
-    const enrichment = await loadTitleMetadata({
-      mediaType: item.section === 'series' ? 'tv' : 'movie',
-      title: metadataLookupTitle(selectedSeries?.info.name ?? item.name),
-      originalTitle: metadata.originalTitle,
-      year: metadata.year ?? item.year,
-      tmdbId: metadata.tmdbId,
-      signal,
+    const title = metadataLookupTitle(selectedSeries?.info.name ?? item.name)
+    const enrichment = configured
+      ? await loadTitleMetadata({
+          mediaType: item.section === 'series' ? 'tv' : 'movie',
+          title,
+          originalTitle: metadata.originalTitle,
+          year: metadata.year ?? item.year,
+          tmdbId: metadata.tmdbId,
+          signal,
+        })
+      : item.section === 'series'
+        ? await loadTvMazeSeriesMetadata(title, signal)
+        : null
+
+    const current = isCurrentNavigation(token) && view === 'details' && selectedItem === item
+    performanceTrace.event('metadata', 'enrichment-complete', {
+      current,
+      found: Boolean(enrichment),
+      castCount: enrichment?.cast?.length ?? 0,
+      ratingCount: enrichment?.contentRatings?.length ?? 0,
     })
 
-    if (isCurrentNavigation(token) && view === 'details' && selectedItem === item) {
+    if (current) {
       selectedTitleEnrichment = enrichment
       titleEnrichmentLoading = false
       renderDetails()
     }
   } catch {
-    if (isCurrentNavigation(token) && view === 'details' && selectedItem === item) {
+    const current = isCurrentNavigation(token) && view === 'details' && selectedItem === item
+    performanceTrace.event('metadata', 'enrichment-failed', { current, configured })
+
+    if (current) {
       titleEnrichmentLoading = false
       renderDetails()
     }
@@ -4339,7 +5031,8 @@ async function openDetails(stream: StreamItem): Promise<void> {
   activeSeriesSeason = null
   selectedVod = null
   selectedTitleEnrichment = null
-  titleEnrichmentLoading = metadataServiceConfigured() && stream.section !== 'live'
+  titleEnrichmentLoading =
+    stream.section === 'series' || (metadataServiceConfigured() && stream.section !== 'live')
 
   if (stream.section === 'live') {
     view = 'details'
@@ -4676,8 +5369,36 @@ async function searchGlobalSection(
   query: string,
   results: StreamItem[],
   resultKeys: Set<string>,
-): Promise<void> {
+): Promise<GlobalSearchSectionOutcome> {
   const { signal } = session.controller
+  const completeCatalog = cachedCompleteSearchCatalog(section)
+
+  if (completeCatalog) {
+    const catalogSearchStartedAt = Date.now()
+    const added = await addSearchMatchesCooperatively(
+      results,
+      resultKeys,
+      completeCatalog,
+      query,
+      signal,
+    )
+
+    if (!isCurrentGlobalSearchSession(session)) {
+      return { authoritative: false, cacheable: false }
+    }
+
+    if (added) {
+      globalSearchResults = results
+      scheduleGlobalSearchRender(session, [section])
+    }
+
+    performanceTrace.event('search', 'global-search-catalog-hit', {
+      section,
+      catalogItemCount: completeCatalog.length,
+      durationMs: Date.now() - catalogSearchStartedAt,
+    })
+    return { authoritative: true, cacheable: true }
+  }
 
   const cachedMatches = await addSearchMatchesCooperatively(
     results,
@@ -4688,7 +5409,7 @@ async function searchGlobalSection(
   )
 
   if (!isCurrentGlobalSearchSession(session)) {
-    return
+    return { authoritative: false, cacheable: false }
   }
 
   if (cachedMatches) {
@@ -4696,19 +5417,16 @@ async function searchGlobalSection(
     scheduleGlobalSearchRender(session, [section])
   }
 
-  const categoriesPromise = activeClient
-    .categories(section, signal)
-    .then((categories) => {
-      if (isCurrentGlobalSearchSession(session)) {
-        rememberCategories(section, categories)
-      }
-      return categories
-    })
-    .catch(() => [] as Category[])
+  let fallbackCategories = sectionCategories.get(section)
 
+  // Apply known adult category IDs when catalog metadata is already present.
+  // Do not block a foreground search waiting for category endpoints: some
+  // providers serve streams but intermittently stall category requests. The
+  // title-based adult filter still applies to every displayed match.
   try {
     const matches = await activeClient.searchStreams(section, query, {
       signal,
+      timeoutMs: GLOBAL_SEARCH_PROVIDER_TIMEOUT_MS,
       limit: Math.max(
         1,
         GLOBAL_SEARCH_SECTION_RESULT_LIMIT - globalSearchResultCount(results, section),
@@ -4721,24 +5439,60 @@ async function searchGlobalSection(
       },
     })
 
-    if (isCurrentGlobalSearchSession(session)) {
-      appendGlobalSearchMatches(session, results, resultKeys, section, matches)
+    if (!isCurrentGlobalSearchSession(session)) {
+      return { authoritative: false, cacheable: false }
     }
+
+    appendGlobalSearchMatches(session, results, resultKeys, section, matches)
 
     // A valid provider-wide response is authoritative, including zero matches.
     // Do not turn an ordinary empty search into an unbounded category crawl.
-    return
-  } catch {
+    // Defer warming until every foreground section search has finished.
+    return { authoritative: true, cacheable: true, warmAfterSearch: true }
+  } catch (reason) {
     if (!isCurrentGlobalSearchSession(session)) {
-      return
+      return { authoritative: false, cacheable: false }
+    }
+
+    /*
+     * The category fallback below exists for providers that reject whole-library
+     * endpoints, which they signal by stalling or failing the transport. A
+     * refusal is a different situation: a 403, 401 or 429 means the provider is
+     * actively turning traffic away, and answering it with one category request
+     * plus up to twelve stream requests -- across three sections in parallel --
+     * turned a single rejection into thirty-nine more. That amplification kept
+     * the account rate limited. A cancellation must not crawl either.
+     */
+    if (!isRetryableProviderFailure(reason)) {
+      return { authoritative: false, cacheable: false }
     }
   }
 
-  // Some providers reject whole-library endpoints. In that case only, use a
-  // small, bounded category fallback. Every section runs independently, so one
-  // slow provider endpoint cannot block the other libraries.
-  const categories = await categoriesPromise
-  const fallbackCategories = categories
+  // Some providers reject whole-library endpoints. Fetch categories only for
+  // that bounded fallback so normal searches with adult content visible avoid
+  // three otherwise unused category requests. When adult content is hidden,
+  // category IDs are loaded once above and then reused to preserve filtering.
+  let categories = fallbackCategories
+
+  if (!categories) {
+    try {
+      categories = await activeClient.categories(
+        section,
+        signal,
+        GLOBAL_SEARCH_CATEGORY_TIMEOUT_MS,
+      )
+    } catch {
+      return { authoritative: false, cacheable: false }
+    }
+
+    if (!isCurrentGlobalSearchSession(session)) {
+      return { authoritative: false, cacheable: false }
+    }
+
+    rememberCategories(section, categories)
+  }
+
+  const rankedFallbackCategories = categories
     .filter((category) => !settings.hideAdultContent || !isAdult(category.name))
     .map((category, index) => ({
       category,
@@ -4749,21 +5503,28 @@ async function searchGlobalSection(
     .slice(0, 12)
     .map(({ category }) => category)
 
-  for (const category of fallbackCategories) {
+  let fallbackHadFailure = false
+
+  for (const category of rankedFallbackCategories) {
     if (
       !isCurrentGlobalSearchSession(session) ||
       globalSearchResultCount(results, section) >= GLOBAL_SEARCH_SECTION_RESULT_LIMIT
     ) {
-      return
+      return { authoritative: false, cacheable: false }
     }
 
     try {
       const streams =
         cachedStreams(section, category.id) ??
-        await activeClient.streams(section, category.id, signal)
+        await activeClient.streams(
+          section,
+          category.id,
+          signal,
+          GLOBAL_SEARCH_CATEGORY_TIMEOUT_MS,
+        )
 
       if (!isCurrentGlobalSearchSession(session)) {
-        return
+        return { authoritative: false, cacheable: false }
       }
 
       cacheStreams(section, category.id, streams)
@@ -4780,12 +5541,28 @@ async function searchGlobalSection(
         globalSearchResults = results
         scheduleGlobalSearchRender(session, [section])
       }
-    } catch {
+    } catch (reason) {
       if (!isCurrentGlobalSearchSession(session)) {
-        return
+        return { authoritative: false, cacheable: false }
+      }
+
+      fallbackHadFailure = true
+
+      /*
+       * A refusal partway through the crawl applies to the remaining categories
+       * too. Continuing would spend the rest of the budget on requests the
+       * provider has already said it will reject.
+       */
+      if (!isRetryableProviderFailure(reason)) {
+        break
       }
     }
   }
+
+  // Category fallback is bounded rather than provider-wide authoritative, but
+  // cache its completed result set so a provider that rejects whole-library
+  // searches still benefits from repeated exact queries.
+  return { authoritative: false, cacheable: !fallbackHadFailure }
 }
 
 async function runGlobalSearch(session?: GlobalSearchSession): Promise<void> {
@@ -4799,6 +5576,12 @@ async function runGlobalSearch(session?: GlobalSearchSession): Promise<void> {
   const requestedQuery = (searchInput?.value ?? globalSearchQuery).trim()
   const activeSession =
     session ?? startGlobalSearchSession(requestedQuery, 'searching')
+
+  performanceTrace.event('search', 'global-search-start', {
+    resumed: Boolean(session),
+    queryLength: requestedQuery.length,
+    cacheHit: false,
+  })
 
   if (requestedQuery.length < MIN_GLOBAL_SEARCH_LENGTH) {
     clearGlobalSearch()
@@ -4818,12 +5601,43 @@ async function runGlobalSearch(session?: GlobalSearchSession): Promise<void> {
     return
   }
 
+  const cacheKey = globalSearchCacheKey(activeSession.query)
+  const cachedResults = globalSearchResultCache.get(cacheKey)
+
+  if (cachedResults) {
+    const results = [...cachedResults]
+    rememberStreams(results)
+    globalSearchLoading = false
+    globalSearchResults = results
+    globalSearchStatus = results.length
+      ? `${results.length} result${results.length === 1 ? '' : 's'}`
+      : 'No results'
+    activeSession.phase = 'completed'
+    performanceTrace.event('cache', 'global-search-result-hit', {
+      resultCount: results.length,
+    })
+    performanceTrace.event('search', 'global-search-complete', {
+      cacheHit: true,
+      resultCount: results.length,
+      liveCount: globalSearchResultCount(results, 'live'),
+      vodCount: globalSearchResultCount(results, 'vod'),
+      seriesCount: globalSearchResultCount(results, 'series'),
+    })
+    updateGlobalSearchView({
+      controls: true,
+      fullResults: false,
+      sections: GLOBAL_SEARCH_SECTIONS,
+    })
+    return
+  }
+
+  performanceTrace.event('cache', 'global-search-result-miss')
   activeSession.phase = 'searching'
   const query = foldText(activeSession.query)
   const results: StreamItem[] = []
   const resultKeys = new Set<string>()
 
-  await Promise.allSettled(
+  const outcomes = await Promise.allSettled(
     GLOBAL_SEARCH_SECTIONS.map((section) =>
       searchGlobalSection(
         activeClient,
@@ -4846,6 +5660,36 @@ async function runGlobalSearch(session?: GlobalSearchSession): Promise<void> {
     ? `${results.length} result${results.length === 1 ? '' : 's'}`
     : 'No results'
   activeSession.phase = 'completed'
+  const cacheable = outcomes.every(
+    (outcome) => outcome.status === 'fulfilled' && outcome.value.cacheable,
+  )
+  const fullyAuthoritative = outcomes.every(
+    (outcome) => outcome.status === 'fulfilled' && outcome.value.authoritative,
+  )
+
+  if (cacheable) {
+    globalSearchResultCache.set(cacheKey, [...results])
+    performanceTrace.event('cache', 'global-search-result-write', {
+      resultCount: results.length,
+      cacheEntries: globalSearchResultCache.size,
+    })
+  }
+
+  outcomes.forEach((outcome, index) => {
+    if (outcome.status === 'fulfilled' && outcome.value.warmAfterSearch) {
+      warmCompleteSearchCatalog(GLOBAL_SEARCH_SECTIONS[index])
+    }
+  })
+
+  performanceTrace.event('search', 'global-search-complete', {
+    cacheHit: false,
+    cacheable,
+    fullyAuthoritative,
+    resultCount: results.length,
+    liveCount: globalSearchResultCount(results, 'live'),
+    vodCount: globalSearchResultCount(results, 'vod'),
+    seriesCount: globalSearchResultCount(results, 'series'),
+  })
   updateGlobalSearchView({
     controls: true,
     fullResults: false,
@@ -5018,6 +5862,11 @@ function updateNowNextCard(key: string, nowNext?: NowNext): void {
 }
 
 function beginPlayback(item: StreamItem): void {
+  // Background catalog parsing must never compete with video startup on a TV.
+  // Completed catalog snapshots remain available and interrupted sections can
+  // be scheduled again by a later foreground search.
+  pauseCompleteSearchCatalogWarming('playback-start')
+
   if (view !== 'player') {
     playerReturnPoint = captureReturnPoint()
     pushRouteHistory()
@@ -5060,7 +5909,7 @@ function beginPlayback(item: StreamItem): void {
 function closePlayer(): void {
   cancelPlayerSeek()
   playerUiMode = 'immersive'
-  startNavigation()
+  const { token, signal } = startNavigation()
   playerCleanup?.()
   playerCleanup = null
   activeHls = null
@@ -5083,6 +5932,25 @@ function closePlayer(): void {
         ? 'details'
         : 'home'
   requestFocus(returnPoint?.focus ?? null)
+
+  const returningDetailItem = selectedItem
+  if (
+    view === 'details' &&
+    returningDetailItem !== null &&
+    returningDetailItem.section !== 'live' &&
+    !selectedTitleEnrichment
+  ) {
+    titleEnrichmentLoading = true
+    render()
+    void enrichSelectedTitle(
+      returningDetailItem,
+      detailsMetadata(returningDetailItem),
+      token,
+      signal,
+    )
+    return
+  }
+
   render()
 }
 
@@ -5251,7 +6119,72 @@ function findNextEpisode(episode: StreamItem): StreamItem | null {
   return index >= 0 ? episodes[index + 1] ?? null : null
 }
 
+function openContinueMenu(cardEl: HTMLElement): void {
+  cancelPendingSpatialNavigation()
+  const streamKey = cardEl.dataset.streamKey
+  const stream = streamFromKey(streamKey)
+
+  if (!stream) {
+    return
+  }
+
+  // Remove any existing instance before opening a fresh one.
+  if (continueMenuEl) {
+    continueMenuEl.remove()
+    continueMenuEl = null
+  }
+
+  const menu = document.createElement('aside')
+  menu.id = 'continue-menu'
+  menu.className = 'continue-menu'
+  menu.setAttribute('role', 'menu')
+  menu.dataset.navZone = 'continue-menu'
+  menu.dataset.returnStreamKey = streamKey!
+  menu.innerHTML =
+    '<h3 class="continue-menu-title">' + escape(streamDisplayTitle(stream)) + '</h3>' +
+    '<button class="continue-menu-button" data-action="resume-continue" data-stream-key="' + escape(streamKey!) + '" data-focus-id="continue-menu-resume" role="menuitem">Resume playing</button>' +
+    '<button class="continue-menu-button danger-button" data-action="remove-continue" data-stream-key="' + escape(streamKey!) + '" data-focus-id="continue-menu-remove" role="menuitem">Remove from Continue watching</button>'
+
+  document.body.appendChild(menu)
+  continueMenuEl = menu
+  invalidateSpatialLayout()
+  var resumeButton = menu.querySelector<HTMLElement>('[data-focus-id="continue-menu-resume"]')
+  if (resumeButton) {
+    resumeButton.focus({ preventScroll: true })
+  }
+}
+
+function closeContinueMenu(): string | null {
+  cancelPendingSpatialNavigation()
+  var menu = continueMenuEl
+
+  if (!menu) {
+    return null
+  }
+
+  var returnKey = menu.dataset.returnStreamKey ?? null
+  menu.remove()
+  continueMenuEl = null
+  invalidateSpatialLayout()
+  return returnKey
+}
+
+function closeContinueMenuAndRefocus(): void {
+  var returnKey = closeContinueMenu()
+
+  if (returnKey) {
+    var target = document.querySelector<HTMLElement>(
+      '[data-focus-id="stream-' + cssEscape(returnKey) + '"]',
+    )
+
+    if (target) {
+      target.focus({ preventScroll: true })
+    }
+  }
+}
+
 function toggleChannelOverlay(): void {
+  cancelPendingSpatialNavigation()
   const overlay = document.querySelector<HTMLElement>('#channel-overlay')
 
   if (overlay) {
@@ -5362,6 +6295,7 @@ function saveCurrentSettings(): void {
   const hideAdult = document.querySelector<HTMLInputElement>('#setting-hide-adult')
   const parentalPin = document.querySelector<HTMLInputElement>('#setting-parental-pin')
 
+  const previousHideAdultContent = settings.hideAdultContent
   const nextHideAdultContent = hideAdult?.checked ?? settings.hideAdultContent
 
   if (
@@ -5387,6 +6321,11 @@ function saveCurrentSettings(): void {
   if (!saveSettings(profile.id, settings)) {
     showToast(STORAGE_FAILURE_MESSAGE)
     return
+  }
+
+  if (previousHideAdultContent !== nextHideAdultContent) {
+    clearGlobalSearchResultCache()
+    clearCompleteSearchCatalogs()
   }
 
   showToast('Settings saved.')
@@ -5418,6 +6357,8 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: XtreamClient):
   liveQueue = []
   guideStreams = []
   streamCache.clear()
+  clearGlobalSearchResultCache()
+  clearCompleteSearchCatalogs()
   sectionCategories.clear()
   adultCategoryIds.clear()
   knownStreams.clear()
@@ -5443,7 +6384,9 @@ async function refreshAccount(silent = false): Promise<void> {
 }
 
 function renderLoading(message: string): void {
+  cancelPendingSpatialNavigation()
   const snapshot = snapshotFocus()
+  const renderId = performanceTrace.beginRender(view, { state: 'loading' })
   app.innerHTML = `
     <main class="status-page">
       <section class="status-card" aria-live="polite">
@@ -5454,13 +6397,19 @@ function renderLoading(message: string): void {
       </section>
     </main>
   `
-  invalidateSpatialLayout()
+  invalidateSpatialLayout('loading-replaced')
+  performanceTrace.endRender(renderId, { state: 'loading' })
   restoreFocus(snapshot)
 }
 
 function renderError(reason: unknown, retry: () => void): void {
+  cancelPendingSpatialNavigation()
   const snapshot = snapshotFocus()
+  const renderId = performanceTrace.beginRender(view, { state: 'error' })
   const message = reason instanceof Error ? reason.message : 'Something went wrong.'
+  performanceTrace.event('route', 'error-rendered', {
+    errorType: reason instanceof Error ? reason.name : 'unknown',
+  })
   app.innerHTML = `
     <main class="status-page">
       <section class="status-card status-card-error">
@@ -5472,9 +6421,10 @@ function renderError(reason: unknown, retry: () => void): void {
       </section>
     </main>
   `
-  invalidateSpatialLayout()
+  invalidateSpatialLayout('error-replaced')
   document.querySelector<HTMLButtonElement>('#retry')?.addEventListener('click', retry)
   bindEvents()
+  performanceTrace.endRender(renderId, { state: 'error' })
   restoreFocus(snapshot)
 }
 
@@ -5556,10 +6506,48 @@ function navigateBack(): boolean {
   return false
 }
 
+function clearContinueMenuState(): void {
+  if (continueMenuHoldTimer !== null) {
+    window.clearTimeout(continueMenuHoldTimer)
+    continueMenuHoldTimer = null
+  }
+  continueMenuHoldCard = null
+  continueMenuHoldConsumeOk = false
+  // Reset the absorb flag defensively: on webOS versions that fire only a
+  // keydown (no companion popstate) for Back, the flag would otherwise linger.
+  // Safe here because the keydown-close → companion-popstate sequence performs
+  // no render in between.
+  continueMenuAbsorbNextPopState = false
+  closeContinueMenu()
+}
+
+function clearUndoState(): void {
+  if (undoResumeTimer !== null) {
+    window.clearTimeout(undoResumeTimer)
+    undoResumeTimer = null
+  }
+  lastRemovedResume = null
+}
+
 function render(): void {
+  performanceTrace.setView(view)
+  performanceTrace.event('route', 'render-dispatch')
+  cancelPendingSpatialNavigation()
+
+  // Always remove the continue-menu overlay and hold timer before any render.
+  clearContinueMenuState()
+
   if (view === 'login' || !profile || !client) {
+    // Leaving home — drop undo state too.
+    clearUndoState()
     renderLogin()
     return
+  }
+
+  // Clear undo state when navigating away from home so Green can't
+  // unexpectedly restore a removed item long after the user left.
+  if (view !== 'home') {
+    clearUndoState()
   }
 
   if (view === 'home') renderHome()
@@ -5576,44 +6564,53 @@ function navigationZone(element: HTMLElement): HTMLElement | null {
   return element.closest<HTMLElement>('[data-nav-zone]')
 }
 
-function navigationLayout(): { items: NavigationItem[]; elements: Map<string, HTMLElement> } {
-  const overlay = document.querySelector<HTMLElement>('#channel-overlay')
+function navigationLayout(): NavigationLayout {
+  const overlay = continueMenuEl ?? document.querySelector<HTMLElement>('#channel-overlay')
   const root = overlay ?? app
-  const elements = new Map<string, HTMLElement>()
+  const cacheHit = spatialLayoutCache.populated
 
-  const items = Array.from(
-    root.querySelectorAll<HTMLElement>(
-      '[data-focus-id]:not([data-nav-skip="true"]):not([disabled])',
-    ),
+  return performanceTrace.measure('navigation', cacheHit ? 'layout-cache-hit' : 'layout-cache-miss', () =>
+    spatialLayoutCache.get(root, () => {
+    const elements = new Map<string, HTMLElement>()
+
+    const items = Array.from(
+      root.querySelectorAll<HTMLElement>(
+        '[data-focus-id]:not([data-nav-skip="true"]):not([disabled])',
+      ),
+    )
+      .filter((element) => {
+        const zone = navigationZone(element)
+        return Boolean(zone && (!overlay || zone === overlay))
+      })
+      .map((element) => {
+        const rect = element.getBoundingClientRect()
+        const id = element.dataset.focusId!
+        const zoneId = navigationZone(element)?.dataset.navZone
+
+        elements.set(id, element)
+        return {
+          id,
+          zoneId: zoneId ?? '',
+          left: rect.left,
+          top: rect.top,
+          width: rect.width,
+          height: rect.height,
+        }
+      })
+      .filter((item) => item.width > 0 && item.height > 0)
+
+      return { items, elements }
+    }),
   )
-    .filter((element) => {
-      const zone = navigationZone(element)
-      return Boolean(zone && (!overlay || zone === overlay))
-    })
-    .map((element) => {
-      const rect = element.getBoundingClientRect()
-      const id = element.dataset.focusId!
-      const zoneId = navigationZone(element)?.dataset.navZone
-
-      elements.set(id, element)
-      return {
-        id,
-        zoneId: zoneId ?? '',
-        left: rect.left,
-        top: rect.top,
-        width: rect.width,
-        height: rect.height,
-      }
-    })
-    .filter((item) => item.width > 0 && item.height > 0)
-
-  return { items, elements }
 }
 
 function moveFocus(target: HTMLElement): void {
-  target.focus({ preventScroll: true })
-  ensureFocusVisible(target)
-  invalidateSpatialLayout()
+  performanceTrace.measure('navigation', 'focus-move', () => {
+    const scrollDelta = focusVisibilityDelta(target)
+
+    target.focus({ preventScroll: true })
+    applyFocusVisibility(scrollDelta)
+  })
 }
 
 function isReverseDirection(
@@ -5628,13 +6625,21 @@ function isReverseDirection(
   )
 }
 
-function handleSpatialNavigation(event: KeyboardEvent): boolean {
-  const direction = remoteDirection(event)
+function canQueueSpatialNavigation(direction: NavigationDirection): boolean {
+  const active = document.activeElement
 
-  if (!direction) {
+  if (
+    (active instanceof HTMLInputElement || active instanceof HTMLSelectElement) &&
+    (direction === 'ArrowLeft' || direction === 'ArrowRight') &&
+    editingInput === active
+  ) {
     return false
   }
 
+  return active instanceof HTMLElement && Boolean(navigationZone(active))
+}
+
+function handleSpatialNavigation(direction: NavigationDirection): boolean {
   const active = document.activeElement
   if (
     (active instanceof HTMLInputElement || active instanceof HTMLSelectElement) &&
@@ -5704,7 +6709,6 @@ function handleSpatialNavigation(event: KeyboardEvent): boolean {
     lastZoneTransition = null
   }
 
-  event.preventDefault()
   moveFocus(target)
   return true
 }
@@ -5732,7 +6736,21 @@ function handleColorShortcut(event: KeyboardEvent): boolean {
   if (color === 'red') {
     openFavorites()
   } else if (color === 'green') {
-    if (view === 'details' && selectedItem?.section === 'live') {
+    // Undo a recent Continue Watching removal (green key, home view only).
+    // When no undo is pending, fall through to the normal guide shortcut.
+    if (view === 'home' && lastRemovedResume && profile) {
+      resumeEntries.set(lastRemovedResume.key, lastRemovedResume.entry)
+      if (!saveResume(profile.id, resumeEntries)) {
+        showToast(STORAGE_FAILURE_MESSAGE)
+      }
+      if (undoResumeTimer !== null) {
+        window.clearTimeout(undoResumeTimer)
+        undoResumeTimer = null
+      }
+      lastRemovedResume = null
+      renderHome()
+      showToast('Restored to Continue watching')
+    } else if (view === 'details' && selectedItem?.section === 'live') {
       void showEpg(selectedItem)
     } else {
       void openGuide()
@@ -5874,6 +6892,18 @@ window.addEventListener('keydown', (event) => {
   const direction = remoteDirection(event)
 
   if (isRemoteBack(event)) {
+    // Close the continue-watching options menu on Back, restoring focus to the
+    // originating card instead of navigating away from home. Set the absorb
+    // flag so the companion popstate (on webOS TVs that fire both events for a
+    // single physical Back press) does not also consume a history entry.
+    if (continueMenuEl) {
+      closeContinueMenuAndRefocus()
+      continueMenuAbsorbNextPopState = true
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      return
+    }
+
     if (view === 'search' && globalSearchIsActive()) {
       armSearchBackCancellation()
       finishTextEditing()
@@ -6046,22 +7076,110 @@ window.addEventListener('keydown', (event) => {
       return
     }
 
-    if (isPlayerControl) {
+    if (isPlayerControl && direction && canQueueSpatialNavigation(direction)) {
       setPlayerUiMode('focused')
-
-      if (handleSpatialNavigation(event)) {
-        return
-      }
+      event.preventDefault()
+      performanceTrace.endInteraction(pendingSpatialInteractionId, 'spatial-coalesced')
+      pendingSpatialInteractionId = performanceTrace.startInteraction('spatial-navigation', {
+        direction,
+        repeated: event.repeat,
+        player: true,
+      })
+      frameNavigation.schedule(direction)
+      return
     }
     return
   }
 
-  if (handleSpatialNavigation(event)) {
+  // While OK is still physically held after a long-press opened the menu,
+  // swallow every OK keydown repeat. Otherwise the still-down key would
+  // immediately activate the focused "Resume playing" button and jump into the
+  // player. Released via keyup, which clears the flag.
+  if (continueMenuHoldConsumeOk && (event.key === 'Enter' || event.key === ' ')) {
+    event.preventDefault()
+    event.stopImmediatePropagation()
     return
+  }
+
+  // OK on a Continue Watching card: quick tap resumes, long-press (550ms)
+  // opens the options menu. On webOS a <button> fires its click SYNCHRONOUSLY
+  // during keydown, so we must preventDefault here to cancel that native
+  // activation and drive both outcomes ourselves (resume on keyup for a tap,
+  // openContinueMenu when the hold timer fires). webOS emits repeated keydown
+  // while held; the timer-null + !event.repeat guard schedules only once.
+  if (
+    view === 'home' &&
+    !editingInput &&
+    (event.key === 'Enter' || event.key === ' ') &&
+    !continueMenuEl
+  ) {
+    var card = activeElement instanceof HTMLElement
+      ? activeElement.closest<HTMLElement>('[data-resume-card="true"]')
+      : null
+
+    if (card) {
+      // Cancel the native button click that webOS fires on keydown.
+      event.preventDefault()
+      event.stopImmediatePropagation()
+
+      if (!event.repeat && continueMenuHoldTimer === null) {
+        continueMenuHoldCard = card
+        continueMenuHoldTimer = window.setTimeout(function () {
+          continueMenuHoldTimer = null
+          continueMenuHoldCard = null
+          // Mark OK as consumed until release so the held key does not leak
+          // into the freshly-opened menu and trigger "Resume playing".
+          continueMenuHoldConsumeOk = true
+          openContinueMenu(card!)
+        }, 450)
+      }
+      return
+    }
+  }
+
+  if (direction && canQueueSpatialNavigation(direction)) {
+    event.preventDefault()
+    performanceTrace.endInteraction(pendingSpatialInteractionId, 'spatial-coalesced')
+    pendingSpatialInteractionId = performanceTrace.startInteraction('spatial-navigation', {
+      direction,
+      repeated: event.repeat,
+      player: false,
+    })
+    frameNavigation.schedule(direction)
   }
 }, true)
 
 window.addEventListener('keyup', (event) => {
+  if (event.key === 'Enter' || event.key === ' ') {
+    // OK physically released: stop swallowing OK repeats. The next OK press is
+    // a fresh interaction (e.g. selecting a menu item).
+    if (continueMenuHoldConsumeOk) {
+      continueMenuHoldConsumeOk = false
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      return
+    }
+
+    // OK released while the hold timer is still pending → this was a quick tap,
+    // not a hold. Cancel the timer and resume playback ourselves (the native
+    // click was suppressed in keydown).
+    if (continueMenuHoldTimer !== null) {
+      window.clearTimeout(continueMenuHoldTimer)
+      continueMenuHoldTimer = null
+
+      var tappedCard = continueMenuHoldCard
+      continueMenuHoldCard = null
+
+      if (tappedCard) {
+        var tappedStream = streamFromKey(tappedCard.dataset.streamKey)
+        if (tappedStream) {
+          event.preventDefault()
+          void beginResumePlayback(tappedStream)
+        }
+      }
+    }
+  }
+
   const direction = remoteDirection(event)
 
   if (
@@ -6111,6 +7229,28 @@ window.addEventListener(
 )
 
 window.addEventListener('popstate', (event) => {
+  // Close the continue-watching options menu on Back (popstate path).
+  // On webOS TVs that fire BOTH keydown + popstate for a single Back press,
+  // the keydown handler already closed the menu and set the absorb flag.
+  // Absorb the companion event and re-push history so depth is preserved.
+  if (view === 'home' && (continueMenuAbsorbNextPopState || continueMenuEl)) {
+    var menuWasOpen = Boolean(continueMenuEl)
+    continueMenuAbsorbNextPopState = false
+
+    if (menuWasOpen) {
+      closeContinueMenuAndRefocus()
+    }
+
+    if (isAppHistoryState(event.state)) {
+      appHistoryDepth = event.state.depth
+    } else {
+      appHistoryDepth = Math.max(0, appHistoryDepth - 1)
+    }
+
+    pushAppHistory()
+    return
+  }
+
   // Back-button handling for the player must live here because on this webOS
   // TV the physical Back arrives ONLY as a browser history.back() → popstate
   // (no companion keydown). Rule: first Back with controls visible only hides
@@ -6167,13 +7307,25 @@ window.addEventListener('popstate', (event) => {
   }
 })
 
-window.addEventListener('scroll', invalidateSpatialLayout, { passive: true })
-window.addEventListener('resize', invalidateSpatialLayout)
+window.addEventListener('scroll', () => {
+  invalidateSpatialLayout('scroll')
+  scheduleDeferredImageLoads()
+}, { passive: true })
+window.addEventListener('resize', () => {
+  invalidateSpatialLayout('resize')
+  scheduleDeferredImageLoads()
+})
 window.addEventListener('pagehide', () => {
+  performanceTrace.event('lifecycle', 'pagehide')
+  pauseCompleteSearchCatalogWarming('pagehide')
+  performanceTrace.disable()
+  cancelPendingSpatialNavigation()
   playerCleanup?.()
 })
 
 document.addEventListener('visibilitychange', () => {
+  performanceTrace.event('lifecycle', document.hidden ? 'hidden' : 'visible')
+
   if (document.hidden && view === 'player') {
     cancelPlayerSeek()
     document.querySelector<HTMLVideoElement>('#video-player')?.pause()

@@ -45,6 +45,59 @@ describe('XtreamClient global search', () => {
     expect(batches.flat()).toEqual(['1', '3'])
   })
 
+  it('honors a caller-provided stream request timeout', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn().mockImplementation(
+      (_url: string, options: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          options.signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('Aborted', 'AbortError')),
+            { once: true },
+          )
+        }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient(profile)
+
+    const outcome = client
+      .streams('vod', 'movies', undefined, 50)
+      .then(
+        () => null,
+        (reason: unknown) => reason,
+      )
+    await vi.advanceTimersByTimeAsync(50)
+
+    // Retryable matters as much as the message: the global-search category
+    // fallback exists for providers that stall on whole-library endpoints, and
+    // it is gated on this flag.
+    await expect(outcome).resolves.toMatchObject({
+      message: 'The provider took too long to respond. Please try again.',
+      kind: 'timeout',
+      retryable: true,
+    })
+    vi.useRealTimers()
+  })
+
+  it('supports opt-in match-all scanning up to its requested limit', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          { stream_id: '1', name: 'First title', category_id: 'movies' },
+          { stream_id: '2', name: 'Second title', category_id: 'movies' },
+          { stream_id: '3', name: 'Third title', category_id: 'movies' },
+        ]),
+        { status: 200 },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient(profile)
+
+    const streams = await client.searchStreams('vod', '', { limit: 2, matchAll: true })
+
+    expect(streams.map((stream) => stream.id)).toEqual(['1', '2'])
+  })
+
   it('matches accented titles and multi-term, order-independent queries', async () => {
     const fetchMock = vi.fn().mockImplementation(
       () =>
@@ -423,5 +476,130 @@ describe('XtreamClient EPG', () => {
     const programs = await client.epg('42', 8)
 
     expect(programs[0].title).toBe('Morning News')
+  })
+})
+
+describe('XtreamClient provider failure classification', () => {
+  // A distinctive password, so asserting that it was scrubbed proves the
+  // redaction ran rather than coincidentally matching a common word.
+  const bannedProfile: XtreamProfile = {
+    id: 'banned-profile',
+    name: 'Banned playlist',
+    serverUrl: 'https://example.test',
+    username: 'alice',
+    password: 's3cret-value',
+  }
+
+  beforeEach(() => {
+    vi.stubGlobal('window', globalThis)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('classifies 403 as a non-retryable refusal and scrubs credentials echoed in the body', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          'Access denied for /player_api.php?username=alice&password=s3cret-value',
+          { status: 403, headers: { server: 'nginx', 'cf-ray': 'abc123' } },
+        ),
+      ),
+    )
+    const client = new XtreamClient(bannedProfile)
+
+    const reason = await client.categories('live').then(
+      () => null,
+      (error: unknown) => error,
+    )
+
+    expect(reason).toMatchObject({
+      isProviderError: true,
+      kind: 'forbidden',
+      retryable: false,
+    })
+    const diagnostics = (reason as { diagnostics: Record<string, unknown> }).diagnostics
+    expect(diagnostics.status).toBe(403)
+    expect(diagnostics.server).toBe('nginx')
+    expect(diagnostics.proxied).toBe(true)
+    expect(diagnostics.bodySnippet).not.toContain('s3cret-value')
+    expect(diagnostics.bodySnippet).not.toContain('alice')
+    expect(diagnostics.bodySnippet).toContain('Access denied')
+  })
+
+  it('classifies 429 as rate limited and records Retry-After', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response('slow down', { status: 429, headers: { 'retry-after': '90' } }),
+      ),
+    )
+    const client = new XtreamClient(bannedProfile)
+
+    const reason = await client.categories('vod').then(
+      () => null,
+      (error: unknown) => error,
+    )
+
+    expect(reason).toMatchObject({ kind: 'rate-limited', retryable: false })
+    expect(
+      (reason as { diagnostics: { retryAfterMs?: number } }).diagnostics.retryAfterMs,
+    ).toBe(90_000)
+  })
+
+  it('keeps 5xx retryable so a genuine provider stall still falls back', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(new Response('bad gateway', { status: 502 })),
+    )
+    const client = new XtreamClient(bannedProfile)
+
+    const reason = await client.categories('series').then(
+      () => null,
+      (error: unknown) => error,
+    )
+
+    expect(reason).toMatchObject({ kind: 'server', retryable: true })
+    expect((reason as Error).message).toBe('The provider returned HTTP 502.')
+  })
+
+  it('classifies a refusal on the streamed search path as well', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(new Response('denied', { status: 403 })),
+    )
+    const client = new XtreamClient(bannedProfile)
+
+    const reason = await client.searchStreams('vod', 'anne').then(
+      () => null,
+      (error: unknown) => error,
+    )
+
+    expect(reason).toMatchObject({
+      isProviderError: true,
+      kind: 'forbidden',
+      retryable: false,
+    })
+  })
+
+  it('classifies an account rejection as a non-retryable auth failure', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ user_info: { auth: 0 } }), { status: 200 }),
+      ),
+    )
+    const client = new XtreamClient(bannedProfile)
+
+    const reason = await client.validate().then(
+      () => null,
+      (error: unknown) => error,
+    )
+
+    expect(reason).toMatchObject({ kind: 'auth', retryable: false })
+    expect((reason as Error).message).toContain('rejected that username or password')
   })
 })

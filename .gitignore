@@ -17,6 +17,11 @@ packages
 .env.*
 !.env.example
 
+# Cloudflare Worker secrets and local state
+metadata-proxy/.dev.vars
+metadata-proxy/.wrangler/
+.wrangler/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

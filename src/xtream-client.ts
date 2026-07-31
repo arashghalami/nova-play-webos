@@ -4,6 +4,8 @@ import type {
   Category,
   LibrarySection,
   NowNext,
+  RatingCandidate,
+  PersonSummary,
   Program,
   RichMetadata,
   SeriesDetails,
@@ -13,6 +15,17 @@ import type {
   XtreamProfile,
 } from './types'
 import { foldText, matchesQuery, queryTokens } from './search'
+import { ageGuidanceForRating, normalizeRatingCandidate } from './content-rating'
+import { performanceTrace } from './performance-trace'
+import type { ProviderFailureDiagnostics } from './provider-error'
+import {
+  AUTH_MESSAGE,
+  ProviderError,
+  buildBodySnippet,
+  classifyHttpStatus,
+  httpFailureMessage,
+  parseRetryAfterMs,
+} from './provider-error'
 
 type RawRecord = Record<string, unknown>
 
@@ -31,6 +44,8 @@ const MAX_SEARCH_RECORD_CHARS = 2 * 1024 * 1024
 // on the native lowercase fast path instead of the per-character accent fold.
 const NON_ASCII_PATTERN = /[^\x00-\x7f]/
 const NORMALIZATION_BATCH_SIZE = 400
+// A failed response only needs enough of its body to fingerprint the cause.
+const MAX_ERROR_BODY_CHARS = 8 * 1024
 const RESPONSE_TOO_LARGE_MESSAGE =
   'This provider response is too large to load safely. Open a category to load a smaller portion of the catalog.'
 
@@ -43,6 +58,7 @@ type StreamSearchOptions = RequestOptions & {
   limit?: number
   excludeCategoryIds?: ReadonlySet<string>
   onMatches?: (matches: StreamItem[]) => void
+  matchAll?: boolean
 }
 
 function readString(value: unknown): string | undefined {
@@ -319,7 +335,7 @@ async function readResponseText(response: Response): Promise<string> {
     const source = await response.text()
 
     if (source.length > MAX_JSON_RESPONSE_BYTES) {
-      throw new Error(RESPONSE_TOO_LARGE_MESSAGE)
+      throw new ProviderError('too-large', RESPONSE_TOO_LARGE_MESSAGE, false)
     }
 
     return source
@@ -344,7 +360,7 @@ async function readResponseText(response: Response): Promise<string> {
 
     if (byteLength > MAX_JSON_RESPONSE_BYTES) {
       await reader.cancel()
-      throw new Error(RESPONSE_TOO_LARGE_MESSAGE)
+      throw new ProviderError('too-large', RESPONSE_TOO_LARGE_MESSAGE, false)
     }
 
     chunks.push(value)
@@ -359,6 +375,69 @@ async function readResponseText(response: Response): Promise<string> {
   })
 
   return textDecoder().decode(payload)
+}
+
+function providerPersonId(name: string, role: string): string {
+  return `xtream-${role}-${foldText(name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`
+}
+
+function parseProviderPeople(value: unknown, role: 'cast' | 'crew'): PersonSummary[] | undefined {
+  const people = readArray(value)
+    .map((entry, index): PersonSummary | null => {
+      const record = readRecord(entry)
+      const name = readString(
+        typeof entry === 'string'
+          ? entry
+          : record.name ?? record.actor ?? record.person ?? record.title,
+      )
+
+      if (!name) {
+        return null
+      }
+
+      return {
+        id: readString(record.id ?? record.person_id ?? record.tmdb_id) ?? `${providerPersonId(name, role)}-${index}`,
+        name,
+        profileImage: readString(
+          record.profile_path ?? record.profile_image ?? record.image ?? record.photo ?? record.avatar,
+        ),
+        character: readString(record.character ?? record.role),
+        job: readString(record.job ?? record.credit),
+        department: readString(record.department),
+        source: 'xtream' as const,
+      }
+    })
+    .filter((person): person is PersonSummary => Boolean(person))
+
+  return people.length ? people : undefined
+}
+
+function parseContentRating(record: RawRecord): RatingCandidate | undefined {
+  const raw = readString(
+    record.certification ??
+      record.content_rating ??
+      record.classification ??
+      record.mpaa_rating ??
+      record.age_rating ??
+      record.age,
+  )
+
+  if (!raw) {
+    return undefined
+  }
+
+  const region = readString(record.region ?? record.country_code ?? record.certification_country)
+  const value = raw.trim()
+  const minimumAgeMatch = value.match(/^(?:FSK\s*)?(\d{1,2})$/i)
+
+  return normalizeRatingCandidate({
+    value,
+    region,
+    minimumAge: minimumAgeMatch ? Number(minimumAgeMatch[1]) : undefined,
+    provider: 'xtream',
+    sourceLabel: 'Xtream',
+    official: true,
+  })
 }
 
 function parseMetadata(record: RawRecord): RichMetadata {
@@ -378,6 +457,7 @@ function parseMetadata(record: RawRecord): RichMetadata {
   )
 
   const duration = readString(record.duration ?? record.runtime ?? record.duration_formatted)
+  const contentRating = parseContentRating(record)
 
   return {
     originalTitle: readString(record.o_name ?? record.original_name),
@@ -405,10 +485,123 @@ function parseMetadata(record: RawRecord): RichMetadata {
     durationSeconds: parseDurationSeconds(
       record.duration_secs ?? record.duration_seconds ?? record.runtime_seconds ?? duration,
     ),
-    ageRating: readString(record.age ?? record.age_rating ?? record.mpaa_rating),
+    ageRating: contentRating?.value ?? readString(record.age ?? record.age_rating ?? record.mpaa_rating),
+    contentRating,
+    ageGuidance: contentRating ? ageGuidanceForRating(contentRating) : undefined,
+    contentRatings: contentRating ? [contentRating] : undefined,
+    providerCast: parseProviderPeople(record.cast ?? record.actors ?? record.actor_list, 'cast'),
+    providerCrew: parseProviderPeople(record.crew ?? record.directors ?? record.creators, 'crew'),
     tmdbId: readString(record.tmdb_id ?? record.tmdb),
     trailer,
   }
+}
+
+/*
+ * Reads a bounded prefix of a failed response body. Provider rejections are
+ * normally tiny, but an edge proxy challenge page can be large, so stop early
+ * instead of buffering whatever the edge decided to send.
+ */
+async function readBoundedErrorText(response: Response): Promise<string> {
+  if (
+    response.body &&
+    typeof response.body.getReader === 'function' &&
+    typeof TextDecoder === 'function'
+  ) {
+    const reader = response.body.getReader()
+    const decoder = textDecoder()
+    let text = ''
+
+    try {
+      while (text.length < MAX_ERROR_BODY_CHARS) {
+        const { done, value } = await reader.read()
+
+        if (done) {
+          break
+        }
+
+        if (value) {
+          text += decoder.decode(value, { stream: true })
+        }
+      }
+    } finally {
+      void reader.cancel().catch(() => undefined)
+    }
+
+    return text.slice(0, MAX_ERROR_BODY_CHARS)
+  }
+
+  return (await response.text()).slice(0, MAX_ERROR_BODY_CHARS)
+}
+
+/*
+ * Builds the typed failure for a non-OK provider response.
+ *
+ * The status alone cannot distinguish per-minute throttling from a blocked
+ * account from an edge challenge page, and that distinction decides whether the
+ * app may issue any further request. Capture the bounded, credential-scrubbed
+ * evidence needed to tell them apart and record it on the trace so it can be
+ * read back from a device without a debugger session.
+ */
+async function describeHttpFailure(
+  response: Response,
+  operation: string,
+  secrets: ReadonlyArray<string | undefined>,
+  requestId: number | null,
+): Promise<ProviderError> {
+  const { kind, retryable } = classifyHttpStatus(response.status)
+  const diagnostics: ProviderFailureDiagnostics = { status: response.status }
+  const retryAfterMs = parseRetryAfterMs(response.headers.get('retry-after'), Date.now())
+
+  if (retryAfterMs !== undefined) {
+    diagnostics.retryAfterMs = retryAfterMs
+  }
+
+  const server = response.headers.get('server')
+
+  if (server) {
+    diagnostics.server = server.slice(0, 64)
+  }
+
+  // A CDN or WAF hop changes the diagnosis: an edge challenge is a different
+  // problem, with a different remedy, from a panel-level rate limit.
+  diagnostics.proxied = Boolean(
+    response.headers.get('cf-ray') ??
+      response.headers.get('cf-mitigated') ??
+      response.headers.get('x-sucuri-id'),
+  )
+
+  try {
+    const bodySnippet = buildBodySnippet(await readBoundedErrorText(response), secrets)
+
+    if (bodySnippet) {
+      diagnostics.bodySnippet = bodySnippet
+    }
+  } catch {
+    // An unreadable body must never hide the status we already classified.
+  }
+
+  performanceTrace.event(
+    'network',
+    'xtream-http-failure',
+    {
+      operation,
+      status: response.status,
+      kind,
+      retryable,
+      retryAfterMs: diagnostics.retryAfterMs ?? null,
+      server: diagnostics.server ?? null,
+      proxied: diagnostics.proxied ?? null,
+      bodySnippet: diagnostics.bodySnippet ?? null,
+    },
+    { requestId: requestId ?? undefined },
+  )
+
+  return new ProviderError(
+    kind,
+    httpFailureMessage(response.status, kind),
+    retryable,
+    diagnostics,
+  )
 }
 
 export class XtreamClient {
@@ -438,6 +631,11 @@ export class XtreamClient {
     parameters: Record<string, string> = {},
     options: RequestOptions = {},
   ): Promise<T> {
+    const operation = action ?? 'validate'
+    const requestId = performanceTrace.beginRequest('xtream-request', {
+      operation,
+      parameterCount: Object.keys(parameters).length,
+    })
     const controller = new AbortController()
     const timeout = window.setTimeout(
       () => controller.abort(),
@@ -455,61 +653,123 @@ export class XtreamClient {
       let response: Response
 
       try {
+        performanceTrace.event('network', 'xtream-fetch-start', { operation }, {
+          requestId: requestId ?? undefined,
+        })
         response = await fetch(this.apiUrl(action, parameters), { signal: controller.signal })
+        performanceTrace.event(
+          'network',
+          'xtream-response-headers',
+          {
+            operation,
+            status: response.status,
+            contentLength: Number(response.headers.get('content-length')) || 0,
+          },
+          { requestId: requestId ?? undefined },
+        )
       } catch {
         if (options.signal?.aborted) {
-          throw new Error('Request cancelled.')
+          throw new ProviderError('cancelled', 'Request cancelled.', false)
         }
 
         if (controller.signal.aborted) {
-          throw new Error('The provider took too long to respond. Please try again.')
+          throw new ProviderError(
+            'timeout',
+            'The provider took too long to respond. Please try again.',
+            true,
+          )
         }
 
-        throw new Error(
+        throw new ProviderError(
+          'network',
           'Unable to reach this provider. Check the server URL and your internet connection.',
+          true,
         )
       }
 
       if (!response.ok) {
-        throw new Error(`The provider returned HTTP ${response.status}.`)
+        throw await describeHttpFailure(
+          response,
+          operation,
+          [this.profile.username, this.profile.password],
+          requestId,
+        )
       }
 
       const contentLength = Number(response.headers.get('content-length'))
 
       if (Number.isFinite(contentLength) && contentLength > MAX_JSON_RESPONSE_BYTES) {
-        throw new Error(RESPONSE_TOO_LARGE_MESSAGE)
+        throw new ProviderError('too-large', RESPONSE_TOO_LARGE_MESSAGE, false)
       }
 
       let source
 
       try {
-        source = await readResponseText(response)
+        source = await performanceTrace.measureAsync(
+          'data',
+          'xtream-response-read',
+          () => readResponseText(response),
+          { operation },
+          { requestId: requestId ?? undefined },
+        )
+        performanceTrace.event(
+          'data',
+          'xtream-response-decoded',
+          {
+            operation,
+            characters: source.length,
+          },
+          { requestId: requestId ?? undefined },
+        )
       } catch (reason) {
         if (reason instanceof Error && reason.message === RESPONSE_TOO_LARGE_MESSAGE) {
           throw reason
         }
 
         if (options.signal?.aborted) {
-          throw new Error('Request cancelled.')
+          throw new ProviderError('cancelled', 'Request cancelled.', false)
         }
 
         if (controller.signal.aborted) {
-          throw new Error('The provider took too long to respond. Please try again.')
+          throw new ProviderError(
+            'timeout',
+            'The provider took too long to respond. Please try again.',
+            true,
+          )
         }
 
-        throw new Error('The provider response could not be read.')
+        // A truncated or aborted read is a transport fault, so a different
+        // request may still succeed.
+        throw new ProviderError('network', 'The provider response could not be read.', true)
       }
 
       try {
-        return JSON.parse(source) as T
+        return performanceTrace.measure(
+          'data',
+          'xtream-json-parse',
+          () => JSON.parse(source) as T,
+          {
+            operation,
+            characters: source.length,
+          },
+          { requestId: requestId ?? undefined },
+        )
       } catch {
         if (options.signal?.aborted) {
-          throw new Error('Request cancelled.')
+          throw new ProviderError('cancelled', 'Request cancelled.', false)
         }
 
-        throw new Error('The provider sent an invalid response.')
+        throw new ProviderError(
+          'invalid-response',
+          'The provider sent an invalid response.',
+          false,
+        )
       }
     } finally {
+      performanceTrace.endRequest(requestId, {
+        operation,
+        aborted: controller.signal.aborted,
+      })
       window.clearTimeout(timeout)
       options.signal?.removeEventListener('abort', abortFromCaller)
     }
@@ -522,7 +782,7 @@ export class XtreamClient {
     const user = readRecord(payload.user_info)
 
     if (readString(user.auth) !== '1') {
-      throw new Error('The provider rejected that username or password.')
+      throw new ProviderError('auth', AUTH_MESSAGE, false)
     }
 
     return {
@@ -533,7 +793,11 @@ export class XtreamClient {
     }
   }
 
-  async categories(section: LibrarySection, signal?: AbortSignal): Promise<Category[]> {
+  async categories(
+    section: LibrarySection,
+    signal?: AbortSignal,
+    timeoutMs?: number,
+  ): Promise<Category[]> {
     const actions: Record<LibrarySection, string> = {
       live: 'get_live_categories',
       vod: 'get_vod_categories',
@@ -543,7 +807,7 @@ export class XtreamClient {
     const payload = await this.getJson<unknown[]>(
       actions[section],
       {},
-      { signal, timeoutMs: 30_000 },
+      { signal, timeoutMs: timeoutMs ?? 30_000 },
     )
 
     return Array.isArray(payload)
@@ -567,6 +831,7 @@ export class XtreamClient {
     section: LibrarySection,
     categoryId?: string,
     signal?: AbortSignal,
+    timeoutMs?: number,
   ): Promise<StreamItem[]> {
     const actions: Record<LibrarySection, string> = {
       live: 'get_live_streams',
@@ -574,17 +839,27 @@ export class XtreamClient {
       series: 'get_series',
     }
     const parameters: Record<string, string> = categoryId ? { category_id: categoryId } : {}
-    const payload = await this.getJson<unknown[]>(actions[section], parameters, { signal })
+    const payload = await this.getJson<unknown[]>(actions[section], parameters, {
+      signal,
+      timeoutMs,
+    })
 
     if (!Array.isArray(payload)) {
       return []
     }
 
     const streams: StreamItem[] = []
+    const normalizationStartedAt =
+      typeof performance !== 'undefined' ? performance.now() : Date.now()
+
+    performanceTrace.event('data', 'xtream-normalization-start', {
+      section,
+      recordCount: payload.length,
+    })
 
     for (let index = 0; index < payload.length; index += 1) {
       if (signal?.aborted) {
-        throw new Error('Request cancelled.')
+        throw new ProviderError('cancelled', 'Request cancelled.', false)
       }
 
       const stream = this.normalizeStream(readRecord(payload[index]), section)
@@ -598,6 +873,14 @@ export class XtreamClient {
       }
     }
 
+    performanceTrace.event('data', 'xtream-normalization-complete', {
+      section,
+      recordCount: payload.length,
+      streamCount: streams.length,
+      durationMs:
+        (typeof performance !== 'undefined' ? performance.now() : Date.now()) -
+        normalizationStartedAt,
+    })
     return streams
   }
 
@@ -609,7 +892,7 @@ export class XtreamClient {
     const tokens = queryTokens(query)
     const limit = Math.max(1, options.limit ?? 180)
 
-    if (!tokens.length) {
+    if (!tokens.length && !options.matchAll) {
       return []
     }
 
@@ -627,8 +910,17 @@ export class XtreamClient {
       vod: 'get_vod_streams',
       series: 'get_series',
     }
+    const operation = actions[section]
+    const requestId = performanceTrace.beginRequest('xtream-search-request', {
+      operation,
+      queryTokenCount: tokens.length,
+      matchAll: Boolean(options.matchAll),
+    })
     const controller = new AbortController()
-    const timeout = window.setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS)
+    const timeout = window.setTimeout(
+      () => controller.abort(),
+      options.timeoutMs ?? SEARCH_TIMEOUT_MS,
+    )
     const abortFromCaller = (): void => controller.abort()
     const matches: StreamItem[] = []
     let pendingMatches: StreamItem[] = []
@@ -674,7 +966,7 @@ export class XtreamClient {
         ? foldText(source)
         : source.toLowerCase()
 
-      if (!haystack.includes(longestToken)) {
+      if (longestToken && !haystack.includes(longestToken)) {
         return false
       }
 
@@ -711,7 +1003,7 @@ export class XtreamClient {
 
       for (let index = 0; index < chunk.length; index += 1) {
         if (controller.signal.aborted) {
-          throw new Error('Request cancelled.')
+          throw new ProviderError('cancelled', 'Request cancelled.', false)
         }
 
         const character = chunk[index]
@@ -784,7 +1076,7 @@ export class XtreamClient {
       flushMatches()
 
       if (controller.signal.aborted) {
-        throw new Error('Request cancelled.')
+        throw new ProviderError('cancelled', 'Request cancelled.', false)
       }
 
       return matches.length >= limit
@@ -794,23 +1086,48 @@ export class XtreamClient {
       let response: Response
 
       try {
-        response = await fetch(this.apiUrl(actions[section]), {
+        performanceTrace.event(
+          'network',
+          'xtream-search-fetch-start',
+          { operation },
+          { requestId: requestId ?? undefined },
+        )
+        response = await fetch(this.apiUrl(operation), {
           signal: controller.signal,
         })
+        performanceTrace.event(
+          'network',
+          'xtream-search-response-headers',
+          {
+            operation,
+            status: response.status,
+            contentLength: Number(response.headers.get('content-length')) || 0,
+          },
+          { requestId: requestId ?? undefined },
+        )
       } catch {
         if (options.signal?.aborted) {
-          throw new Error('Request cancelled.')
+          throw new ProviderError('cancelled', 'Request cancelled.', false)
         }
 
         if (controller.signal.aborted) {
-          throw new Error('The provider search took too long. Please try again.')
+          throw new ProviderError(
+            'timeout',
+            'The provider search took too long. Please try again.',
+            true,
+          )
         }
 
-        throw new Error('Unable to search this provider right now.')
+        throw new ProviderError('network', 'Unable to search this provider right now.', true)
       }
 
       if (!response.ok) {
-        throw new Error(`The provider returned HTTP ${response.status}.`)
+        throw await describeHttpFailure(
+          response,
+          operation,
+          [this.profile.username, this.profile.password],
+          requestId,
+        )
       }
 
       if (
@@ -844,15 +1161,24 @@ export class XtreamClient {
       flushMatches()
 
       if (options.signal?.aborted) {
-        throw new Error('Request cancelled.')
+        throw new ProviderError('cancelled', 'Request cancelled.', false)
       }
 
       if (controller.signal.aborted) {
-        throw new Error('The provider search took too long. Please try again.')
+        throw new ProviderError(
+            'timeout',
+            'The provider search took too long. Please try again.',
+            true,
+          )
       }
 
       throw reason
     } finally {
+      performanceTrace.endRequest(requestId, {
+        operation,
+        aborted: controller.signal.aborted,
+        matchCount: matches.length,
+      })
       window.clearTimeout(timeout)
       options.signal?.removeEventListener('abort', abortFromCaller)
     }

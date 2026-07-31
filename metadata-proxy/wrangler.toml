@@ -1,0 +1,10 @@
+name = "nova-play-metadata"
+main = "worker.ts"
+compatibility_date = "2026-07-29"
+workers_dev = true
+
+[vars]
+METADATA_LANGUAGE = "en-US"
+METADATA_REGION = "NL"
+# Comma-separated browser origins. Add "null" only for packaged webOS builds.
+ALLOWED_ORIGINS = "null"

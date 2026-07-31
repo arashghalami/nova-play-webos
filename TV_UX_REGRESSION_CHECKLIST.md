@@ -61,6 +61,17 @@ Run with at least two complete rows and one incomplete final row.
 - The open channel overlay confines arrow navigation to its own controls.
 - At every zone boundary, no arrow key may jump to an unrelated toolbar, top-bar control, or hidden background element.
 
+## Content classification and provenance
+
+Run these checks once with a deployed `VITE_METADATA_PROXY_URL` and once without it.
+
+1. Open a Netherlands-rated title such as Downton Abbey where a recognised result is available. At rest, confirm the details row stays compact: `PG: <value> · Age: <value>`.
+2. D-pad focus the classification control. Confirm only a concise provenance line appears, such as `TMDB · NL · Kijkwijzer` or `Trakt fallback · US · TV-PG`; it must not add an explanatory paragraph or alter the default Play focus.
+3. Navigate into and out of the classification control with arrows. Verify focus is visible, preserves normal detail-page navigation, and scrolls into view.
+4. Open a title without a usable classification. Verify it shows exactly `PG: - · Age: -` and does not expose a provenance line.
+5. Inspect the emulator network/console and the packaged IPK: TMDB bearer tokens, Trakt client IDs, and IPTV credentials must be absent.
+6. Regression-check cast portraits, people pages, episode navigation, details scrolling, and playback after metadata proxy lookup succeeds, partially fails, and is unavailable.
+
 ## Async and state-change checks
 
 - Start loading a library, category, guide, details page, or search, then press Back immediately. A stale response must not replace the newer view.

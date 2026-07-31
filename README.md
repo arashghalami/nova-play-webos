@@ -27,7 +27,8 @@ Nova Play is a private Xtream Codes IPTV player for LG webOS TVs. It provides a 
 ### Movies and series
 
 - Rich movie detail lookup using Xtream `get_vod_info`: plot, cast, director, country, genre, release date, rating, duration, artwork/backdrops, and trailer links when supplied by the provider
-- Optional TMDB-proxy enrichment for movie and series pages: cast/crew portraits, role labels, recommendations, and remote-friendly internal person pages with biographies, approved profile links, and filmographies
+- Optional metadata-proxy enrichment for movie and series pages: cast/crew portraits, role labels, recommendations, remote-friendly internal person pages with biographies, approved profile links, and filmographies
+- Netherlands-first, multi-source content classifications: a compact `PG` and `Age` row uses Kijkwijzer when available, preserves Xtream as a final fallback, and reveals concise selected-source provenance only while focused
 - Series season/episode browsing with watched indicators and next-episode autoplay
 - Resume positions with a **collision-safe composite identity** (`section:streamType:id`)
 - Continue Watching rail on Home, resume markers, and mark watched/unwatched controls
@@ -46,18 +47,22 @@ Nova Play is a private Xtream Codes IPTV player for LG webOS TVs. It provides a 
 - Defensive persistence: slim favorite/resume snapshots, bounded history, quota-error handling, and oldest-entry eviction retries
 - During playback, the app attempts standard Screen Wake Lock and guarded webOS keep-alive calls to reduce screensaver interruptions
 
-## Optional TMDB metadata proxy
+## Optional metadata proxy and content classifications
 
-Rich people and filmography content is opt-in. Nova Play calls an application-specific HTTPS proxy, not TMDB directly, so the TMDB bearer token never reaches the television or the packaged IPK.
+Rich people, filmography, and ratings enrichment is opt-in. Nova Play calls an application-specific HTTPS Cloudflare Worker, never TMDB or Trakt directly, so provider credentials and metadata API secrets never reach the television or packaged IPK.
 
-Set the Vite build-time endpoint only:
+The Worker collects bounded official classification candidates from TMDB plus optional Trakt data, selects one deterministic Netherlands-first result, and returns only safe provenance. It prioritizes recognised Netherlands/Kijkwijzer ratings, then configured-region results, Trakt fallback, TMDB US/GB, other official results, and finally recognised Xtream metadata in the app. IMDb, TMDB vote, and editorial scores are never treated as classifications.
+
+The details page stays compact (`PG: value · Age: value`). Move D-pad focus to the classification control to reveal a short source line such as `TMDB · NL · Kijkwijzer` or `Trakt fallback · US · TV-PG`; unavailable titles remain `PG: - · Age: -`.
+
+Set the Vite build-time endpoint before packaging:
 
 ```cmd
-set VITE_METADATA_PROXY_URL=https://metadata.example.com
-npm run build
+set VITE_METADATA_PROXY_URL=https://your-worker.workers.dev
+npm run package:webos
 ```
 
-The proxy must keep its TMDB token in server-side environment secrets and expose only these normalized endpoints:
+The Worker exposes only these normalized endpoints:
 
 ```text
 POST /v1/resolve-title
@@ -66,18 +71,18 @@ POST /v1/resolve-title
 GET /v1/person/:personId
 ```
 
-`resolve-title` should return `tmdbId`, `mediaType`, optional `tagline`, plus bounded `cast`, `crew`, and `related` arrays. `person` should return a person profile and bounded `knownFor`/`credits` arrays. The exact normalized response shapes are represented in `src/types.ts` and validated defensively by `src/metadata-client.ts`.
+`resolve-title` returns bounded `cast`, `crew`, `related`, `contentRatings`, and `ratingResolution` data alongside compatibility `contentRating` and `ageGuidance` fields. Exact contracts are defined in `src/types.ts` and parsed defensively in `src/metadata-client.ts`.
 
 Proxy requirements:
 
-- Use HTTPS and restrict CORS to Nova Play deployments.
-- Validate media types, IDs, title/query lengths, and response sizes; do not proxy arbitrary TMDB URLs.
-- Cache normalized title/person responses, rate-limit requests, enforce timeouts, and return compact payloads suitable for webOS hardware.
+- Use HTTPS with explicit `ALLOWED_ORIGINS`; include `null` only deliberately for packaged webOS builds.
+- Keep `TMDB_BEARER_TOKEN` secret server-side; `TRAKT_CLIENT_ID` is optional but recommended. Never add browser-side API keys or SDKs.
+- Validate media types, IDs, title/query lengths, candidate fields, and bounded collections; do not proxy arbitrary upstream paths.
+- Cache normalized responses, rate-limit requests, use request timeouts, and allow a rating-source failure without dropping TMDB details, people, or recommendations.
 - Never accept, forward, log, or store IPTV URLs, Xtream usernames, passwords, or playback URLs.
-- Return only allowlisted HTTPS external profile links.
-- Include required TMDB attribution in the proxy/app experience.
+- Return only allowlisted HTTPS external profile links and retain TMDB attribution.
 
-If `VITE_METADATA_PROXY_URL` is omitted or the proxy is unavailable, the player continues using Xtream metadata and playback unchanged; no metadata request is attempted.
+Worker setup, deploy commands, secret names, and verification steps are documented in [`metadata-proxy/README.md`](metadata-proxy/README.md). If `VITE_METADATA_PROXY_URL` is omitted or the proxy is unavailable, Nova Play keeps using Xtream metadata and playback unchanged; no proxy request is attempted.
 
 ## Security and parental-control notes
 
@@ -236,6 +241,7 @@ Test one H.264 live channel, one HEVC channel, one movie, one series episode, on
 ```text
 src/
   main.ts             Views, spatial remote navigation, player, guide, settings
+  content-rating.ts   Pure classification normalization, deduplication, and selection policy
   metadata-client.ts  Typed, bounded client for the optional secure metadata proxy
   xtream-client.ts    Xtream API adapter, EPG, metadata, and stream URLs
   storage.ts        Profile-scoped device-local persistence and migrations

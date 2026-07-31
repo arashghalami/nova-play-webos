@@ -1,10 +1,21 @@
 import type {
+  AgeGuidance,
   EnrichedTitleMetadata,
   FilmographyCredit,
   PersonDetails,
   PersonSummary,
+  RatingCandidate,
+  RatingResolution,
   RelatedTitle,
 } from './types'
+import {
+  ageGuidanceForRating,
+  dedupeRatingCandidates,
+  normalizeRatingCandidate,
+  normalizeRegion,
+  resolveContentRating,
+} from './content-rating'
+import { performanceTrace } from './performance-trace'
 
 type JsonRecord = Record<string, unknown>
 
@@ -53,6 +64,14 @@ function readRecord(value: unknown): JsonRecord {
 
 function readString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function readIdentifier(value: unknown): string | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value)
+  }
+
+  return readString(value)
 }
 
 function readArray(value: unknown): unknown[] {
@@ -115,6 +134,108 @@ function readRelatedTitle(value: unknown): RelatedTitle | null {
   return { ...credit, overview: readString(readRecord(value).overview) }
 }
 
+function readContentRating(value: unknown): RatingCandidate | undefined {
+  const source = readRecord(value)
+  const provider =
+    source.provider === undefined
+      ? 'tmdb'
+      : source.provider === 'tmdb' || source.provider === 'trakt'
+        ? source.provider
+        : undefined
+
+  if (!provider) {
+    return undefined
+  }
+
+  return normalizeRatingCandidate({
+    ...source,
+    provider,
+    sourceLabel:
+      readString(source.sourceLabel) ??
+      (provider === 'trakt' ? 'Trakt' : 'TMDB'),
+    official: source.official === undefined ? true : source.official,
+  })
+}
+
+function readRatingCandidates(value: unknown): RatingCandidate[] {
+  return dedupeRatingCandidates(
+    readArray(value)
+      .map(normalizeRatingCandidate)
+      .filter((candidate): candidate is RatingCandidate => Boolean(candidate)),
+  )
+}
+
+function readAgeGuidance(value: unknown): AgeGuidance | undefined {
+  const source = readRecord(value)
+  const suggestedMinimumAge =
+    typeof source.suggestedMinimumAge === 'number' &&
+    Number.isInteger(source.suggestedMinimumAge) &&
+    source.suggestedMinimumAge >= 0 &&
+    source.suggestedMinimumAge <= 21
+      ? source.suggestedMinimumAge
+      : undefined
+  const basis = source.basis
+  const confidence = source.confidence
+
+  if (
+    suggestedMinimumAge === undefined ||
+    (basis !== 'official-certification' && basis !== 'provider-value' && basis !== 'derived') ||
+    (confidence !== 'high' && confidence !== 'medium' && confidence !== 'low')
+  ) {
+    return undefined
+  }
+
+  return {
+    suggestedMinimumAge,
+    basis,
+    confidence,
+    reasons: readArray(source.reasons)
+      .map(readString)
+      .filter((reason): reason is string => Boolean(reason))
+      .slice(0, 8),
+  }
+}
+
+function sameRating(left: RatingCandidate, right: RatingCandidate): boolean {
+  return (
+    left.provider === right.provider &&
+    left.value === right.value &&
+    left.system === right.system &&
+    left.region === right.region &&
+    left.retrievedRegion === right.retrievedRegion
+  )
+}
+
+function readRatingResolution(
+  value: unknown,
+  candidates: RatingCandidate[],
+): RatingResolution | undefined {
+  const source = readRecord(value)
+  const preferredRegion = normalizeRegion(source.preferredRegion)
+
+  if (!preferredRegion) {
+    return undefined
+  }
+
+  const normalizedCandidates = dedupeRatingCandidates([
+    ...candidates,
+    ...readRatingCandidates(source.candidates),
+  ])
+  const selected = normalizeRatingCandidate(source.selected)
+
+  if (!selected || !normalizedCandidates.some((candidate) => sameRating(candidate, selected))) {
+    return resolveContentRating(normalizedCandidates, preferredRegion)
+  }
+
+  return {
+    selected,
+    candidates: normalizedCandidates,
+    ageGuidance: readAgeGuidance(source.ageGuidance) ?? ageGuidanceForRating(selected),
+    preferredRegion,
+    fallbackUsed: source.fallbackUsed === true,
+  }
+}
+
 function titleFromPayload(value: unknown): EnrichedTitleMetadata | null {
   const source = readRecord(value)
   const tmdbId = readString(source.tmdbId)
@@ -124,10 +245,26 @@ function titleFromPayload(value: unknown): EnrichedTitleMetadata | null {
     return null
   }
 
+  const legacyContentRating = readContentRating(source.contentRating)
+  const contentRatings = dedupeRatingCandidates([
+    ...readRatingCandidates(source.contentRatings),
+    ...(legacyContentRating && !Array.isArray(source.contentRatings) ? [legacyContentRating] : []),
+  ])
+  const ratingResolution = readRatingResolution(source.ratingResolution, contentRatings)
+  const selectedRating = ratingResolution?.selected ?? legacyContentRating
+  const ageGuidance =
+    ratingResolution?.ageGuidance ??
+    readAgeGuidance(source.ageGuidance) ??
+    (selectedRating ? ageGuidanceForRating(selectedRating) : undefined)
+
   return {
     tmdbId,
     mediaType,
     tagline: readString(source.tagline),
+    ...(selectedRating ? { contentRating: selectedRating } : {}),
+    ...(ageGuidance ? { ageGuidance } : {}),
+    ...(contentRatings.length ? { contentRatings } : {}),
+    ...(ratingResolution ? { ratingResolution } : {}),
     cast: readArray(source.cast).map(readPerson).filter((person): person is PersonSummary => Boolean(person)),
     crew: readArray(source.crew).map(readPerson).filter((person): person is PersonSummary => Boolean(person)),
     related: readArray(source.related)
@@ -211,8 +348,17 @@ async function requestJson(
   signal?: AbortSignal,
 ): Promise<unknown> {
   const baseUrl = configuredBaseUrl()
+  const requestId = performanceTrace.beginRequest('metadata-request', {
+    route: path,
+    configured: Boolean(baseUrl),
+  })
 
   if (!baseUrl) {
+    performanceTrace.endRequest(requestId, {
+      route: path,
+      configured: false,
+      outcome: 'unconfigured',
+    })
     throw new Error('Metadata service is not configured.')
   }
 
@@ -222,14 +368,39 @@ async function requestJson(
   signal?.addEventListener('abort', forwardAbort, { once: true })
 
   try {
+    performanceTrace.event('network', 'metadata-fetch-start', {
+      route: path,
+      method: init.method ?? 'GET',
+    }, { requestId: requestId ?? undefined })
     const response = await fetch(`${baseUrl}${path}`, { ...init, signal: controller.signal })
+
+    performanceTrace.event(
+      'network',
+      'metadata-response-headers',
+      {
+        route: path,
+        status: response.status,
+        contentLength: Number(response.headers.get('content-length')) || 0,
+      },
+      { requestId: requestId ?? undefined },
+    )
 
     if (!response.ok) {
       throw new Error(response.status === 404 ? 'Metadata was not found.' : 'Metadata service is unavailable.')
     }
 
-    return await response.json()
+    return await performanceTrace.measureAsync(
+      'data',
+      'metadata-json-parse',
+      () => response.json(),
+      { route: path },
+      { requestId: requestId ?? undefined },
+    )
   } finally {
+    performanceTrace.endRequest(requestId, {
+      route: path,
+      aborted: controller.signal.aborted,
+    })
     globalThis.clearTimeout(timeout)
     signal?.removeEventListener('abort', forwardAbort)
   }
@@ -248,9 +419,11 @@ export async function loadTitleMetadata(
   const cached = cacheRead(titleCache, lookup)
 
   if (cached !== undefined) {
+    performanceTrace.event('cache', 'metadata-title-hit')
     return cached
   }
 
+  performanceTrace.event('cache', 'metadata-title-miss')
   const payload = await requestJson(
     '/v1/resolve-title',
     {
@@ -266,9 +439,128 @@ export async function loadTitleMetadata(
     },
     request.signal,
   )
-  const metadata = titleFromPayload(payload)
+  const metadata = performanceTrace.measure(
+    'data',
+    'metadata-title-normalize',
+    () => titleFromPayload(payload),
+  )
+  performanceTrace.event('metadata', 'title-result', {
+    found: Boolean(metadata),
+    castCount: metadata?.cast?.length ?? 0,
+    crewCount: metadata?.crew?.length ?? 0,
+    ratingCount: metadata?.contentRatings?.length ?? 0,
+  })
   cacheWrite(titleCache, lookup, metadata, TITLE_CACHE_TTL_MS)
   return metadata
+}
+
+export async function loadTvMazeSeriesMetadata(
+  title: string,
+  signal?: AbortSignal,
+): Promise<EnrichedTitleMetadata | null> {
+  const normalizedTitle = title.trim()
+  const cacheKey = `tvmaze:${normalizedTitle.toLocaleLowerCase()}`
+  const cached = cacheRead(titleCache, cacheKey)
+
+  if (cached !== undefined) {
+    performanceTrace.event('cache', 'metadata-tvmaze-hit')
+    return cached
+  }
+
+  performanceTrace.event('cache', 'metadata-tvmaze-miss')
+
+  if (!normalizedTitle) {
+    return null
+  }
+
+  const controller = new AbortController()
+  const timeout = globalThis.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  const forwardAbort = () => controller.abort()
+  signal?.addEventListener('abort', forwardAbort, { once: true })
+
+  try {
+    const requestId = performanceTrace.beginRequest('tvmaze-search')
+    const searchResponse = await fetch(
+      `https://api.tvmaze.com/search/shows?q=${encodeURIComponent(normalizedTitle)}`,
+      { signal: controller.signal },
+    )
+    performanceTrace.endRequest(requestId, {
+      status: searchResponse.status,
+      aborted: controller.signal.aborted,
+    })
+
+    if (!searchResponse.ok) {
+      cacheWrite(titleCache, cacheKey, null, TITLE_CACHE_TTL_MS)
+      return null
+    }
+
+    const searchResults = readArray(await searchResponse.json())
+    const normalizedQuery = normalizedTitle.toLocaleLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+    const show =
+      searchResults
+        .map((entry) => readRecord(readRecord(entry).show))
+        .find((candidate) => {
+          const name = readString(candidate.name)?.toLocaleLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+          return name === normalizedQuery
+        }) ??
+      readRecord(readRecord(searchResults[0]).show)
+    const showId = readIdentifier(show.id)
+    const showName = readString(show.name)
+
+    if (!showId || !showName) {
+      cacheWrite(titleCache, cacheKey, null, TITLE_CACHE_TTL_MS)
+      return null
+    }
+
+    const castRequestId = performanceTrace.beginRequest('tvmaze-cast')
+    const castResponse = await fetch(
+      `https://api.tvmaze.com/shows/${encodeURIComponent(showId)}/cast`,
+      { signal: controller.signal },
+    )
+    performanceTrace.endRequest(castRequestId, {
+      status: castResponse.status,
+      aborted: controller.signal.aborted,
+    })
+    const castPayload = castResponse.ok ? await castResponse.json() : []
+    const cast = readArray(castPayload)
+      .map((entry): PersonSummary | null => {
+        const credit = readRecord(entry)
+        const person = readRecord(credit.person)
+        const personId = readIdentifier(person.id)
+        const name = readString(person.name)
+
+        if (!personId || !name) {
+          return null
+        }
+
+        return {
+          id: `tvmaze-${personId}`,
+          name,
+          profileImage: readString(readRecord(person.image).medium ?? readRecord(person.image).original),
+          character: readString(readRecord(credit.character).name),
+          department: 'Acting',
+        }
+      })
+      .filter((person): person is PersonSummary => Boolean(person))
+      .slice(0, 12)
+
+    const metadata: EnrichedTitleMetadata = {
+      tmdbId: `tvmaze-${showId}`,
+      mediaType: 'tv',
+      cast,
+      crew: [],
+      related: [],
+    }
+
+    performanceTrace.event('metadata', 'tvmaze-result', {
+      castCount: cast.length,
+    })
+    cacheWrite(titleCache, cacheKey, metadata, TITLE_CACHE_TTL_MS)
+    return metadata
+  } finally {
+    globalThis.clearTimeout(timeout)
+    signal?.removeEventListener('abort', forwardAbort)
+  }
 }
 
 export async function loadPersonMetadata(
@@ -278,11 +570,17 @@ export async function loadPersonMetadata(
   const cached = cacheRead(personCache, personId)
 
   if (cached) {
+    performanceTrace.event('cache', 'metadata-person-hit')
     return cached
   }
 
+  performanceTrace.event('cache', 'metadata-person-miss')
   const payload = await requestJson(`/v1/person/${encodeURIComponent(personId)}`, { method: 'GET' }, signal)
-  const person = personFromPayload(payload)
+  const person = performanceTrace.measure(
+    'data',
+    'metadata-person-normalize',
+    () => personFromPayload(payload),
+  )
 
   if (!person) {
     throw new Error('Person metadata is unavailable.')

@@ -44,6 +44,9 @@ export interface Trailer {
   url: string
 }
 
+export type MetadataSource = 'xtream' | 'external' | 'derived'
+export type RatingProvider = 'xtream' | 'tmdb' | 'trakt'
+
 export interface PersonSummary {
   id: string
   name: string
@@ -51,6 +54,40 @@ export interface PersonSummary {
   character?: string
   job?: string
   department?: string
+  source?: MetadataSource
+}
+
+export interface ContentRating {
+  value: string
+  system?: string
+  region?: string
+  minimumAge?: number
+  descriptors?: string[]
+  source: MetadataSource
+  official: boolean
+  /** Provider-specific origin retained while migrating from singular ratings. */
+  provider?: RatingProvider
+}
+
+export interface RatingCandidate extends ContentRating {
+  provider: RatingProvider
+  sourceLabel: string
+  retrievedRegion?: string
+}
+
+export interface AgeGuidance {
+  suggestedMinimumAge?: number
+  basis: 'official-certification' | 'provider-value' | 'derived'
+  confidence: 'high' | 'medium' | 'low'
+  reasons?: string[]
+}
+
+export interface RatingResolution {
+  selected?: RatingCandidate
+  candidates: RatingCandidate[]
+  ageGuidance?: AgeGuidance
+  preferredRegion: string
+  fallbackUsed: boolean
 }
 
 export interface ExternalProfile {
@@ -90,6 +127,10 @@ export interface EnrichedTitleMetadata {
   tmdbId: string
   mediaType: 'movie' | 'tv'
   tagline?: string
+  contentRating?: ContentRating
+  ageGuidance?: AgeGuidance
+  contentRatings?: RatingCandidate[]
+  ratingResolution?: RatingResolution
   cast?: PersonSummary[]
   crew?: PersonSummary[]
   related?: RelatedTitle[]
@@ -111,6 +152,12 @@ export interface RichMetadata {
   duration?: string
   durationSeconds?: number
   ageRating?: string
+  contentRating?: ContentRating
+  ageGuidance?: AgeGuidance
+  contentRatings?: RatingCandidate[]
+  ratingResolution?: RatingResolution
+  providerCast?: PersonSummary[]
+  providerCrew?: PersonSummary[]
   tmdbId?: string
   trailer?: Trailer
   enrichment?: EnrichedTitleMetadata
