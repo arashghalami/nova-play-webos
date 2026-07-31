@@ -55,6 +55,12 @@ type RequestOptions = {
 }
 
 type StreamSearchOptions = RequestOptions & {
+  /**
+   * Optional deadline for receiving HTTP response headers. When supplied, the
+   * regular timeout begins again after headers arrive and bounds incremental
+   * body scanning independently.
+   */
+  responseTimeoutMs?: number
   limit?: number
   excludeCategoryIds?: ReadonlySet<string>
   onMatches?: (matches: StreamItem[]) => void
@@ -917,9 +923,9 @@ export class XtreamClient {
       matchAll: Boolean(options.matchAll),
     })
     const controller = new AbortController()
-    const timeout = window.setTimeout(
+    let timeout = window.setTimeout(
       () => controller.abort(),
-      options.timeoutMs ?? SEARCH_TIMEOUT_MS,
+      options.responseTimeoutMs ?? options.timeoutMs ?? SEARCH_TIMEOUT_MS,
     )
     const abortFromCaller = (): void => controller.abort()
     const matches: StreamItem[] = []
@@ -1105,6 +1111,14 @@ export class XtreamClient {
           },
           { requestId: requestId ?? undefined },
         )
+
+        if (options.responseTimeoutMs !== undefined) {
+          window.clearTimeout(timeout)
+          timeout = window.setTimeout(
+            () => controller.abort(),
+            options.timeoutMs ?? SEARCH_TIMEOUT_MS,
+          )
+        }
       } catch {
         if (options.signal?.aborted) {
           throw new ProviderError('cancelled', 'Request cancelled.', false)

@@ -96,8 +96,13 @@ import { XtreamClient } from './xtream-client'
 import {
   isProviderError,
   isProviderRefusal,
-  isRetryableProviderFailure,
 } from './provider-error'
+import {
+  isProviderSearchBlocked,
+  providerSearchBlockForFailure,
+  providerSearchBlockMessage,
+  type ProviderSearchBlock,
+} from './provider-search-guard'
 import {
   dedupeRatingCandidates,
   ratingSourceSummary,
@@ -131,7 +136,8 @@ type CachedStreams = {
 type GlobalSearchSectionOutcome = {
   authoritative: boolean
   cacheable: boolean
-  warmAfterSearch?: boolean
+  partial?: boolean
+  blocked?: boolean
 }
 
 type CompleteSearchCatalog = {
@@ -192,7 +198,6 @@ type GlobalSearchViewUpdate = {
 type PlayerUiMode = 'immersive' | 'overlay' | 'focused' | 'seeking'
 const CATALOG_PAGE_SIZE = 60
 const WEBOS_CATALOG_PAGE_SIZE = 24
-const SEARCH_DEBOUNCE_MS = 240
 // Local, in-memory catalog filtering is cheap, so it can react faster than the
 // networked global search without feeling chatty.
 const CATALOG_SEARCH_DEBOUNCE_MS = 140
@@ -215,9 +220,10 @@ const GLOBAL_SEARCH_WORK_SLICE_MS = 8
 // Some Xtream panels accept categories but never answer provider-wide library
 // endpoints. Fail fast enough to reach the bounded fallback rather than leave
 // a TV search in its loading state for the general 60-second stream timeout.
-const GLOBAL_SEARCH_PROVIDER_TIMEOUT_MS = 10_000
-const GLOBAL_SEARCH_CATEGORY_TIMEOUT_MS = 6_000
-const MIN_GLOBAL_SEARCH_LENGTH = 1
+const GLOBAL_SEARCH_RESPONSE_TIMEOUT_MS = 10_000
+const GLOBAL_SEARCH_SCAN_TIMEOUT_MS = 45_000
+const GLOBAL_SEARCH_RETRY_COOLDOWN_MS = 60_000
+const MIN_GLOBAL_SEARCH_LENGTH = 2
 const MAX_NOW_NEXT_ENTRIES = 600
 const PLAYBACK_ATTEMPT_TIMEOUT_MS = 12_000
 // Older webOS Chromium eagerly decodes every image in a 60-card DOM grid even
@@ -413,6 +419,8 @@ let globalSearchResults: StreamItem[] = []
 let globalSearchQuery = ''
 let globalSearchLoading = false
 let globalSearchStatus = ''
+let providerSearchBlock: ProviderSearchBlock | null = null
+const globalSearchRetryAfterByQuery = new Map<string, number>()
 let searchReturnView: AppView = 'home'
 let pendingFocus: FocusSnapshot | null = null
 let detailReturnPoint: ViewReturnPoint | null = null
@@ -1004,14 +1012,6 @@ async function loadCompleteSearchCatalog(
     durationMs: Date.now() - startedAt,
   })
   return 'complete'
-}
-
-function warmCompleteSearchCatalog(section: LibrarySection): void {
-  if (cachedCompleteSearchCatalog(section)) {
-    return
-  }
-
-  completeSearchCatalogQueue.request(section)
 }
 
 function isAppHistoryState(value: unknown): value is AppHistoryState {
@@ -2829,37 +2829,62 @@ function leaveGlobalSearch(): void {
   render()
 }
 
-function scheduleGlobalSearch(query: string): void {
-  const normalizedQuery = query.trim()
-  globalSearchQuery = query
-  expandedGlobalSearchSections.clear()
+function localGlobalSearchMatches(query: string): StreamItem[] {
+  const results: StreamItem[] = []
+  const knownKeys = new Set<string>()
+  const tokens = queryTokens(query)
 
-  if (normalizedQuery.length < MIN_GLOBAL_SEARCH_LENGTH) {
-    stopGlobalSearchWork()
-    globalSearchSession = null
-    globalSearchResults = []
-    globalSearchLoading = false
-    globalSearchStatus = ''
-    updateGlobalSearchView({ controls: true, fullResults: true })
-    return
+  for (const section of GLOBAL_SEARCH_SECTIONS) {
+    for (const stream of cachedStreamsForSection(section)) {
+      if (globalSearchResultCount(results, section) >= GLOBAL_SEARCH_SECTION_RESULT_LIMIT) {
+        break
+      }
+
+      const key = streamLookupKey(stream)
+
+      if (
+        stream.streamType !== 'episode' &&
+        !knownKeys.has(key) &&
+        visibleStream(stream) &&
+        matchesQuery(searchText(stream), tokens)
+      ) {
+        knownKeys.add(key)
+        results.push(stream)
+      }
+    }
   }
 
-  const session = startGlobalSearchSession(normalizedQuery, 'debouncing')
-  globalSearchResults = []
-  globalSearchLoading = true
-  globalSearchStatus = 'Searching…'
+  return results
+}
+
+function scheduleGlobalSearch(query: string): void {
+  const normalizedQuery = query.trim()
+
+  // The remote's on-screen keyboard emits an input event for every character.
+  // Keep that path entirely local so typing a title cannot become a burst of
+  // whole-library provider requests. Search/Enter submits the final query.
+  stopGlobalSearchWork()
+  globalSearchSession = null
+  globalSearchQuery = query
+  expandedGlobalSearchSections.clear()
+  globalSearchLoading = false
+  globalSearchResults =
+    normalizedQuery.length >= MIN_GLOBAL_SEARCH_LENGTH
+      ? localGlobalSearchMatches(normalizedQuery)
+      : []
+
+  if (!normalizedQuery) {
+    globalSearchStatus = ''
+  } else if (normalizedQuery.length < MIN_GLOBAL_SEARCH_LENGTH) {
+    globalSearchStatus = `Type at least ${MIN_GLOBAL_SEARCH_LENGTH} characters, then press Search.`
+  } else {
+    const localCount = globalSearchResults.length
+    globalSearchStatus = localCount
+      ? `${localCount} local result${localCount === 1 ? '' : 's'} · Press Search to check the provider.`
+      : 'Press Search to check the provider.'
+  }
+
   updateGlobalSearchView({ controls: true, fullResults: true })
-
-  globalSearchDebounceTimer = window.setTimeout(() => {
-    globalSearchDebounceTimer = null
-
-    if (!isCurrentGlobalSearchSession(session)) {
-      return
-    }
-
-    session.phase = 'searching'
-    void runGlobalSearch(session)
-  }, SEARCH_DEBOUNCE_MS)
 }
 
 function renderGlobalSearch(): void {
@@ -5208,66 +5233,6 @@ async function openGuide(refresh = false): Promise<void> {
   render()
 }
 
-function categorySearchScore(category: Category, query: string): number {
-  const normalizedName = foldText(category.name)
-
-  if (normalizedName.includes(query)) {
-    return 0
-  }
-
-  // Keep the fuzzy fallback compatible with the ES2015 webOS bundle.
-  const queryTokens = query.match(/[a-z0-9]+/g) ?? []
-  const nameTokens = normalizedName.match(/[a-z0-9]+/g) ?? []
-
-  return queryTokens.reduce((bestScore, queryToken) => {
-    const tokenScore = nameTokens.reduce((bestTokenScore, nameToken) => {
-      if (nameToken.includes(queryToken) || queryToken.includes(nameToken)) {
-        return Math.min(bestTokenScore, 1)
-      }
-
-      const distance = boundedEditDistance(nameToken, queryToken, 2)
-
-      return distance <= 2
-        ? Math.min(bestTokenScore, distance + 2)
-        : bestTokenScore
-    }, Number.POSITIVE_INFINITY)
-
-    return Math.min(bestScore, tokenScore)
-  }, Number.POSITIVE_INFINITY)
-}
-
-function boundedEditDistance(left: string, right: string, limit: number): number {
-  if (Math.abs(left.length - right.length) > limit) {
-    return limit + 1
-  }
-
-  let previous = Array.from({ length: right.length + 1 }, (_, index) => index)
-
-  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
-    const current = [leftIndex]
-    let smallest = current[0]
-
-    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
-      const cost = left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1
-      const value = Math.min(
-        previous[rightIndex] + 1,
-        current[rightIndex - 1] + 1,
-        previous[rightIndex - 1] + cost,
-      )
-      current.push(value)
-      smallest = Math.min(smallest, value)
-    }
-
-    if (smallest > limit) {
-      return limit + 1
-    }
-
-    previous = current
-  }
-
-  return previous[right.length]
-}
-
 function globalSearchResultCount(results: StreamItem[], section: LibrarySection): number {
   return results.reduce(
     (count, stream) => count + (stream.section === section ? 1 : 0),
@@ -5362,6 +5327,24 @@ function appendGlobalSearchMatches(
   return added
 }
 
+function globalSearchSectionOrder(query: string): LibrarySection[] {
+  const tokens = queryTokens(query)
+
+  return [...GLOBAL_SEARCH_SECTIONS]
+    .map((section, index) => ({
+      section,
+      index,
+      localMatches: cachedStreamsForSection(section).filter(
+        (stream) =>
+          stream.streamType !== 'episode' &&
+          visibleStream(stream) &&
+          matchesQuery(searchText(stream), tokens),
+      ).length,
+    }))
+    .sort((left, right) => right.localMatches - left.localMatches || left.index - right.index)
+    .map(({ section }) => section)
+}
+
 async function searchGlobalSection(
   activeClient: XtreamClient,
   session: GlobalSearchSession,
@@ -5374,7 +5357,6 @@ async function searchGlobalSection(
   const completeCatalog = cachedCompleteSearchCatalog(section)
 
   if (completeCatalog) {
-    const catalogSearchStartedAt = Date.now()
     const added = await addSearchMatchesCooperatively(
       results,
       resultKeys,
@@ -5395,38 +5377,19 @@ async function searchGlobalSection(
     performanceTrace.event('search', 'global-search-catalog-hit', {
       section,
       catalogItemCount: completeCatalog.length,
-      durationMs: Date.now() - catalogSearchStartedAt,
     })
     return { authoritative: true, cacheable: true }
   }
 
-  const cachedMatches = await addSearchMatchesCooperatively(
-    results,
-    resultKeys,
-    cachedStreamsForSection(section),
-    query,
-    signal,
-  )
-
-  if (!isCurrentGlobalSearchSession(session)) {
-    return { authoritative: false, cacheable: false }
+  if (isProviderSearchBlocked(providerSearchBlock)) {
+    return { authoritative: false, cacheable: false, partial: true, blocked: true }
   }
 
-  if (cachedMatches) {
-    globalSearchResults = results
-    scheduleGlobalSearchRender(session, [section])
-  }
-
-  let fallbackCategories = sectionCategories.get(section)
-
-  // Apply known adult category IDs when catalog metadata is already present.
-  // Do not block a foreground search waiting for category endpoints: some
-  // providers serve streams but intermittently stall category requests. The
-  // title-based adult filter still applies to every displayed match.
   try {
     const matches = await activeClient.searchStreams(section, query, {
       signal,
-      timeoutMs: GLOBAL_SEARCH_PROVIDER_TIMEOUT_MS,
+      responseTimeoutMs: GLOBAL_SEARCH_RESPONSE_TIMEOUT_MS,
+      timeoutMs: GLOBAL_SEARCH_SCAN_TIMEOUT_MS,
       limit: Math.max(
         1,
         GLOBAL_SEARCH_SECTION_RESULT_LIMIT - globalSearchResultCount(results, section),
@@ -5444,125 +5407,29 @@ async function searchGlobalSection(
     }
 
     appendGlobalSearchMatches(session, results, resultKeys, section, matches)
-
-    // A valid provider-wide response is authoritative, including zero matches.
-    // Do not turn an ordinary empty search into an unbounded category crawl.
-    // Defer warming until every foreground section search has finished.
-    return { authoritative: true, cacheable: true, warmAfterSearch: true }
+    return { authoritative: true, cacheable: true }
   } catch (reason) {
     if (!isCurrentGlobalSearchSession(session)) {
       return { authoritative: false, cacheable: false }
     }
 
-    /*
-     * The category fallback below exists for providers that reject whole-library
-     * endpoints, which they signal by stalling or failing the transport. A
-     * refusal is a different situation: a 403, 401 or 429 means the provider is
-     * actively turning traffic away, and answering it with one category request
-     * plus up to twelve stream requests -- across three sections in parallel --
-     * turned a single rejection into thirty-nine more. That amplification kept
-     * the account rate limited. A cancellation must not crawl either.
-     */
-    if (!isRetryableProviderFailure(reason)) {
-      return { authoritative: false, cacheable: false }
+    const block = providerSearchBlockForFailure(reason)
+
+    if (block) {
+      providerSearchBlock = block
+      performanceTrace.event('search', 'global-search-provider-blocked', {
+        kind: block.kind,
+        permanent: block.until === null,
+      })
+      return { authoritative: false, cacheable: false, partial: true, blocked: true }
     }
+
+    // Do not turn one stalled whole-library scan into a category crawl. That
+    // amplification is what previously caused provider bans. Keep already
+    // streamed matches, mark them partial, and require a paced explicit retry.
+    performanceTrace.event('search', 'global-search-section-partial', { section })
+    return { authoritative: false, cacheable: false, partial: true }
   }
-
-  // Some providers reject whole-library endpoints. Fetch categories only for
-  // that bounded fallback so normal searches with adult content visible avoid
-  // three otherwise unused category requests. When adult content is hidden,
-  // category IDs are loaded once above and then reused to preserve filtering.
-  let categories = fallbackCategories
-
-  if (!categories) {
-    try {
-      categories = await activeClient.categories(
-        section,
-        signal,
-        GLOBAL_SEARCH_CATEGORY_TIMEOUT_MS,
-      )
-    } catch {
-      return { authoritative: false, cacheable: false }
-    }
-
-    if (!isCurrentGlobalSearchSession(session)) {
-      return { authoritative: false, cacheable: false }
-    }
-
-    rememberCategories(section, categories)
-  }
-
-  const rankedFallbackCategories = categories
-    .filter((category) => !settings.hideAdultContent || !isAdult(category.name))
-    .map((category, index) => ({
-      category,
-      index,
-      score: categorySearchScore(category, query),
-    }))
-    .sort((left, right) => left.score - right.score || left.index - right.index)
-    .slice(0, 12)
-    .map(({ category }) => category)
-
-  let fallbackHadFailure = false
-
-  for (const category of rankedFallbackCategories) {
-    if (
-      !isCurrentGlobalSearchSession(session) ||
-      globalSearchResultCount(results, section) >= GLOBAL_SEARCH_SECTION_RESULT_LIMIT
-    ) {
-      return { authoritative: false, cacheable: false }
-    }
-
-    try {
-      const streams =
-        cachedStreams(section, category.id) ??
-        await activeClient.streams(
-          section,
-          category.id,
-          signal,
-          GLOBAL_SEARCH_CATEGORY_TIMEOUT_MS,
-        )
-
-      if (!isCurrentGlobalSearchSession(session)) {
-        return { authoritative: false, cacheable: false }
-      }
-
-      cacheStreams(section, category.id, streams)
-      rememberStreams(streams)
-      const added = await addSearchMatchesCooperatively(
-        results,
-        resultKeys,
-        streams,
-        query,
-        signal,
-      )
-
-      if (added) {
-        globalSearchResults = results
-        scheduleGlobalSearchRender(session, [section])
-      }
-    } catch (reason) {
-      if (!isCurrentGlobalSearchSession(session)) {
-        return { authoritative: false, cacheable: false }
-      }
-
-      fallbackHadFailure = true
-
-      /*
-       * A refusal partway through the crawl applies to the remaining categories
-       * too. Continuing would spend the rest of the budget on requests the
-       * provider has already said it will reject.
-       */
-      if (!isRetryableProviderFailure(reason)) {
-        break
-      }
-    }
-  }
-
-  // Category fallback is bounded rather than provider-wide authoritative, but
-  // cache its completed result set so a provider that rejects whole-library
-  // searches still benefits from repeated exact queries.
-  return { authoritative: false, cacheable: !fallbackHadFailure }
 }
 
 async function runGlobalSearch(session?: GlobalSearchSession): Promise<void> {
@@ -5574,8 +5441,40 @@ async function runGlobalSearch(session?: GlobalSearchSession): Promise<void> {
 
   const searchInput = document.querySelector<HTMLInputElement>('#global-search-input')
   const requestedQuery = (searchInput?.value ?? globalSearchQuery).trim()
-  const activeSession =
-    session ?? startGlobalSearchSession(requestedQuery, 'searching')
+
+  if (requestedQuery.length < MIN_GLOBAL_SEARCH_LENGTH) {
+    globalSearchStatus = `Type at least ${MIN_GLOBAL_SEARCH_LENGTH} characters, then press Search.`
+    updateGlobalSearchView({ controls: true, fullResults: false, sections: GLOBAL_SEARCH_SECTIONS })
+    return
+  }
+
+  if (providerSearchBlock && !isProviderSearchBlocked(providerSearchBlock)) {
+    providerSearchBlock = null
+  }
+
+  const providerBlockMessage = providerSearchBlockMessage(providerSearchBlock)
+
+  if (providerBlockMessage) {
+    globalSearchResults = localGlobalSearchMatches(requestedQuery)
+    globalSearchLoading = false
+    globalSearchStatus = providerBlockMessage
+    updateGlobalSearchView({ controls: true, fullResults: true })
+    return
+  }
+
+  const cacheKey = globalSearchCacheKey(requestedQuery)
+  const retryAfter = globalSearchRetryAfterByQuery.get(cacheKey)
+
+  if (retryAfter && retryAfter > Date.now()) {
+    globalSearchResults = localGlobalSearchMatches(requestedQuery)
+    globalSearchLoading = false
+    globalSearchStatus = 'Partial results · Provider search is cooling down before another attempt.'
+    updateGlobalSearchView({ controls: true, fullResults: true })
+    return
+  }
+
+  globalSearchRetryAfterByQuery.delete(cacheKey)
+  const activeSession = session ?? startGlobalSearchSession(requestedQuery, 'searching')
 
   performanceTrace.event('search', 'global-search-start', {
     resumed: Boolean(session),
@@ -5583,25 +5482,10 @@ async function runGlobalSearch(session?: GlobalSearchSession): Promise<void> {
     cacheHit: false,
   })
 
-  if (requestedQuery.length < MIN_GLOBAL_SEARCH_LENGTH) {
-    clearGlobalSearch()
-    return
-  }
-
-  if (!session) {
-    globalSearchQuery = requestedQuery
-    globalSearchResults = []
-    globalSearchLoading = true
-    globalSearchStatus = 'Searching…'
-    expandedGlobalSearchSections.clear()
-    updateGlobalSearchView({ controls: true, fullResults: true })
-  }
-
   if (!isCurrentGlobalSearchSession(activeSession)) {
     return
   }
 
-  const cacheKey = globalSearchCacheKey(activeSession.query)
   const cachedResults = globalSearchResultCache.get(cacheKey)
 
   if (cachedResults) {
@@ -5631,24 +5515,48 @@ async function runGlobalSearch(session?: GlobalSearchSession): Promise<void> {
     return
   }
 
-  performanceTrace.event('cache', 'global-search-result-miss')
-  activeSession.phase = 'searching'
-  const query = foldText(activeSession.query)
-  const results: StreamItem[] = []
-  const resultKeys = new Set<string>()
+  globalSearchQuery = requestedQuery
+  globalSearchResults = localGlobalSearchMatches(requestedQuery)
+  globalSearchLoading = true
+  globalSearchStatus = 'Searching the provider…'
+  expandedGlobalSearchSections.clear()
+  updateGlobalSearchView({ controls: true, fullResults: true })
 
-  const outcomes = await Promise.allSettled(
-    GLOBAL_SEARCH_SECTIONS.map((section) =>
-      searchGlobalSection(
+  performanceTrace.event('cache', 'global-search-result-miss')
+  const query = foldText(activeSession.query)
+  const results = [...globalSearchResults]
+  const resultKeys = new Set(results.map(streamLookupKey))
+  const outcomes: GlobalSearchSectionOutcome[] = []
+
+  // Only one provider request is active at a time. If a section stalls or the
+  // provider refuses traffic, stop immediately instead of multiplying requests
+  // across sections or category fallbacks.
+  for (const section of globalSearchSectionOrder(query)) {
+    if (!isCurrentGlobalSearchSession(activeSession)) {
+      return
+    }
+
+    let outcome: GlobalSearchSectionOutcome
+
+    try {
+      outcome = await searchGlobalSection(
         activeClient,
         activeSession,
         section,
         query,
         results,
         resultKeys,
-      ),
-    ),
-  )
+      )
+    } catch {
+      outcome = { authoritative: false, cacheable: false, partial: true }
+    }
+
+    outcomes.push(outcome)
+
+    if (outcome.partial || outcome.blocked) {
+      break
+    }
+  }
 
   if (!isCurrentGlobalSearchSession(activeSession)) {
     return
@@ -5656,35 +5564,37 @@ async function runGlobalSearch(session?: GlobalSearchSession): Promise<void> {
 
   globalSearchLoading = false
   globalSearchResults = results
-  globalSearchStatus = results.length
-    ? `${results.length} result${results.length === 1 ? '' : 's'}`
-    : 'No results'
   activeSession.phase = 'completed'
-  const cacheable = outcomes.every(
-    (outcome) => outcome.status === 'fulfilled' && outcome.value.cacheable,
-  )
-  const fullyAuthoritative = outcomes.every(
-    (outcome) => outcome.status === 'fulfilled' && outcome.value.authoritative,
-  )
+  const fullyAuthoritative =
+    outcomes.length === GLOBAL_SEARCH_SECTIONS.length &&
+    outcomes.every((outcome) => outcome.authoritative)
+  const partial = !fullyAuthoritative
+  const blockedMessage = providerSearchBlockMessage(providerSearchBlock)
 
-  if (cacheable) {
+  if (fullyAuthoritative) {
     globalSearchResultCache.set(cacheKey, [...results])
     performanceTrace.event('cache', 'global-search-result-write', {
       resultCount: results.length,
       cacheEntries: globalSearchResultCache.size,
     })
+  } else {
+    globalSearchRetryAfterByQuery.set(cacheKey, Date.now() + GLOBAL_SEARCH_RETRY_COOLDOWN_MS)
   }
 
-  outcomes.forEach((outcome, index) => {
-    if (outcome.status === 'fulfilled' && outcome.value.warmAfterSearch) {
-      warmCompleteSearchCatalog(GLOBAL_SEARCH_SECTIONS[index])
-    }
-  })
+  globalSearchStatus = blockedMessage
+    ? blockedMessage
+    : partial
+      ? `${results.length} partial result${results.length === 1 ? '' : 's'} · Search stopped to protect your provider account.`
+      : results.length
+        ? `${results.length} result${results.length === 1 ? '' : 's'}`
+        : 'No results'
 
   performanceTrace.event('search', 'global-search-complete', {
     cacheHit: false,
-    cacheable,
+    cacheable: fullyAuthoritative,
     fullyAuthoritative,
+    partial,
+    sectionsScanned: outcomes.length,
     resultCount: results.length,
     liveCount: globalSearchResultCount(results, 'live'),
     vodCount: globalSearchResultCount(results, 'vod'),
@@ -6333,6 +6243,8 @@ function saveCurrentSettings(): void {
 }
 
 function activateProfile(nextProfile: XtreamProfile, nextClient?: XtreamClient): void {
+  providerSearchBlock = null
+  globalSearchRetryAfterByQuery.clear()
   profile = nextProfile
   client = nextClient ?? new XtreamClient(nextProfile)
   settings = loadSettings(nextProfile.id)
