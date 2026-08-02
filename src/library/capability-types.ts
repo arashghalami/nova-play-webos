@@ -69,6 +69,26 @@ export type FlatSnapshotProbeOptions = {
   onSnapshotCommitted?: (writesCompleted: number) => void
 }
 
+export type PublicationProbeOptions = {
+  databaseName?: string
+  runId?: string
+  categoryCount?: number
+  itemsPerCategory?: number
+  cleanup?: boolean
+}
+
+export type PublicationProbeReport = {
+  schemaVersion: 1
+  databaseName: string
+  runId: string
+  categoryCount: number
+  itemsPerCategory: number
+  publishedCategoryCount: number
+  publishStages: string[]
+  success: boolean
+  fault?: Record<string, string>
+}
+
 export type FlatSnapshotPlaybackMode = 'baseline' | 'concurrent'
 
 export type FlatSnapshotPlaybackStartupReport = {

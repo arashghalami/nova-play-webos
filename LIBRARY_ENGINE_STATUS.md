@@ -1145,3 +1145,65 @@ The run stopped after five serial provider requests because the VOD category-man
 - No probe budget reset was invoked. The six-request ceiling was neither raised nor bypassed.
 - The exact one approved physical verification run remains deferred until the next UTC sync-budget window provides all six debits, unless the user explicitly authorizes a different budget procedure.
 - Gate 1 remains **rejected/pending**. Phase 2A remains **not started and not authorized**.
+
+## 2026-08-02 — ReferenceError root cause, bundle boundary correction, and zero-provider physical publication proof
+
+### Error identification
+
+- The probe-only internal-fault policy was used to exercise the actual `replaceSectionSnapshots()` publication path with three synthetic VOD categories of 24 items each. The probe constructs no `ProviderBroker` or `XtreamClient` and issues no provider request.
+- The original physical diagnostic package captured the previously sanitized fault as:
+  - `ReferenceError: Cannot access 'i' before initialization`;
+  - publication stages reached `snapshot-plan`, `snapshot-write`, `manifest-build`, `manifest-put`, and `cleanup`, but not `complete`.
+- Source-map resolution of the first captured frame identified `node_modules/dashjs/dist/modern/esm/dash.all.min.js`, not the catalog repository, broker, transport, or client.
+- The permanent relative-import graph gate was added and passed. It reported no runtime cycles, ruling out the proposed `provider-broker.ts` ↔ `xtream-client.ts` temporal-dead-zone hypothesis.
+- After Dash.js isolation, the synthetic physical path surfaced a second independently mapped TDZ from `node_modules/hls.js/dist/hls.mjs`. The final residual physical TDZ mapped into the minified application IIFE's coroutine-local publication bindings.
+- The failure was therefore not a missing `structuredClone`/new-global issue, provider failure, provider budget issue, or a relative source import cycle.
+
+### Corrective implementation
+
+- Added probe-only safe internal diagnostics:
+  - provider/network errors remain fully sanitized;
+  - probe-enabled builds may expose bounded local application fault type, message, and up to three safe file/line/column frames;
+  - URL-like and credential-assignment fragments are redacted.
+- Added the synthetic no-provider `publication.run()` probe and regression test. It verifies the exact repository path reaches all six stages:
+  `snapshot-plan`, `snapshot-write`, `manifest-build`, `manifest-put`, `cleanup`, and `complete`.
+- Isolated all browser media engines from the application IIFE:
+  - Dash.js uses the separately packaged legacy UMD `dash.all.min.js`;
+  - Hls.js uses separately packaged `hls.min.js`;
+  - MPEG-TS uses separately packaged `mpegts.js`;
+  - `src/dash-player.ts` and `src/media-engines.ts` access only typed globals exposed by those scripts.
+- The output `index.html` loads those assets before `app.js`. The Vite build copies each asset reproducibly from `node_modules`.
+- The build now rejects any Dash.js, Hls.js, or MPEG-TS module detected inside the application IIFE and the output checker verifies all three standalone assets, their ordering, their expected global markers, and the generated build metadata.
+- The initial media isolation removed the library-origin TDZs but did not eliminate the final TDZ in the minified app IIFE. The remaining physical fault was resolved by retaining the ES2015 application IIFE **unminified** (`build.minify = false`). This avoids the legacy webOS Chromium minifier/runtime interaction while preserving the ES2015 syntax target. Media-engine UMD assets remain their upstream minified distributions.
+- The whole-section synthetic publication path also no longer carries unused `onSnapshotPut` timing callback bindings. Production sync instrumentation still exists where it is consumed; the no-provider whole-section publication probe uses only publication-stage callbacks.
+
+### Automated and bundle evidence
+
+| Command | Result | Notes |
+| --- | --- | --- |
+| `rtk npx tsc --noEmit` | Passed | No TypeScript diagnostics. |
+| `rtk npx vitest run src/library/publication-probe.test.ts src/library/catalog-repository.test.ts src/library/flat-snapshot-probe.test.ts` | Passed | 26 tests, including the 30,000-item/300-category fixture and 1,055-snapshot atomicity proof. |
+| `rtk npm test -- --run` | Passed | 31 files, 235 tests. Expected mocked metadata upstream-503 output remains non-failing. |
+| `rtk npm run build` | Passed | 33 runtime source modules have no relative import cycle. The bundle guard verified the ES2015 app IIFE has no prohibited globals and all three media engines are standalone assets. |
+| Probe-enabled `npm run package:webos` | Passed | Produced `com.arash.novaplay_1.0.12_all.ipk`. |
+
+### Physical corrected-bundle proof
+
+- Target: `OLED55G1RLA`, alias `lg-oled-g1`, webOS SDK 6.5.3.
+- Installed and launched probe-enabled package `com.arash.novaplay` version `1.0.12`.
+- CDP executed `catalogSync.cancel()` followed by `window.__NOVA_LIBRARY_PROBE__.publication.run({ categoryCount: 3, itemsPerCategory: 24 })`.
+- Result:
+  - `success=true`;
+  - `publishedCategoryCount=3`;
+  - publication stages: `snapshot-plan`, `snapshot-write`, `manifest-build`, `manifest-put`, `cleanup`, `complete`;
+  - no `fault` field.
+- This proof executed the physical packaged IIFE and the real local repository publication path. It did not construct a provider client or use provider/network traffic.
+- The subsequent broker inspection reported `interactive 0/24`, `sync 6/6`, and `block=null` in the active UTC window. The publication proof used no provider debit; no budget reset, ceiling change, or refusal-state mutation was performed.
+
+### Source-control and gate decision
+
+- Baseline corrective-work checkpoint before this change set: `05ca1e2` (`feat: add local catalog cache and sync foundation`).
+- The physical ReferenceError diagnosis and corrective bundle work remain to be committed after the final diff/cleanup verification.
+- Gate 1 remains **rejected/pending**: this entry proves the local post-scan publication path, not all-three-section authoritative provider synchronization.
+- Phase 2A remains **not started and not authorized**.
+- The next provider action remains exactly one separately approved serial Gate 1 sync in a future UTC window with all six sync debits available. No provider request is authorized before that condition is met.

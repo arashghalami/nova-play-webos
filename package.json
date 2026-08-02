@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build && node scripts/check-webos-bundle.mjs && npm run build:library-probe-worker",
+    "build": "tsc && node scripts/check-import-cycles.mjs && vite build && node scripts/check-webos-bundle.mjs && npm run build:library-probe-worker",
     "build:library-probe-worker": "vite build --config vite.worker.config.ts",
     "test": "vitest run",
     "test:proxy": "vitest run metadata-proxy/worker.test.ts",

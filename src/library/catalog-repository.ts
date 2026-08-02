@@ -1032,8 +1032,6 @@ export class IndexedDbCatalogRepository {
         assertCooperativeWriteAllowed(writeEpoch, options.signal)
         await assertSyncOwnership(database, input.profileId, input.runId)
         const shard = plan.shards[shardIndex]
-        const eventLoopTurn = nextEventLoopTurn()
-        const startedAt = monotonicNow()
 
         await putCooperativeRecord(
           database,
@@ -1052,12 +1050,6 @@ export class IndexedDbCatalogRepository {
           options.signal,
         )
 
-        options.onSnapshotPut?.({
-          durationMs: monotonicNow() - startedAt,
-          eventLoopTurnMs: await eventLoopTurn,
-          byteEstimate: shard.byteEstimate,
-          itemCount: shard.itemCount,
-        })
         await (options.yieldControl ?? defaultYield)()
       }
     }

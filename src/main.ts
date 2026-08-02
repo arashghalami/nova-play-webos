@@ -1,6 +1,3 @@
-import { MediaPlayer as DashMediaPlayer } from 'dashjs'
-import Hls from 'hls.js'
-import Mpegts from 'mpegts.js'
 import './style.css'
 import {
   clearProfile,
@@ -65,6 +62,7 @@ import { foldText, matchesQuery, normalizeQuery, queryTokens } from './search'
 import { LruTtlCache } from './lru-ttl-cache'
 import { focusScrollDelta } from './focus-scroll'
 import { episodeDisplayTitle, episodeThumbnailSources, seasonLabel } from './series-presentation'
+import { dashMediaPlayerFactory } from './dash-player'
 import {
   clampSeekPosition,
   hasAdvancedPlaybackTimeline,
@@ -110,6 +108,7 @@ import {
   type CapabilityProbeRunOptions,
   type CatalogSyncStorageInspection,
 } from './library/capability-probe'
+import { runPublicationProbe } from './library/publication-probe'
 import {
   armFlatSnapshotPlaybackStartup,
   deleteFlatSnapshotDatabase,
@@ -130,6 +129,12 @@ import {
   CATALOG_SYNC_SECTIONS,
   CatalogSyncCoordinator,
 } from './library/catalog-sync'
+import {
+  hlsConstructor,
+  mpegtsEngine,
+  type HlsInstance,
+  type MpegtsMediaPlayer,
+} from './media-engines'
 
 type CatalogResults = {
   key: string
@@ -378,8 +383,8 @@ let playerCleanup: (() => void) | null = null
 let searchDebounceTimer: number | null = null
 let numericChannelTimer: number | null = null
 let numericChannelBuffer = ''
-let activeHls: Hls | null = null
-let activeMpegts: ReturnType<typeof Mpegts.createPlayer> | null = null
+let activeHls: HlsInstance | null = null
+let activeMpegts: MpegtsMediaPlayer | null = null
 let activeDash: { reset: () => void } | null = null
 let playerDiagnostics: PlaybackFailure[] = []
 let playerDiagnosticsExpanded = false
@@ -2797,12 +2802,16 @@ function renderPlayer(): void {
       player.canPlayType('application/x-mpegURL'),
   )
   const isWebOs = isWebOsRuntime()
-  const mpegtsFeatures = Mpegts.isSupported() ? Mpegts.getFeatureList() : null
+  const hlsEngine = hlsConstructor()
+  const mpegtsEngineValue = mpegtsEngine()
+  const mpegtsFeatures = mpegtsEngineValue?.isSupported()
+    ? mpegtsEngineValue.getFeatureList()
+    : null
   const playbackCapabilities: PlaybackCapabilities = {
     nativeHls: nativeHlsSupport,
     nativeTransportStream: Boolean(player.canPlayType('video/mp2t')) || isWebOs,
     nativeVideo: true,
-    hlsJs: Hls.isSupported(),
+    hlsJs: Boolean(hlsEngine?.isSupported()),
     mpegts: Boolean(mpegtsFeatures?.mseLivePlayback),
     dash: typeof MediaSource !== 'undefined',
     preferNativeTransport: isWebOs,
@@ -2950,6 +2959,12 @@ function renderPlayer(): void {
   }
 
   function mpegtsFailureKind(detail: string): PlaybackFailureKind {
+    const Mpegts = mpegtsEngineValue
+
+    if (!Mpegts) {
+      return 'unknown'
+    }
+
     if (detail === Mpegts.ErrorDetails.MEDIA_FORMAT_UNSUPPORTED) {
       return 'unsupported'
     }
@@ -3075,7 +3090,9 @@ function renderPlayer(): void {
   }
 
   function startHlsAttempt(attempt: PlaybackAttempt, generation: number): void {
-    if (!Hls.isSupported()) {
+    const Hls = hlsEngine
+
+    if (!Hls || !Hls.isSupported()) {
       failAttempt(attempt, generation, 'unsupported', sourceEvidence('HLS MediaSource is unavailable.'))
       return
     }
@@ -3159,7 +3176,9 @@ function renderPlayer(): void {
   }
 
   function startMpegtsAttempt(attempt: PlaybackAttempt, generation: number): void {
-    if (!playbackCapabilities.mpegts) {
+    const Mpegts = mpegtsEngineValue
+
+    if (!Mpegts || !playbackCapabilities.mpegts) {
       failAttempt(attempt, generation, 'media-source', sourceEvidence('MPEG-TS MediaSource playback is unavailable.'))
       return
     }
@@ -3220,6 +3239,18 @@ function renderPlayer(): void {
   function startDashAttempt(attempt: PlaybackAttempt, generation: number): void {
     if (!playbackCapabilities.dash) {
       failAttempt(attempt, generation, 'media-source', sourceEvidence('MPEG-DASH MediaSource playback is unavailable.'))
+      return
+    }
+
+    const DashMediaPlayer = dashMediaPlayerFactory()
+
+    if (!DashMediaPlayer) {
+      failAttempt(
+        attempt,
+        generation,
+        'media-source',
+        sourceEvidence('The local DASH playback engine is unavailable.'),
+      )
       return
     }
 
@@ -6805,6 +6836,11 @@ if (
         // below. ProviderBroker resets counters only and preserves any
         // refusal/Retr-After block.
         return client?.resetBudgetsForProbe() ?? null
+      },
+    },
+    publication: {
+      run(options = {}) {
+        return runPublicationProbe(options)
       },
     },
     flatSnapshot: {

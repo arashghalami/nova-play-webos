@@ -22,6 +22,8 @@ import type {
   FlatSnapshotProbeOptions,
   FlatSnapshotProbeReport,
   FlatSnapshotRecoveryReport,
+  PublicationProbeOptions,
+  PublicationProbeReport,
   WorkerProbeResult,
 } from './capability-types'
 
@@ -66,6 +68,9 @@ export type LibraryCapabilityProbeApi = {
   run(options?: CapabilityProbeRunOptions): Promise<CapabilityProbeReport>
   cancel(): void
   cleanup(): Promise<void>
+  publication: {
+    run(options?: PublicationProbeOptions): Promise<PublicationProbeReport>
+  }
   flatSnapshot: {
     run(options?: FlatSnapshotProbeOptions): Promise<FlatSnapshotProbeReport>
     inspect(databaseName: string, runId: string): Promise<FlatSnapshotRecoveryReport>
