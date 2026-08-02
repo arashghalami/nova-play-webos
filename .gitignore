@@ -17,6 +17,9 @@ packages
 .env.*
 !.env.example
 
+# Recorded provider payloads can contain private catalog data and credentials.
+fixtures/
+
 # Cloudflare Worker secrets and local state
 metadata-proxy/.dev.vars
 metadata-proxy/.wrangler/

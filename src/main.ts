@@ -63,7 +63,6 @@ import { createSpatialLayoutCache } from './spatial-layout-cache'
 import { isRemoteBack, remoteDirection } from './remote-input'
 import { foldText, matchesQuery, normalizeQuery, queryTokens } from './search'
 import { LruTtlCache } from './lru-ttl-cache'
-import { SearchCatalogWarmQueue } from './search-catalog-queue'
 import { focusScrollDelta } from './focus-scroll'
 import { episodeDisplayTitle, episodeThumbnailSources, seasonLabel } from './series-presentation'
 import {
@@ -92,23 +91,45 @@ import {
   type PlaybackFailure,
   type PlaybackFailureKind,
 } from './playback-fallback'
-import { XtreamClient } from './xtream-client'
+import { ProviderBroker } from './provider-broker'
 import {
   isProviderError,
   isProviderRefusal,
 } from './provider-error'
-import {
-  isProviderSearchBlocked,
-  providerSearchBlockForFailure,
-  providerSearchBlockMessage,
-  type ProviderSearchBlock,
-} from './provider-search-guard'
 import {
   dedupeRatingCandidates,
   ratingSourceSummary,
   resolveContentRating,
 } from './content-rating'
 import { performanceTrace } from './performance-trace'
+import {
+  deleteProbeDatabase,
+} from './library/idb-probe'
+import {
+  runLibraryCapabilityProbe,
+  type CapabilityProbeRunOptions,
+  type CatalogSyncStorageInspection,
+} from './library/capability-probe'
+import {
+  armFlatSnapshotPlaybackStartup,
+  deleteFlatSnapshotDatabase,
+  inspectFlatSnapshotRecovery,
+  markFlatSnapshotPlaybackFailed,
+  markFlatSnapshotPlaybackReady,
+  markFlatSnapshotPlaybackStarting,
+  resetFlatSnapshotPlaybackStartup,
+  runFlatSnapshotProbe,
+  snapshotFlatSnapshotPlaybackStartup,
+} from './library/flat-snapshot-probe'
+import {
+  clearLibraryMemoryCaches,
+  IndexedDbCatalogRepository,
+  setLibraryPlaybackStarting,
+} from './library/catalog-repository'
+import {
+  CATALOG_SYNC_SECTIONS,
+  CatalogSyncCoordinator,
+} from './library/catalog-sync'
 
 type CatalogResults = {
   key: string
@@ -129,18 +150,6 @@ type CatalogState = {
 }
 
 type CachedStreams = {
-  streams: StreamItem[]
-  updatedAt: number
-}
-
-type GlobalSearchSectionOutcome = {
-  authoritative: boolean
-  cacheable: boolean
-  partial?: boolean
-  blocked?: boolean
-}
-
-type CompleteSearchCatalog = {
   streams: StreamItem[]
   updatedAt: number
 }
@@ -178,17 +187,6 @@ type AppHistoryState = {
   depth: number
 }
 
-type GlobalSearchPhase = 'idle' | 'debouncing' | 'searching' | 'completed' | 'cancelled'
-
-type GlobalSearchSession = {
-  id: number
-  query: string
-  controller: AbortController
-  phase: GlobalSearchPhase
-  dirtySections: Set<LibrarySection>
-  renderTimer: number | null
-}
-
 type GlobalSearchViewUpdate = {
   controls?: boolean
   fullResults?: boolean
@@ -202,29 +200,15 @@ const WEBOS_CATALOG_PAGE_SIZE = 24
 // networked global search without feeling chatty.
 const CATALOG_SEARCH_DEBOUNCE_MS = 140
 const NUMERIC_CHANNEL_TIMEOUT_MS = 1600
-const NOW_NEXT_CONCURRENCY = 4
 const MAX_KNOWN_STREAMS = 5_000
 const MAX_STREAM_CACHE_ENTRIES = 18
 const MAX_CACHED_STREAM_ITEMS = 12_000
 const STREAM_CACHE_TTL_MS = 15 * 60_000
 const GLOBAL_SEARCH_SECTION_RESULT_LIMIT = 60
 const GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT = 12
-const GLOBAL_SEARCH_RESULT_CACHE_MAX_ENTRIES = 20
-const GLOBAL_SEARCH_RESULT_CACHE_TTL_MS = 15 * 60_000
-const COMPLETE_SEARCH_CATALOG_TTL_MS = 15 * 60_000
-const COMPLETE_SEARCH_CATALOG_RETRY_DELAY_MS = 5 * 60_000
-const MAX_COMPLETE_SEARCH_CATALOG_ITEMS = 12_000
-const MAX_COMPLETE_SEARCH_CATALOG_SECTION_ITEMS = 6_000
-const GLOBAL_SEARCH_RENDER_INTERVAL_MS = 80
-const GLOBAL_SEARCH_WORK_SLICE_MS = 8
-// Some Xtream panels accept categories but never answer provider-wide library
-// endpoints. Fail fast enough to reach the bounded fallback rather than leave
-// a TV search in its loading state for the general 60-second stream timeout.
-const GLOBAL_SEARCH_RESPONSE_TIMEOUT_MS = 10_000
-const GLOBAL_SEARCH_SCAN_TIMEOUT_MS = 45_000
-const GLOBAL_SEARCH_RETRY_COOLDOWN_MS = 60_000
 const MIN_GLOBAL_SEARCH_LENGTH = 2
 const MAX_NOW_NEXT_ENTRIES = 600
+const NOW_NEXT_CACHE_TTL_MS = 5 * 60_000
 const PLAYBACK_ATTEMPT_TIMEOUT_MS = 12_000
 // Older webOS Chromium eagerly decodes every image in a 60-card DOM grid even
 // when loading="lazy" is present. Admit only nearby artwork and limit active
@@ -364,7 +348,15 @@ function provisionProfileFromLaunchParams(): void {
 provisionProfileFromLaunchParams()
 
 let profile = loadProfile()
-let client = profile ? new XtreamClient(profile) : null
+let client = profile ? new ProviderBroker(profile) : null
+const catalogRepository = new IndexedDbCatalogRepository()
+let catalogSync = client
+  ? new CatalogSyncCoordinator(client, catalogRepository, {
+      internalFaultDiagnostics: import.meta.env.VITE_ENABLE_LIBRARY_PROBE === 'true',
+    })
+  : null
+let catalogSyncTimer: number | null = null
+let activeLibraryProbeController: AbortController | null = null
 let settings: AppSettings = profile
   ? loadSettings(profile.id)
   : { ...DEFAULT_SETTINGS }
@@ -384,9 +376,6 @@ let playerForceDirect = false
 let playerControlsTimer: number | null = null
 let playerCleanup: (() => void) | null = null
 let searchDebounceTimer: number | null = null
-let globalSearchDebounceTimer: number | null = null
-let globalSearchSequence = 0
-let globalSearchSession: GlobalSearchSession | null = null
 let numericChannelTimer: number | null = null
 let numericChannelBuffer = ''
 let activeHls: Hls | null = null
@@ -412,15 +401,11 @@ let wakeLock: { release: () => Promise<void> } | null = null
 let navigationSequence = 0
 let navigationToken = 0
 let navigationController: AbortController | null = null
-let nowNextPrefetchController: AbortController | null = null
 let liveQueue: StreamItem[] = []
 let guideStreams: StreamItem[] = []
 let globalSearchResults: StreamItem[] = []
 let globalSearchQuery = ''
-let globalSearchLoading = false
 let globalSearchStatus = ''
-let providerSearchBlock: ProviderSearchBlock | null = null
-const globalSearchRetryAfterByQuery = new Map<string, number>()
 let searchReturnView: AppView = 'home'
 let pendingFocus: FocusSnapshot | null = null
 let detailReturnPoint: ViewReturnPoint | null = null
@@ -437,6 +422,7 @@ let stickyColumnZone: string | null = null
 let pendingSpatialInteractionId: number | null = null
 let deferredImageLoads = 0
 let deferredImageScheduleHandle: number | null = null
+const LIBRARY_SYNC_IDLE_DELAY_MS = 10_000
 const spatialLayoutCache = createSpatialLayoutCache<HTMLElement, NavigationLayout>()
 const frameNavigation = createFrameNavigationScheduler(
   (direction) => {
@@ -482,25 +468,11 @@ const knownStreams = new Map<string, StreamItem>()
 const streamCache = new Map<string, CachedStreams>()
 const sectionCategories = new Map<LibrarySection, Category[]>()
 const adultCategoryIds = new Map<LibrarySection, Set<string>>()
-const nowNextCache = new Map<string, NowNext>()
-const nowNextLoading = new Map<string, AbortController>()
-const globalSearchResultCache = new LruTtlCache<StreamItem[]>(
-  GLOBAL_SEARCH_RESULT_CACHE_MAX_ENTRIES,
-  GLOBAL_SEARCH_RESULT_CACHE_TTL_MS,
+const nowNextCache = new LruTtlCache<NowNext>(
+  MAX_NOW_NEXT_ENTRIES,
+  NOW_NEXT_CACHE_TTL_MS,
 )
-const completeSearchCatalogs = new Map<LibrarySection, CompleteSearchCatalog>()
-const completeSearchCatalogQueue = new SearchCatalogWarmQueue<LibrarySection>({
-  retryDelayMs: COMPLETE_SEARCH_CATALOG_RETRY_DELAY_MS,
-  load: loadCompleteSearchCatalog,
-  onStateChange: (section, state) => {
-    performanceTrace.event('cache', 'global-search-catalog-state', {
-      section,
-      state,
-      catalogItemCount: completeSearchCatalogItemCount(),
-    })
-  },
-})
-
+const nowNextLoading = new Map<string, AbortController>()
 if (profile && repairResumeEpisodeContexts()) {
   saveResume(profile.id, resumeEntries)
 }
@@ -900,120 +872,6 @@ function cachedStreamsForSection(section: LibrarySection): StreamItem[] {
   return [...streams.values()]
 }
 
-function globalSearchCacheKey(query: string): string {
-  return `${settings.hideAdultContent ? 'hide-adult' : 'show-adult'}:${normalizeQuery(query)}`
-}
-
-function clearGlobalSearchResultCache(): void {
-  globalSearchResultCache.clear()
-}
-
-function completeSearchCatalogItemCount(): number {
-  let count = 0
-
-  completeSearchCatalogs.forEach((catalog) => {
-    count += catalog.streams.length
-  })
-
-  return count
-}
-
-function pruneExpiredCompleteSearchCatalogs(now = Date.now()): number {
-  let removed = 0
-
-  completeSearchCatalogs.forEach((catalog, section) => {
-    if (now - catalog.updatedAt > COMPLETE_SEARCH_CATALOG_TTL_MS) {
-      completeSearchCatalogs.delete(section)
-      completeSearchCatalogQueue.invalidate(section)
-      removed += 1
-      performanceTrace.event('cache', 'global-search-catalog-expired', { section })
-    }
-  })
-
-  return removed
-}
-
-function cachedCompleteSearchCatalog(section: LibrarySection): StreamItem[] | null {
-  pruneExpiredCompleteSearchCatalogs()
-  return completeSearchCatalogs.get(section)?.streams ?? null
-}
-
-function clearCompleteSearchCatalogs(): void {
-  completeSearchCatalogQueue.clear()
-  completeSearchCatalogs.clear()
-}
-
-function pauseCompleteSearchCatalogWarming(reason: string): void {
-  completeSearchCatalogQueue.cancel()
-  performanceTrace.event('search', 'global-search-catalog-warm-paused', { reason })
-}
-
-async function loadCompleteSearchCatalog(
-  section: LibrarySection,
-  signal: AbortSignal,
-): Promise<'complete' | 'oversized'> {
-  const activeClient = client
-
-  if (!activeClient) {
-    throw new Error('No active IPTV provider.')
-  }
-
-  const startedAt = Date.now()
-  performanceTrace.event('search', 'global-search-catalog-warm-start', { section })
-
-  // Only fetch category metadata while it is needed to enforce the adult
-  // category filter. In the normal visible-content mode, catalog warming stays
-  // to one provider-wide stream request.
-  if (settings.hideAdultContent && !sectionCategories.has(section)) {
-    const categories = await activeClient.categories(section, signal)
-
-    if (signal.aborted || activeClient !== client) {
-      throw new Error('Catalog warming was cancelled.')
-    }
-
-    rememberCategories(section, categories)
-  }
-
-  // A blank query matches every valid record. Unlike streams(), this keeps the
-  // provider response incremental, yields between parser slices, and stops as
-  // soon as the bounded catalog limit proves retention is unsafe on a TV.
-  const streams = await activeClient.searchStreams(section, '', {
-    signal,
-    limit: MAX_COMPLETE_SEARCH_CATALOG_SECTION_ITEMS + 1,
-    matchAll: true,
-  })
-
-  if (signal.aborted || activeClient !== client) {
-    throw new Error('Catalog warming was cancelled.')
-  }
-
-  pruneExpiredCompleteSearchCatalogs()
-  const cachedItemCount = completeSearchCatalogItemCount()
-  const canStore =
-    streams.length <= MAX_COMPLETE_SEARCH_CATALOG_SECTION_ITEMS &&
-    cachedItemCount + streams.length <= MAX_COMPLETE_SEARCH_CATALOG_ITEMS
-
-  if (!canStore) {
-    performanceTrace.event('cache', 'global-search-catalog-skip-oversized', {
-      section,
-      itemCount: streams.length,
-      cachedItemCount,
-      durationMs: Date.now() - startedAt,
-    })
-    return 'oversized'
-  }
-
-  completeSearchCatalogs.set(section, { streams, updatedAt: Date.now() })
-  performanceTrace.event('cache', 'global-search-catalog-write', {
-    section,
-    itemCount: streams.length,
-    cacheEntries: completeSearchCatalogs.size,
-    totalItemCount: completeSearchCatalogItemCount(),
-    durationMs: Date.now() - startedAt,
-  })
-  return 'complete'
-}
-
 function isAppHistoryState(value: unknown): value is AppHistoryState {
   return (
     typeof value === 'object' &&
@@ -1072,16 +930,10 @@ function startNavigation(): { token: number; signal: AbortSignal } {
     nextNavigationToken: navigationToken + 1,
   })
 
-  if (view === 'search') {
-    stopGlobalSearchWork()
-  }
-
   navigationToken += 1
   navigationController?.abort()
-  nowNextPrefetchController?.abort()
   nowNextLoading.clear()
   navigationController = new AbortController()
-  nowNextPrefetchController = null
   return { token: navigationToken, signal: navigationController.signal }
 }
 
@@ -1156,18 +1008,7 @@ function searchText(stream: StreamItem): string {
 }
 
 function cacheNowNext(key: string, value: NowNext): void {
-  nowNextCache.delete(key)
   nowNextCache.set(key, value)
-
-  while (nowNextCache.size > MAX_NOW_NEXT_ENTRIES) {
-    const oldestKey = nowNextCache.keys().next().value
-
-    if (!oldestKey) {
-      break
-    }
-
-    nowNextCache.delete(oldestKey)
-  }
 }
 
 function streamFromKey(key: string | undefined): StreamItem | null {
@@ -1471,7 +1312,7 @@ function renderLogin(): void {
       }
 
       const { token, signal } = startNavigation()
-      const nextClient = new XtreamClient(nextProfile)
+      const nextClient = new ProviderBroker(nextProfile)
       const nextAccount = await nextClient.validate(signal)
 
       if (!isCurrentNavigation(token)) {
@@ -1632,9 +1473,6 @@ function renderCatalog(): void {
     scheduleCatalogSearch,
   )
 
-  if (catalog.section === 'live' && catalog.category !== null) {
-    prefetchNowNext(pageStreams)
-  }
 }
 
 // Wire a search input so it filters on debounced input but ignores events that
@@ -2481,7 +2319,6 @@ function renderGuide(): void {
     </section>
   `)
 
-  prefetchNowNext(guideStreams)
 }
 
 function globalSearchResultsForSection(section: LibrarySection): StreamItem[] {
@@ -2531,9 +2368,7 @@ function globalSearchSectionContent(section: LibrarySection): string {
       ${
         visibleResults.length
           ? visibleResults.map(globalSearchCard).join('')
-          : globalSearchLoading
-            ? '<div class="spinner"></div><span>Looking in this library…</span>'
-            : 'No results'
+          : '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Refresh library before searching this section.</p></div>'
       }
     </div>
   `
@@ -2558,8 +2393,7 @@ function renderGlobalSearchResults(): string {
 function globalSearchControlsContent(): string {
   return `
     ${globalSearchQuery ? '<button class="secondary-button" data-action="clear-global-search" data-focus-id="global-search-clear">Clear</button>' : ''}
-    ${globalSearchLoading ? '<button class="secondary-button" data-action="cancel-global-search" data-focus-id="global-search-cancel">Cancel</button>' : ''}
-    <button class="primary-button" data-action="run-global-search" data-focus-id="global-search-run">Search</button>
+    <button class="primary-button" data-action="run-global-search" data-focus-id="global-search-run">Search local library</button>
   `
 }
 
@@ -2612,13 +2446,8 @@ function updateGlobalSearchSection(section: LibrarySection): void {
 
   if (!visibleResults.length) {
     content.className = 'global-search-empty'
-    content.textContent = ''
-
-    if (globalSearchLoading) {
-      content.innerHTML = '<div class="spinner"></div><span>Looking in this library…</span>'
-    } else {
-      content.textContent = 'No results'
-    }
+    content.innerHTML =
+      '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Refresh library before searching this section.</p></div>'
     return
   }
 
@@ -2691,90 +2520,11 @@ function updateGlobalSearchView(update: GlobalSearchViewUpdate = {}): void {
 }
 
 function globalSearchIsActive(): boolean {
-  return (
-    globalSearchSession?.phase === 'debouncing' ||
-    globalSearchSession?.phase === 'searching'
-  )
-}
-
-function isCurrentGlobalSearchSession(session: GlobalSearchSession): boolean {
-  return (
-    globalSearchSession === session &&
-    view === 'search' &&
-    !session.controller.signal.aborted &&
-    (session.phase === 'debouncing' || session.phase === 'searching')
-  )
-}
-
-function stopGlobalSearchWork(): void {
-  if (globalSearchDebounceTimer !== null) {
-    window.clearTimeout(globalSearchDebounceTimer)
-    globalSearchDebounceTimer = null
-  }
-
-  const session = globalSearchSession
-
-  if (!session) {
-    return
-  }
-
-  if (session.renderTimer !== null) {
-    window.clearTimeout(session.renderTimer)
-    session.renderTimer = null
-  }
-
-  session.controller.abort()
-}
-
-function startGlobalSearchSession(query: string, phase: GlobalSearchPhase): GlobalSearchSession {
-  stopGlobalSearchWork()
-  const session: GlobalSearchSession = {
-    id: globalSearchSequence + 1,
-    query,
-    controller: new AbortController(),
-    phase,
-    dirtySections: new Set(),
-    renderTimer: null,
-  }
-  globalSearchSequence = session.id
-  globalSearchSession = session
-  return session
-}
-
-function scheduleGlobalSearchRender(
-  session: GlobalSearchSession,
-  sections: Iterable<LibrarySection>,
-): void {
-  if (!isCurrentGlobalSearchSession(session)) {
-    return
-  }
-
-  for (const section of sections) {
-    session.dirtySections.add(section)
-  }
-
-  if (session.renderTimer !== null) {
-    return
-  }
-
-  session.renderTimer = window.setTimeout(() => {
-    session.renderTimer = null
-
-    if (!isCurrentGlobalSearchSession(session) || !session.dirtySections.size) {
-      return
-    }
-
-    const dirtySections = [...session.dirtySections]
-    session.dirtySections.clear()
-    updateGlobalSearchView({ controls: false, fullResults: false, sections: dirtySections })
-  }, GLOBAL_SEARCH_RENDER_INTERVAL_MS)
+  return false
 }
 
 function clearGlobalSearch(): void {
   const input = document.querySelector<HTMLInputElement>('#global-search-input')
-
-  stopGlobalSearchWork()
-  globalSearchSession = null
 
   if (input) {
     input.value = ''
@@ -2783,7 +2533,6 @@ function clearGlobalSearch(): void {
 
   globalSearchQuery = ''
   globalSearchResults = []
-  globalSearchLoading = false
   globalSearchStatus = ''
   expandedGlobalSearchSections.clear()
   updateGlobalSearchView({ controls: true, fullResults: true })
@@ -2791,29 +2540,12 @@ function clearGlobalSearch(): void {
 }
 
 function cancelGlobalSearch(): boolean {
-  const session = globalSearchSession
-
-  if (!session || !globalSearchIsActive()) {
-    return false
-  }
-
-  stopGlobalSearchWork()
-  session.phase = 'cancelled'
-  globalSearchLoading = false
-  globalSearchStatus = globalSearchResults.length
-    ? `${globalSearchResults.length} results · Search stopped`
-    : 'Search stopped'
-  updateGlobalSearchView({ controls: true, fullResults: false, sections: GLOBAL_SEARCH_SECTIONS })
-  document.querySelector<HTMLInputElement>('#global-search-input')?.focus({ preventScroll: true })
-  return true
+  return false
 }
 
 function leaveGlobalSearch(): void {
-  stopGlobalSearchWork()
-  globalSearchSession = null
   globalSearchQuery = ''
   globalSearchResults = []
-  globalSearchLoading = false
   globalSearchStatus = ''
   expandedGlobalSearchSections.clear()
   view =
@@ -2860,14 +2592,8 @@ function localGlobalSearchMatches(query: string): StreamItem[] {
 function scheduleGlobalSearch(query: string): void {
   const normalizedQuery = query.trim()
 
-  // The remote's on-screen keyboard emits an input event for every character.
-  // Keep that path entirely local so typing a title cannot become a burst of
-  // whole-library provider requests. Search/Enter submits the final query.
-  stopGlobalSearchWork()
-  globalSearchSession = null
   globalSearchQuery = query
   expandedGlobalSearchSections.clear()
-  globalSearchLoading = false
   globalSearchResults =
     normalizedQuery.length >= MIN_GLOBAL_SEARCH_LENGTH
       ? localGlobalSearchMatches(normalizedQuery)
@@ -2876,12 +2602,12 @@ function scheduleGlobalSearch(query: string): void {
   if (!normalizedQuery) {
     globalSearchStatus = ''
   } else if (normalizedQuery.length < MIN_GLOBAL_SEARCH_LENGTH) {
-    globalSearchStatus = `Type at least ${MIN_GLOBAL_SEARCH_LENGTH} characters, then press Search.`
+    globalSearchStatus = `Type at least ${MIN_GLOBAL_SEARCH_LENGTH} characters to search your downloaded library.`
   } else {
     const localCount = globalSearchResults.length
     globalSearchStatus = localCount
-      ? `${localCount} local result${localCount === 1 ? '' : 's'} · Press Search to check the provider.`
-      : 'Press Search to check the provider.'
+      ? `${localCount} local result${localCount === 1 ? '' : 's'}`
+      : 'Library not downloaded yet — Refresh library.'
   }
 
   updateGlobalSearchView({ controls: true, fullResults: true })
@@ -3292,6 +3018,8 @@ function renderPlayer(): void {
 
   function startNextAttempt(): void {
     clearPlaybackWatchdog()
+    setLibraryPlaybackStarting(true)
+    markFlatSnapshotPlaybackStarting()
     activeAttemptGeneration += 1
     cleanupActiveTransport()
 
@@ -3300,6 +3028,8 @@ function renderPlayer(): void {
 
     if (!attempt) {
       activeAttempt = null
+      setLibraryPlaybackStarting(false)
+      markFlatSnapshotPlaybackFailed()
       performanceTrace.endInteraction(playbackInteractionId, 'playback-failed', {
         attempts: playbackFailures.length,
       })
@@ -3784,6 +3514,8 @@ function renderPlayer(): void {
     }
 
     visiblePlaybackConfirmed = true
+    setLibraryPlaybackStarting(false)
+    markFlatSnapshotPlaybackReady()
     performanceTrace.endInteraction(playbackInteractionId, 'playback-ready', {
       engine: activeAttempt?.engine ?? 'unknown',
       attemptIndex: nextAttemptIndex,
@@ -4597,7 +4329,8 @@ async function handleAction(element: HTMLElement): Promise<void> {
 
     playerReturnPoint = captureReturnPoint()
     pushRouteHistory()
-    pauseCompleteSearchCatalogWarming('catchup-playback-start')
+    cancelScheduledCatalogSync()
+    catalogSync?.cancel()
     startNavigation()
     playerCleanup?.()
     playerCleanup = null
@@ -4739,11 +4472,12 @@ async function handleAction(element: HTMLElement): Promise<void> {
   if (action === 'add-profile') {
     pushRouteHistory()
     startNavigation()
+    cancelScheduledCatalogSync()
+    catalogSync?.cancel()
     clearProfile()
-    clearGlobalSearchResultCache()
-    clearCompleteSearchCatalogs()
     profile = null
     client = null
+    catalogSync = null
     account = null
     favorites = new Map()
     resumeEntries = new Map()
@@ -4812,7 +4546,8 @@ async function openSection(section: LibrarySection): Promise<void> {
   renderLoading(`Loading ${labels[section].toLowerCase()}…`)
 
   try {
-    const categories = await activeClient.categories(section, signal)
+    const categories =
+      sectionCategories.get(section) ?? await activeClient.categories(section, signal)
 
     if (!isCurrentNavigation(token)) {
       return
@@ -5240,371 +4975,30 @@ function globalSearchResultCount(results: StreamItem[], section: LibrarySection)
   )
 }
 
-function yieldGlobalSearchWork(): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, 0))
-}
-
-async function addSearchMatchesCooperatively(
-  results: StreamItem[],
-  knownKeys: Set<string>,
-  streams: StreamItem[],
-  query: string,
-  signal: AbortSignal,
-): Promise<boolean> {
-  let added = false
-  let sliceStartedAt = Date.now()
-  const tokens = queryTokens(query)
-
-  for (const stream of streams) {
-    if (signal.aborted) {
-      return added
-    }
-
-    if (
-      stream.streamType !== 'episode' &&
-      globalSearchResultCount(results, stream.section) < GLOBAL_SEARCH_SECTION_RESULT_LIMIT
-    ) {
-      const key = streamLookupKey(stream)
-
-      if (!knownKeys.has(key) && matchesQuery(searchText(stream), tokens) && visibleStream(stream)) {
-        knownKeys.add(key)
-        results.push(stream)
-        added = true
-      }
-    }
-
-    if (Date.now() - sliceStartedAt >= GLOBAL_SEARCH_WORK_SLICE_MS) {
-      await yieldGlobalSearchWork()
-
-      if (signal.aborted) {
-        return added
-      }
-
-      sliceStartedAt = Date.now()
-    }
-  }
-
-  return added
-}
-
-function appendGlobalSearchMatches(
-  session: GlobalSearchSession,
-  results: StreamItem[],
-  knownKeys: Set<string>,
-  section: LibrarySection,
-  matches: StreamItem[],
-): boolean {
-  if (!isCurrentGlobalSearchSession(session)) {
-    return false
-  }
-
-  const visibleMatches = matches.filter(
-    (stream) => visibleStream(stream) && stream.streamType !== 'episode',
-  )
-  rememberStreams(visibleMatches)
-
-  let added = false
-
-  for (const stream of visibleMatches) {
-    if (globalSearchResultCount(results, section) >= GLOBAL_SEARCH_SECTION_RESULT_LIMIT) {
-      break
-    }
-
-    const key = streamLookupKey(stream)
-
-    if (!knownKeys.has(key)) {
-      knownKeys.add(key)
-      results.push(stream)
-      added = true
-    }
-  }
-
-  if (added) {
-    globalSearchResults = results
-    scheduleGlobalSearchRender(session, [section])
-  }
-
-  return added
-}
-
-function globalSearchSectionOrder(query: string): LibrarySection[] {
-  const tokens = queryTokens(query)
-
-  return [...GLOBAL_SEARCH_SECTIONS]
-    .map((section, index) => ({
-      section,
-      index,
-      localMatches: cachedStreamsForSection(section).filter(
-        (stream) =>
-          stream.streamType !== 'episode' &&
-          visibleStream(stream) &&
-          matchesQuery(searchText(stream), tokens),
-      ).length,
-    }))
-    .sort((left, right) => right.localMatches - left.localMatches || left.index - right.index)
-    .map(({ section }) => section)
-}
-
-async function searchGlobalSection(
-  activeClient: XtreamClient,
-  session: GlobalSearchSession,
-  section: LibrarySection,
-  query: string,
-  results: StreamItem[],
-  resultKeys: Set<string>,
-): Promise<GlobalSearchSectionOutcome> {
-  const { signal } = session.controller
-  const completeCatalog = cachedCompleteSearchCatalog(section)
-
-  if (completeCatalog) {
-    const added = await addSearchMatchesCooperatively(
-      results,
-      resultKeys,
-      completeCatalog,
-      query,
-      signal,
-    )
-
-    if (!isCurrentGlobalSearchSession(session)) {
-      return { authoritative: false, cacheable: false }
-    }
-
-    if (added) {
-      globalSearchResults = results
-      scheduleGlobalSearchRender(session, [section])
-    }
-
-    performanceTrace.event('search', 'global-search-catalog-hit', {
-      section,
-      catalogItemCount: completeCatalog.length,
-    })
-    return { authoritative: true, cacheable: true }
-  }
-
-  if (isProviderSearchBlocked(providerSearchBlock)) {
-    return { authoritative: false, cacheable: false, partial: true, blocked: true }
-  }
-
-  try {
-    const matches = await activeClient.searchStreams(section, query, {
-      signal,
-      responseTimeoutMs: GLOBAL_SEARCH_RESPONSE_TIMEOUT_MS,
-      timeoutMs: GLOBAL_SEARCH_SCAN_TIMEOUT_MS,
-      limit: Math.max(
-        1,
-        GLOBAL_SEARCH_SECTION_RESULT_LIMIT - globalSearchResultCount(results, section),
-      ),
-      excludeCategoryIds: settings.hideAdultContent
-        ? adultCategoryIds.get(section)
-        : undefined,
-      onMatches: (batch) => {
-        appendGlobalSearchMatches(session, results, resultKeys, section, batch)
-      },
-    })
-
-    if (!isCurrentGlobalSearchSession(session)) {
-      return { authoritative: false, cacheable: false }
-    }
-
-    appendGlobalSearchMatches(session, results, resultKeys, section, matches)
-    return { authoritative: true, cacheable: true }
-  } catch (reason) {
-    if (!isCurrentGlobalSearchSession(session)) {
-      return { authoritative: false, cacheable: false }
-    }
-
-    const block = providerSearchBlockForFailure(reason)
-
-    if (block) {
-      providerSearchBlock = block
-      performanceTrace.event('search', 'global-search-provider-blocked', {
-        kind: block.kind,
-        permanent: block.until === null,
-      })
-      return { authoritative: false, cacheable: false, partial: true, blocked: true }
-    }
-
-    // Do not turn one stalled whole-library scan into a category crawl. That
-    // amplification is what previously caused provider bans. Keep already
-    // streamed matches, mark them partial, and require a paced explicit retry.
-    performanceTrace.event('search', 'global-search-section-partial', { section })
-    return { authoritative: false, cacheable: false, partial: true }
-  }
-}
-
-async function runGlobalSearch(session?: GlobalSearchSession): Promise<void> {
-  const activeClient = client
-
-  if (!activeClient) {
-    return
-  }
-
+async function runGlobalSearch(): Promise<void> {
   const searchInput = document.querySelector<HTMLInputElement>('#global-search-input')
   const requestedQuery = (searchInput?.value ?? globalSearchQuery).trim()
 
   if (requestedQuery.length < MIN_GLOBAL_SEARCH_LENGTH) {
-    globalSearchStatus = `Type at least ${MIN_GLOBAL_SEARCH_LENGTH} characters, then press Search.`
-    updateGlobalSearchView({ controls: true, fullResults: false, sections: GLOBAL_SEARCH_SECTIONS })
-    return
-  }
-
-  if (providerSearchBlock && !isProviderSearchBlocked(providerSearchBlock)) {
-    providerSearchBlock = null
-  }
-
-  const providerBlockMessage = providerSearchBlockMessage(providerSearchBlock)
-
-  if (providerBlockMessage) {
-    globalSearchResults = localGlobalSearchMatches(requestedQuery)
-    globalSearchLoading = false
-    globalSearchStatus = providerBlockMessage
+    globalSearchResults = []
+    globalSearchStatus =
+      `Type at least ${MIN_GLOBAL_SEARCH_LENGTH} characters to search your downloaded library.`
     updateGlobalSearchView({ controls: true, fullResults: true })
-    return
-  }
-
-  const cacheKey = globalSearchCacheKey(requestedQuery)
-  const retryAfter = globalSearchRetryAfterByQuery.get(cacheKey)
-
-  if (retryAfter && retryAfter > Date.now()) {
-    globalSearchResults = localGlobalSearchMatches(requestedQuery)
-    globalSearchLoading = false
-    globalSearchStatus = 'Partial results · Provider search is cooling down before another attempt.'
-    updateGlobalSearchView({ controls: true, fullResults: true })
-    return
-  }
-
-  globalSearchRetryAfterByQuery.delete(cacheKey)
-  const activeSession = session ?? startGlobalSearchSession(requestedQuery, 'searching')
-
-  performanceTrace.event('search', 'global-search-start', {
-    resumed: Boolean(session),
-    queryLength: requestedQuery.length,
-    cacheHit: false,
-  })
-
-  if (!isCurrentGlobalSearchSession(activeSession)) {
-    return
-  }
-
-  const cachedResults = globalSearchResultCache.get(cacheKey)
-
-  if (cachedResults) {
-    const results = [...cachedResults]
-    rememberStreams(results)
-    globalSearchLoading = false
-    globalSearchResults = results
-    globalSearchStatus = results.length
-      ? `${results.length} result${results.length === 1 ? '' : 's'}`
-      : 'No results'
-    activeSession.phase = 'completed'
-    performanceTrace.event('cache', 'global-search-result-hit', {
-      resultCount: results.length,
-    })
-    performanceTrace.event('search', 'global-search-complete', {
-      cacheHit: true,
-      resultCount: results.length,
-      liveCount: globalSearchResultCount(results, 'live'),
-      vodCount: globalSearchResultCount(results, 'vod'),
-      seriesCount: globalSearchResultCount(results, 'series'),
-    })
-    updateGlobalSearchView({
-      controls: true,
-      fullResults: false,
-      sections: GLOBAL_SEARCH_SECTIONS,
-    })
     return
   }
 
   globalSearchQuery = requestedQuery
   globalSearchResults = localGlobalSearchMatches(requestedQuery)
-  globalSearchLoading = true
-  globalSearchStatus = 'Searching the provider…'
   expandedGlobalSearchSections.clear()
+  const resultCount = globalSearchResults.length
+  globalSearchStatus = resultCount
+    ? `${resultCount} local result${resultCount === 1 ? '' : 's'}`
+    : 'Library not downloaded yet — Refresh library.'
+  performanceTrace.event('search', 'global-search-local-complete', {
+    queryLength: requestedQuery.length,
+    resultCount,
+  })
   updateGlobalSearchView({ controls: true, fullResults: true })
-
-  performanceTrace.event('cache', 'global-search-result-miss')
-  const query = foldText(activeSession.query)
-  const results = [...globalSearchResults]
-  const resultKeys = new Set(results.map(streamLookupKey))
-  const outcomes: GlobalSearchSectionOutcome[] = []
-
-  // Only one provider request is active at a time. If a section stalls or the
-  // provider refuses traffic, stop immediately instead of multiplying requests
-  // across sections or category fallbacks.
-  for (const section of globalSearchSectionOrder(query)) {
-    if (!isCurrentGlobalSearchSession(activeSession)) {
-      return
-    }
-
-    let outcome: GlobalSearchSectionOutcome
-
-    try {
-      outcome = await searchGlobalSection(
-        activeClient,
-        activeSession,
-        section,
-        query,
-        results,
-        resultKeys,
-      )
-    } catch {
-      outcome = { authoritative: false, cacheable: false, partial: true }
-    }
-
-    outcomes.push(outcome)
-
-    if (outcome.partial || outcome.blocked) {
-      break
-    }
-  }
-
-  if (!isCurrentGlobalSearchSession(activeSession)) {
-    return
-  }
-
-  globalSearchLoading = false
-  globalSearchResults = results
-  activeSession.phase = 'completed'
-  const fullyAuthoritative =
-    outcomes.length === GLOBAL_SEARCH_SECTIONS.length &&
-    outcomes.every((outcome) => outcome.authoritative)
-  const partial = !fullyAuthoritative
-  const blockedMessage = providerSearchBlockMessage(providerSearchBlock)
-
-  if (fullyAuthoritative) {
-    globalSearchResultCache.set(cacheKey, [...results])
-    performanceTrace.event('cache', 'global-search-result-write', {
-      resultCount: results.length,
-      cacheEntries: globalSearchResultCache.size,
-    })
-  } else {
-    globalSearchRetryAfterByQuery.set(cacheKey, Date.now() + GLOBAL_SEARCH_RETRY_COOLDOWN_MS)
-  }
-
-  globalSearchStatus = blockedMessage
-    ? blockedMessage
-    : partial
-      ? `${results.length} partial result${results.length === 1 ? '' : 's'} · Search stopped to protect your provider account.`
-      : results.length
-        ? `${results.length} result${results.length === 1 ? '' : 's'}`
-        : 'No results'
-
-  performanceTrace.event('search', 'global-search-complete', {
-    cacheHit: false,
-    cacheable: fullyAuthoritative,
-    fullyAuthoritative,
-    partial,
-    sectionsScanned: outcomes.length,
-    resultCount: results.length,
-    liveCount: globalSearchResultCount(results, 'live'),
-    vodCount: globalSearchResultCount(results, 'vod'),
-    seriesCount: globalSearchResultCount(results, 'series'),
-  })
-  updateGlobalSearchView({
-    controls: true,
-    fullResults: false,
-    sections: GLOBAL_SEARCH_SECTIONS,
-  })
 }
 
 async function loadLiveDetails(stream: StreamItem): Promise<void> {
@@ -5616,20 +5010,32 @@ async function loadLiveDetails(stream: StreamItem): Promise<void> {
     return
   }
 
-  const [nowNext] = await Promise.allSettled([activeClient.nowNext(stream.id, signal)])
   const panel = document.querySelector<HTMLElement>('#now-next-panel')
 
-  if (
-    isCurrentNavigation(token) &&
-    selectedItem === stream &&
-    panel &&
-    nowNext.status === 'fulfilled'
-  ) {
-    cacheNowNext(streamLookupKey(stream), nowNext.value)
-    panel.innerHTML = renderNowNext(nowNext.value)
+  if (!panel) {
+    return
   }
 
-  await showEpg(stream, false, token, signal)
+  const cacheKey = streamLookupKey(stream)
+  const cached = nowNextCache.get(cacheKey)
+
+  if (cached) {
+    panel.innerHTML = renderNowNext(cached)
+    return
+  }
+
+  try {
+    const nowNext = await activeClient.nowNext(stream.id, signal)
+
+    if (isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
+      cacheNowNext(cacheKey, nowNext)
+      panel.innerHTML = renderNowNext(nowNext)
+    }
+  } catch {
+    if (isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
+      panel.innerHTML = ''
+    }
+  }
 }
 
 function renderNowNext(nowNext: NowNext): string {
@@ -5699,83 +5105,10 @@ function renderEpg(stream: StreamItem, programs: Program[], showCatchupActions: 
   `
 }
 
-async function prefetchNowNext(streams: StreamItem[]): Promise<void> {
-  const activeClient = client
-  const token = navigationToken
-
-  if (!activeClient || !isCurrentNavigation(token)) {
-    return
-  }
-
-  nowNextPrefetchController?.abort()
-  const controller = new AbortController()
-  nowNextPrefetchController = controller
-  const signal = controller.signal
-  const queue = streams.filter((stream) => {
-    const key = streamLookupKey(stream)
-    return !nowNextCache.has(key) && !nowNextLoading.has(key)
-  })
-  let cursor = 0
-
-  const worker = async (): Promise<void> => {
-    while (cursor < queue.length && !signal.aborted && isCurrentNavigation(token)) {
-      const stream = queue[cursor]
-      cursor += 1
-      const key = streamLookupKey(stream)
-      nowNextLoading.set(key, controller)
-
-      try {
-        const nowNext = await activeClient.nowNext(stream.id, signal)
-
-        if (!signal.aborted && isCurrentNavigation(token)) {
-          cacheNowNext(key, nowNext)
-          updateNowNextCard(key, nowNext)
-        }
-      } catch (reason) {
-        if (!signal.aborted) {
-          console.warn('Now/Next prefetch failed', stream.id, reason)
-        }
-        if (!signal.aborted && isCurrentNavigation(token)) {
-          updateNowNextCard(key, undefined)
-        }
-      } finally {
-        if (nowNextLoading.get(key) === controller) {
-          nowNextLoading.delete(key)
-        }
-      }
-    }
-  }
-
-  await Promise.all(
-    Array.from({ length: Math.min(NOW_NEXT_CONCURRENCY, queue.length) }, () => worker()),
-  )
-}
-
-function updateNowNextCard(key: string, nowNext?: NowNext): void {
-  document
-    .querySelectorAll<HTMLElement>(`[data-now-next-key="${cssEscape(key)}"]`)
-    .forEach((element) => {
-      element.textContent = nowNext?.now ? `Now: ${nowNext.now.title}` : 'Live channel'
-    })
-
-  document
-    .querySelectorAll<HTMLElement>(`[data-guide-now-key="${cssEscape(key)}"]`)
-    .forEach((element) => {
-      element.textContent = nowNext?.now?.title ?? 'Schedule unavailable'
-    })
-
-  document
-    .querySelectorAll<HTMLElement>(`[data-guide-next-key="${cssEscape(key)}"]`)
-    .forEach((element) => {
-      element.textContent = nowNext?.next?.title ?? 'Schedule unavailable'
-    })
-}
-
 function beginPlayback(item: StreamItem): void {
-  // Background catalog parsing must never compete with video startup on a TV.
-  // Completed catalog snapshots remain available and interrupted sections can
-  // be scheduled again by a later foreground search.
-  pauseCompleteSearchCatalogWarming('playback-start')
+  activeLibraryProbeController?.abort()
+  cancelScheduledCatalogSync()
+  catalogSync?.cancel()
 
   if (view !== 'player') {
     playerReturnPoint = captureReturnPoint()
@@ -5817,6 +5150,7 @@ function beginPlayback(item: StreamItem): void {
 }
 
 function closePlayer(): void {
+  setLibraryPlaybackStarting(false)
   cancelPlayerSeek()
   playerUiMode = 'immersive'
   const { token, signal } = startNavigation()
@@ -5862,6 +5196,7 @@ function closePlayer(): void {
   }
 
   render()
+  scheduleCatalogSync()
 }
 
 function togglePlayback(): void {
@@ -6205,7 +5540,6 @@ function saveCurrentSettings(): void {
   const hideAdult = document.querySelector<HTMLInputElement>('#setting-hide-adult')
   const parentalPin = document.querySelector<HTMLInputElement>('#setting-parental-pin')
 
-  const previousHideAdultContent = settings.hideAdultContent
   const nextHideAdultContent = hideAdult?.checked ?? settings.hideAdultContent
 
   if (
@@ -6233,20 +5567,120 @@ function saveCurrentSettings(): void {
     return
   }
 
-  if (previousHideAdultContent !== nextHideAdultContent) {
-    clearGlobalSearchResultCache()
-    clearCompleteSearchCatalogs()
-  }
-
   showToast('Settings saved.')
   renderSettings()
 }
 
-function activateProfile(nextProfile: XtreamProfile, nextClient?: XtreamClient): void {
-  providerSearchBlock = null
-  globalSearchRetryAfterByQuery.clear()
+function cancelScheduledCatalogSync(): void {
+  if (catalogSyncTimer !== null) {
+    window.clearTimeout(catalogSyncTimer)
+    catalogSyncTimer = null
+  }
+}
+
+function canRunCatalogSync(): boolean {
+  return Boolean(profile && client && catalogSync && view !== 'player' && !document.hidden)
+}
+
+function scheduleCatalogSync(delayMs = LIBRARY_SYNC_IDLE_DELAY_MS): boolean {
+  if (!canRunCatalogSync()) {
+    return false
+  }
+
+  cancelScheduledCatalogSync()
+  catalogSyncTimer = window.setTimeout(() => {
+    catalogSyncTimer = null
+    void runCatalogSync()
+  }, Math.max(0, delayMs))
+  return true
+}
+
+async function inspectCatalogSyncStorage(): Promise<CatalogSyncStorageInspection | null> {
+  const activeProfile = profile
+
+  if (!activeProfile) {
+    return null
+  }
+
+  const meta = await catalogRepository.getMeta(activeProfile.id)
+  const sections = {} as CatalogSyncStorageInspection['sections']
+
+  for (const section of CATALOG_SYNC_SECTIONS) {
+    const manifest = await catalogRepository.getManifest(activeProfile.id, section)
+    const categories = manifest?.categories ?? []
+    const checkpoint = meta?.sync.sections?.[section]
+
+    sections[section] = {
+      coverage: manifest?.coverage.state ?? 'none',
+      manifestCategoryCount: categories.length,
+      activeSnapshotCount: categories.reduce(
+        (total, category) => total + category.shardCount,
+        0,
+      ),
+      activeItemCount: categories.reduce(
+        (total, category) => total + category.itemCount,
+        0,
+      ),
+      checkpoint: {
+        wholeSectionFailureCount: checkpoint?.wholeSectionFailureCount ?? 0,
+        nextCategoryCursor: checkpoint?.nextCategoryCursor ?? 0,
+        lastAttemptAt: checkpoint?.lastAttemptAt ?? null,
+        lastSuccessAt: checkpoint?.lastSuccessAt ?? null,
+        lastFailureAt: checkpoint?.lastFailureAt ?? null,
+      },
+    }
+  }
+
+  return {
+    nextDueAt: meta?.nextDueAt ?? null,
+    failureCount: meta?.sync.failureCount ?? 0,
+    inProgress: meta?.sync.inProgress ?? false,
+    sections,
+  }
+}
+
+async function runCatalogSync() {
+  const activeProfile = profile
+  const activeSync = catalogSync
+
+  if (!activeProfile || !activeSync || view === 'player' || document.hidden) {
+    return null
+  }
+
+  performanceTrace.event('library', 'catalog-sync-start', {
+    profileId: activeProfile.id,
+  })
+
+  try {
+    const result = await activeSync.sync(activeProfile.id)
+    performanceTrace.event('library', 'catalog-sync-complete', {
+      profileId: activeProfile.id,
+      status: result.status,
+      requestCount: result.requestCount,
+    })
+
+    if (result.nextDueAt !== undefined && activeSync === catalogSync) {
+      scheduleCatalogSync(Math.max(0, result.nextDueAt - Date.now()))
+    }
+
+    return result
+  } catch {
+    performanceTrace.event('library', 'catalog-sync-failed', {
+      profileId: activeProfile.id,
+    })
+    return null
+  }
+}
+
+function activateProfile(nextProfile: XtreamProfile, nextClient?: ProviderBroker): void {
+  cancelScheduledCatalogSync()
+  catalogSync?.cancel()
+  clearLibraryMemoryCaches()
   profile = nextProfile
-  client = nextClient ?? new XtreamClient(nextProfile)
+  client = nextClient ?? new ProviderBroker(nextProfile)
+  catalogSync = new CatalogSyncCoordinator(client, catalogRepository, {
+    internalFaultDiagnostics: import.meta.env.VITE_ENABLE_LIBRARY_PROBE === 'true',
+  })
   settings = loadSettings(nextProfile.id)
   favorites = loadFavorites(nextProfile.id)
   resumeEntries = loadResume(nextProfile.id)
@@ -6269,12 +5703,11 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: XtreamClient):
   liveQueue = []
   guideStreams = []
   streamCache.clear()
-  clearGlobalSearchResultCache()
-  clearCompleteSearchCatalogs()
   sectionCategories.clear()
   adultCategoryIds.clear()
   knownStreams.clear()
   nowNextCache.clear()
+  scheduleCatalogSync()
 }
 
 async function refreshAccount(silent = false): Promise<void> {
@@ -7229,14 +6662,20 @@ window.addEventListener('resize', () => {
 })
 window.addEventListener('pagehide', () => {
   performanceTrace.event('lifecycle', 'pagehide')
-  pauseCompleteSearchCatalogWarming('pagehide')
   performanceTrace.disable()
   cancelPendingSpatialNavigation()
+  cancelScheduledCatalogSync()
+  catalogSync?.cancel()
   playerCleanup?.()
 })
 
 document.addEventListener('visibilitychange', () => {
   performanceTrace.event('lifecycle', document.hidden ? 'hidden' : 'visible')
+
+  if (document.hidden) {
+    cancelScheduledCatalogSync()
+    catalogSync?.cancel()
+  }
 
   if (document.hidden && view === 'player') {
     cancelPlayerSeek()
@@ -7244,6 +6683,180 @@ document.addEventListener('visibilitychange', () => {
   }
 })
 
+if (
+  import.meta.env.DEV ||
+  import.meta.env.VITE_ENABLE_LIBRARY_PROBE === 'true'
+) {
+  let lastLibraryProbeDatabaseName = ''
+
+  window.__NOVA_LIBRARY_PROBE__ = {
+    async run(options: CapabilityProbeRunOptions = {}) {
+      activeLibraryProbeController?.abort()
+      const controller = new AbortController()
+      activeLibraryProbeController = controller
+      lastLibraryProbeDatabaseName =
+        options.databaseName ??
+        `nova-play-capability-probe-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+      try {
+        return await runLibraryCapabilityProbe({
+          ...options,
+          signal: options.signal ?? controller.signal,
+          databaseName: lastLibraryProbeDatabaseName,
+          workerScriptUrl: options.workerScriptUrl ?? './library-capability-worker.js',
+        })
+      } finally {
+        if (activeLibraryProbeController === controller) {
+          activeLibraryProbeController = null
+        }
+      }
+    },
+    cancel() {
+      activeLibraryProbeController?.abort()
+    },
+    async cleanup() {
+      activeLibraryProbeController?.abort()
+
+      if (lastLibraryProbeDatabaseName) {
+        await deleteProbeDatabase(lastLibraryProbeDatabaseName)
+      }
+    },
+    catalogSync: {
+      schedule(delayMs = LIBRARY_SYNC_IDLE_DELAY_MS) {
+        return scheduleCatalogSync(delayMs)
+      },
+      run() {
+        cancelScheduledCatalogSync()
+        return runCatalogSync()
+      },
+      cancel() {
+        cancelScheduledCatalogSync()
+        catalogSync?.cancel()
+      },
+      isRunning() {
+        return catalogSync?.isRunning ?? false
+      },
+      inspectState() {
+        return inspectCatalogSyncStorage()
+      },
+      async resetForWholeSectionProbe() {
+        const activeProfile = profile
+
+        if (!activeProfile || catalogSync?.isRunning) {
+          return false
+        }
+
+        cancelScheduledCatalogSync()
+        await catalogRepository.deleteProfileCache(activeProfile.id)
+        clearLibraryMemoryCaches()
+
+        // This deliberately touches only the rebuildable cache profile. It does
+        // not call the broker or mutate its daily budget/refusal state.
+        return true
+      },
+      async clearFailedCheckpointsForProbe() {
+        const activeProfile = profile
+
+        if (!activeProfile || catalogSync?.isRunning) {
+          return false
+        }
+
+        const meta = await catalogRepository.getMeta(activeProfile.id)
+
+        if (!meta || meta.sync.inProgress) {
+          return false
+        }
+
+        const sections: NonNullable<typeof meta.sync.sections> = {}
+
+        for (const section of CATALOG_SYNC_SECTIONS) {
+          const current = meta.sync.sections?.[section]
+
+          if (current) {
+            sections[section] = {
+              ...current,
+              wholeSectionFailureCount: 0,
+              nextCategoryCursor: 0,
+            }
+          }
+        }
+
+        cancelScheduledCatalogSync()
+        await catalogRepository.putMeta(activeProfile.id, {
+          nextDueAt: undefined,
+          sync: {
+            ...meta.sync,
+            inProgress: false,
+            runId: undefined,
+            failureCount: 0,
+            sections,
+          },
+        })
+
+        // This only removes retry scheduling/checkpoints. It does not call the
+        // provider or alter the broker's daily counters or refusal state.
+        return true
+      },
+      inspectBudget() {
+        return client?.inspectBudget() ?? null
+      },
+      resetBudget() {
+        // This object is emitted only under the development/probe build guard
+        // below. ProviderBroker resets counters only and preserves any
+        // refusal/Retr-After block.
+        return client?.resetBudgetsForProbe() ?? null
+      },
+    },
+    flatSnapshot: {
+      async run(options = {}) {
+        activeLibraryProbeController?.abort()
+        const controller = new AbortController()
+        activeLibraryProbeController = controller
+
+        try {
+          return await runFlatSnapshotProbe({
+            ...options,
+            signal: options.signal ?? controller.signal,
+          })
+        } finally {
+          if (activeLibraryProbeController === controller) {
+            activeLibraryProbeController = null
+          }
+        }
+      },
+      inspect(databaseName, runId) {
+        return inspectFlatSnapshotRecovery(databaseName, runId)
+      },
+      cleanup(databaseName) {
+        return deleteFlatSnapshotDatabase(databaseName)
+      },
+      playback: {
+        arm(mode) {
+          return armFlatSnapshotPlaybackStartup(mode)
+        },
+        status() {
+          return snapshotFlatSnapshotPlaybackStartup()
+        },
+        reset() {
+          resetFlatSnapshotPlaybackStartup()
+        },
+        async startFromResume() {
+          const entry = continueWatching(resumeEntries).find(
+            (candidate) => Boolean(candidate.stream),
+          )
+
+          if (!entry?.stream) {
+            return false
+          }
+
+          beginPlayback(entry.stream)
+          return true
+        },
+      },
+    },
+  }
+}
+
 initializeAppHistory()
 render()
-void refreshAccount(true)
+scheduleCatalogSync()

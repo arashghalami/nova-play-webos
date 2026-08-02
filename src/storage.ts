@@ -8,12 +8,14 @@ import type {
 } from './types'
 import { foldText } from './search'
 import { performanceTrace } from './performance-trace'
+import type { ProviderErrorKind } from './provider-error'
 
 const ACTIVE_PROFILE_KEY = 'nova-play.profile'
 const PROFILES_KEY = 'nova-play.profiles'
 const SETTINGS_KEY = 'nova-play.settings'
 const LEGACY_FAVORITES_KEY = 'nova-play.favorites'
 const LEGACY_RESUME_KEY = 'nova-play.resume'
+const PROVIDER_ACCESS_KEY = 'nova-play.provider-access'
 const MAX_FAVORITES = 500
 const MAX_RESUME_ENTRIES = 100
 
@@ -31,6 +33,134 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
 export const STORAGE_FAILURE_MESSAGE =
   'This TV could not save that change because local storage is full or unavailable.'
+
+export type ProviderAccessState = {
+  /**
+   * Legacy date label retained for backwards-compatible storage inspection.
+   * New budget enforcement uses the unambiguous UTC `windowStartAt` boundary.
+   */
+  day: string
+  /**
+   * Deprecated shared counter. Legacy values are migrated once into
+   * `interactiveRequestCount`, never into the sync budget.
+   */
+  requestCount: number
+  windowStartAt: number
+  interactiveRequestCount: number
+  syncRequestCount: number
+  block: {
+    kind: ProviderErrorKind
+    until: number | null
+  } | null
+  failureCount: number
+  nextAttemptAt: number | null
+  updatedAt: number
+}
+
+const EMPTY_PROVIDER_ACCESS_STATE = (): ProviderAccessState => ({
+  day: '',
+  requestCount: 0,
+  windowStartAt: 0,
+  interactiveRequestCount: 0,
+  syncRequestCount: 0,
+  block: null,
+  failureCount: 0,
+  nextAttemptAt: null,
+  updatedAt: 0,
+})
+
+export function loadProviderAccessState(profileId: string): ProviderAccessState {
+  const allStates = readJson<Record<string, Partial<ProviderAccessState>>>(
+    PROVIDER_ACCESS_KEY,
+    {},
+  )
+  const saved = allStates[profileId]
+
+  if (!saved || typeof saved !== 'object') {
+    return EMPTY_PROVIDER_ACCESS_STATE()
+  }
+
+  const block =
+    saved.block &&
+    typeof saved.block === 'object' &&
+    typeof saved.block.kind === 'string' &&
+    (typeof saved.block.until === 'number' || saved.block.until === null)
+      ? {
+          kind: saved.block.kind as ProviderErrorKind,
+          until: saved.block.until,
+        }
+      : null
+
+  const legacyRequestCount =
+    typeof saved.requestCount === 'number' && Number.isFinite(saved.requestCount)
+      ? Math.max(0, Math.floor(saved.requestCount))
+      : 0
+  const legacyWindowStartAt = utcWindowStartForDay(
+    typeof saved.day === 'string' ? saved.day : '',
+  )
+
+  return {
+    day: typeof saved.day === 'string' ? saved.day : '',
+    requestCount: legacyRequestCount,
+    windowStartAt:
+      typeof saved.windowStartAt === 'number' && Number.isFinite(saved.windowStartAt)
+        ? Math.max(0, Math.floor(saved.windowStartAt))
+        : legacyWindowStartAt,
+    interactiveRequestCount:
+      typeof saved.interactiveRequestCount === 'number' &&
+      Number.isFinite(saved.interactiveRequestCount)
+        ? Math.max(0, Math.floor(saved.interactiveRequestCount))
+        : legacyRequestCount,
+    syncRequestCount:
+      typeof saved.syncRequestCount === 'number' && Number.isFinite(saved.syncRequestCount)
+        ? Math.max(0, Math.floor(saved.syncRequestCount))
+        : 0,
+    block,
+    failureCount:
+      typeof saved.failureCount === 'number' && Number.isFinite(saved.failureCount)
+        ? Math.max(0, Math.floor(saved.failureCount))
+        : 0,
+    nextAttemptAt:
+      typeof saved.nextAttemptAt === 'number' && Number.isFinite(saved.nextAttemptAt)
+        ? saved.nextAttemptAt
+        : null,
+    updatedAt:
+      typeof saved.updatedAt === 'number' && Number.isFinite(saved.updatedAt)
+        ? saved.updatedAt
+        : 0,
+  }
+}
+
+function utcWindowStartForDay(day: string): number {
+  const match = day.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+
+  if (!match) {
+    return 0
+  }
+
+  const timestamp = Date.UTC(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3]),
+  )
+
+  return Number.isFinite(timestamp) ? timestamp : 0
+}
+
+export function saveProviderAccessState(
+  profileId: string,
+  state: ProviderAccessState,
+): boolean {
+  const allStates = readJson<Record<string, ProviderAccessState>>(PROVIDER_ACCESS_KEY, {})
+  allStates[profileId] = state
+  return writeJson(PROVIDER_ACCESS_KEY, allStates)
+}
+
+export function clearProviderAccessState(profileId: string): void {
+  const allStates = readJson<Record<string, ProviderAccessState>>(PROVIDER_ACCESS_KEY, {})
+  delete allStates[profileId]
+  writeJson(PROVIDER_ACCESS_KEY, allStates)
+}
 
 export function favoriteKey(stream: StreamItem): string {
   return `${stream.section}:${stream.streamType ?? 'stream'}:${stream.id}`
@@ -88,6 +218,7 @@ export function removeProfile(profileId: string): void {
   saveProfiles(profiles.filter((profile) => profile.id !== profileId))
   removeStoredItem(favoritesKey(profileId))
   removeStoredItem(resumeKey(profileId))
+  clearProviderAccessState(profileId)
 
   const active = readJson<XtreamProfile | null>(ACTIVE_PROFILE_KEY, null)
 
@@ -345,7 +476,7 @@ function resumeKey(profileId: string): string {
   return `nova-play.resume.${profileId}`
 }
 
-function toStoredStream(stream: StreamItem): StreamItem {
+export function toStoredStream(stream: StreamItem): StreamItem {
   return {
     id: stream.id,
     name: stream.name,
@@ -525,7 +656,7 @@ function isProfile(value: unknown): value is XtreamProfile {
   )
 }
 
-function isStreamItem(value: unknown): value is StreamItem {
+export function isStreamItem(value: unknown): value is StreamItem {
   if (typeof value !== 'object' || value === null) {
     return false
   }

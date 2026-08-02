@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { XtreamProfile } from './types'
+import { performanceTrace } from './performance-trace'
 import { XtreamClient } from './xtream-client'
 
 const profile: XtreamProfile = {
@@ -16,6 +17,8 @@ describe('XtreamClient global search', () => {
   })
 
   afterEach(() => {
+    performanceTrace.disable()
+    performanceTrace.clear()
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
   })
@@ -96,6 +99,151 @@ describe('XtreamClient global search', () => {
     const streams = await client.searchStreams('vod', '', { limit: 2, matchAll: true })
 
     expect(streams.map((stream) => stream.id)).toEqual(['1', '2'])
+  })
+
+  it('scans a complete stream response incrementally without retaining a result array', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          { stream_id: '1', name: 'First title', category_id: 'movies' },
+          { stream_id: '2', name: 'Second title', category_id: 'shows' },
+        ]),
+        { status: 200 },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const received: string[] = []
+    const client = new XtreamClient(profile)
+
+    await expect(
+      client.scanSection('vod', {
+        responseTimeoutMs: 15_000,
+        timeoutMs: 120_000,
+        onMatches: (batch) => received.push(...batch.map((stream) => stream.id)),
+      }),
+    ).resolves.toBeUndefined()
+
+    expect(received).toEqual(['1', '2'])
+    const requestUrl = new URL(String(fetchMock.mock.calls[0][0]))
+    expect(requestUrl.searchParams.get('action')).toBe('get_vod_streams')
+    expect(requestUrl.searchParams.has('category_id')).toBe(false)
+  })
+
+  it('rejects a truncated whole-section response after incremental records were delivered', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        '[{"stream_id":"1","name":"First title","category_id":"movies"}',
+        { status: 200 },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const received: string[] = []
+    const client = new XtreamClient(profile)
+
+    await expect(
+      client.scanSection('vod', {
+        onMatches: (batch) => received.push(...batch.map((stream) => stream.id)),
+      }),
+    ).rejects.toMatchObject({ kind: 'invalid-response' })
+
+    expect(received).toEqual(['1'])
+  })
+
+  it('classifies complete-array failures without recording provider content', async () => {
+    const encoder = new TextEncoder()
+    const completeObject = '{"stream_id":"1","name":"Fixture","category_id":"movies"}'
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(`[${completeObject}`, { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode(`[${completeObject},`))
+              globalThis.setTimeout(
+                () => controller.error(new Error('fixture transport interruption')),
+                0,
+              )
+            },
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response('[{"stream_id":"1","name":"Fixture"', { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(`[${completeObject}${' '.repeat(128)}]`, { status: 200 }),
+      )
+    vi.stubGlobal('fetch', fetchMock)
+    performanceTrace.enable()
+    performanceTrace.clear()
+    const client = new XtreamClient(profile)
+
+    await expect(client.scanSection('vod')).rejects.toMatchObject({
+      kind: 'invalid-response',
+    })
+    await expect(client.scanSection('vod')).rejects.toMatchObject({ kind: 'network' })
+    await expect(client.scanSection('vod')).rejects.toMatchObject({
+      kind: 'invalid-response',
+    })
+    await expect(
+      client.scanSection('vod', { maxResponseBytes: 32 }),
+    ).rejects.toMatchObject({ kind: 'too-large' })
+
+    const terminalEvents = performanceTrace
+      .snapshot()
+      .events.filter((event) => event.name === 'xtream-catalog-scan-terminal')
+
+    expect(terminalEvents).toHaveLength(4)
+    expect(terminalEvents[0]).toMatchObject({
+      category: 'data',
+      data: {
+        status: 200,
+        recordsParsed: 1,
+        topLevelArrayClosed: false,
+        scanTimedOut: false,
+        scanSucceeded: false,
+        failureKind: 'invalid-response',
+        validationCondition: 'root-not-closed',
+      },
+    })
+    expect(terminalEvents[1]).toMatchObject({
+      data: {
+        status: 200,
+        recordsParsed: 1,
+        topLevelArrayClosed: false,
+        scanTimedOut: false,
+        scanSucceeded: false,
+        failureKind: 'network',
+        validationCondition: null,
+      },
+    })
+    expect(terminalEvents[2]).toMatchObject({
+      data: {
+        status: 200,
+        recordsParsed: 0,
+        topLevelArrayClosed: false,
+        scanTimedOut: false,
+        scanSucceeded: false,
+        failureKind: 'invalid-response',
+        validationCondition: 'object-not-closed',
+      },
+    })
+    expect(terminalEvents[3]).toMatchObject({
+      data: {
+        status: 200,
+        recordsParsed: 0,
+        topLevelArrayClosed: false,
+        scanTimedOut: false,
+        scanSucceeded: false,
+        failureKind: 'too-large',
+        validationCondition: null,
+      },
+    })
+    expect(JSON.stringify(terminalEvents)).not.toContain(profile.serverUrl)
+    expect(JSON.stringify(terminalEvents)).not.toContain(profile.username)
+    expect(JSON.stringify(terminalEvents)).not.toContain(profile.password)
   })
 
   it('matches accented titles and multi-term, order-independent queries', async () => {

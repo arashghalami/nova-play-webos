@@ -4,23 +4,22 @@ import {
   type ProviderErrorKind,
 } from './provider-error'
 
-export type ProviderSearchBlock = {
+export type ProviderAccessBlock = {
   kind: ProviderErrorKind
   until: number | null
 }
 
-export const DEFAULT_PROVIDER_SEARCH_COOLDOWN_MS = 5 * 60_000
+export const DEFAULT_PROVIDER_COOLDOWN_MS = 5 * 60_000
 
 /**
- * Global search must stop issuing requests as soon as a provider refuses one.
- * A profile-authentication refusal remains blocked until the profile changes;
- * other refusals use Retry-After when the provider supplies one, otherwise a
- * conservative local cooldown.
+ * Stops all provider traffic after a refusal. Authentication refusals remain
+ * blocked until the profile changes; other refusals use Retry-After when it is
+ * available, otherwise a conservative local cooldown.
  */
-export function providerSearchBlockForFailure(
+export function providerBlockForFailure(
   reason: unknown,
   now = Date.now(),
-): ProviderSearchBlock | null {
+): ProviderAccessBlock | null {
   if (!isProviderRefusal(reason) || !isProviderError(reason)) {
     return null
   }
@@ -32,8 +31,8 @@ export function providerSearchBlockForFailure(
   const retryAfterMs = reason.diagnostics.retryAfterMs
   const delayMs =
     retryAfterMs !== undefined
-      ? Math.max(DEFAULT_PROVIDER_SEARCH_COOLDOWN_MS, retryAfterMs)
-      : DEFAULT_PROVIDER_SEARCH_COOLDOWN_MS
+      ? Math.max(DEFAULT_PROVIDER_COOLDOWN_MS, retryAfterMs)
+      : DEFAULT_PROVIDER_COOLDOWN_MS
 
   return {
     kind: reason.kind,
@@ -41,26 +40,26 @@ export function providerSearchBlockForFailure(
   }
 }
 
-export function isProviderSearchBlocked(
-  block: ProviderSearchBlock | null,
+export function isProviderBlocked(
+  block: ProviderAccessBlock | null,
   now = Date.now(),
 ): boolean {
   return block !== null && (block.until === null || block.until > now)
 }
 
-export function providerSearchBlockMessage(
-  block: ProviderSearchBlock | null,
+export function providerBlockMessage(
+  block: ProviderAccessBlock | null,
   now = Date.now(),
 ): string | null {
-  if (!isProviderSearchBlocked(block, now) || !block) {
+  if (!isProviderBlocked(block, now) || !block) {
     return null
   }
 
   if (block.kind === 'auth') {
-    return 'Provider search is paused until you update this account.'
+    return 'Provider access is paused until you update this account.'
   }
 
   const remainingMinutes = Math.max(1, Math.ceil(((block.until ?? now) - now) / 60_000))
 
-  return `Provider search is paused for about ${remainingMinutes} minute${remainingMinutes === 1 ? '' : 's'} after a refusal.`
+  return `Provider access is paused for about ${remainingMinutes} minute${remainingMinutes === 1 ? '' : 's'} after a refusal.`
 }

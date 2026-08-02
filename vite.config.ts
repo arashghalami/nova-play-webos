@@ -2,8 +2,10 @@ import { writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { defineConfig } from 'vite'
 
-export default defineConfig(() => {
+export default defineConfig(({ mode }) => {
   const metadataProxyConfigured = Boolean(process.env.VITE_METADATA_PROXY_URL?.trim())
+  const libraryCapabilityProbeAvailable =
+    mode !== 'production' || process.env.VITE_ENABLE_LIBRARY_PROBE === 'true'
 
   return {
     base: './',
@@ -22,6 +24,7 @@ export default defineConfig(() => {
                 generatedAt: new Date().toISOString(),
                 metadataProxyConfigured,
                 performanceTracingAvailable: true,
+                libraryCapabilityProbeAvailable,
               },
               null,
               2,

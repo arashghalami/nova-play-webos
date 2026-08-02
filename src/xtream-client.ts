@@ -17,6 +17,7 @@ import type {
 import { foldText, matchesQuery, queryTokens } from './search'
 import { ageGuidanceForRating, normalizeRatingCandidate } from './content-rating'
 import { performanceTrace } from './performance-trace'
+import { appProviderTransport, type ProviderTransport } from './provider-transport'
 import type { ProviderFailureDiagnostics } from './provider-error'
 import {
   AUTH_MESSAGE,
@@ -54,18 +55,52 @@ type RequestOptions = {
   timeoutMs?: number
 }
 
-type StreamSearchOptions = RequestOptions & {
+export type StreamScanOptions = RequestOptions & {
   /**
-   * Optional deadline for receiving HTTP response headers. When supplied, the
-   * regular timeout begins again after headers arrive and bounds incremental
-   * body scanning independently.
+   * Bounds the time until response headers arrive independently from the total
+   * incremental scan deadline.
    */
   responseTimeoutMs?: number
+  /**
+   * Optional lower bound for a guarded scan. Production callers use the fixed
+   * safe default; tests can lower it without allocating a huge fixture body.
+   */
+  maxResponseBytes?: number
+  categoryId?: string
+  onMatches?: (matches: StreamItem[]) => void
+}
+
+type StreamSearchOptions = StreamScanOptions & {
   limit?: number
   excludeCategoryIds?: ReadonlySet<string>
-  onMatches?: (matches: StreamItem[]) => void
   matchAll?: boolean
+  /**
+   * Catalog synchronization requires a fully closed top-level array and rejects
+   * a truncated or malformed section rather than treating parsed prefixes as a
+   * complete provider response.
+   */
+  requireCompleteArray?: boolean
+  /**
+   * Streams can be delivered to onMatches without retaining a second complete
+   * result array. Catalog synchronization uses this to keep peak memory bounded
+   * by its normalized category buckets rather than the raw provider response.
+   */
+  collectMatches?: boolean
 }
+
+type CatalogScanValidationCondition =
+  | 'root-not-array'
+  | 'trailing-content'
+  | 'missing-item-separator'
+  | 'unexpected-item-separator'
+  | 'trailing-item-separator'
+  | 'unexpected-root-token'
+  | 'record-exceeds-limit'
+  | 'record-json-invalid'
+  | 'root-not-closed'
+  | 'object-not-closed'
+  | 'string-not-closed'
+  | 'record-buffer-not-empty'
 
 function readString(value: unknown): string | undefined {
   if (value === undefined || value === null || typeof value === 'object' || typeof value === 'function') {
@@ -307,7 +342,7 @@ function parseCatchup(record: RawRecord): CatchupCapability | undefined {
 }
 
 function yieldToBrowser(): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, 0))
+  return new Promise((resolve) => globalThis.setTimeout(resolve, 0))
 }
 
 function textDecoder(): { decode: (value?: Uint8Array, options?: { stream?: boolean }) => string } {
@@ -381,6 +416,10 @@ async function readResponseText(response: Response): Promise<string> {
   })
 
   return textDecoder().decode(payload)
+}
+
+function hasCompleteArrayRoot(state: 'before' | 'items' | 'after'): boolean {
+  return state === 'after'
 }
 
 function providerPersonId(name: string, role: string): string {
@@ -613,9 +652,11 @@ async function describeHttpFailure(
 export class XtreamClient {
   readonly baseUrl: string
   private readonly profile: XtreamProfile
+  private readonly transport: ProviderTransport
 
-  constructor(profile: XtreamProfile) {
+  constructor(profile: XtreamProfile, transport: ProviderTransport = appProviderTransport()) {
     this.profile = profile
+    this.transport = transport
     this.baseUrl = toBaseUrl(profile.serverUrl)
   }
 
@@ -643,7 +684,7 @@ export class XtreamClient {
       parameterCount: Object.keys(parameters).length,
     })
     const controller = new AbortController()
-    const timeout = window.setTimeout(
+    const timeout = globalThis.setTimeout(
       () => controller.abort(),
       options.timeoutMs ?? API_TIMEOUT_MS,
     )
@@ -662,7 +703,9 @@ export class XtreamClient {
         performanceTrace.event('network', 'xtream-fetch-start', { operation }, {
           requestId: requestId ?? undefined,
         })
-        response = await fetch(this.apiUrl(action, parameters), { signal: controller.signal })
+        response = await this.transport.fetch(this.apiUrl(action, parameters), {
+          signal: controller.signal,
+        })
         performanceTrace.event(
           'network',
           'xtream-response-headers',
@@ -776,7 +819,7 @@ export class XtreamClient {
         operation,
         aborted: controller.signal.aborted,
       })
-      window.clearTimeout(timeout)
+      globalThis.clearTimeout(timeout)
       options.signal?.removeEventListener('abort', abortFromCaller)
     }
   }
@@ -890,6 +933,24 @@ export class XtreamClient {
     return streams
   }
 
+  /**
+   * Incrementally scans one complete provider section. This deliberately
+   * reuses the brace-aware parser used by guarded search instead of buffering
+   * and JSON.parse-ing a multi-megabyte catalog response.
+   */
+  async scanSection(
+    section: LibrarySection,
+    options: StreamScanOptions = {},
+  ): Promise<void> {
+    await this.searchStreams(section, '', {
+      ...options,
+      matchAll: true,
+      requireCompleteArray: true,
+      limit: Number.MAX_SAFE_INTEGER,
+      collectMatches: false,
+    })
+  }
+
   async searchStreams(
     section: LibrarySection,
     query: string,
@@ -922,19 +983,46 @@ export class XtreamClient {
       queryTokenCount: tokens.length,
       matchAll: Boolean(options.matchAll),
     })
+    const scanStartedAt = Date.now()
+    const maxResponseBytes = options.maxResponseBytes ?? MAX_JSON_RESPONSE_BYTES
     const controller = new AbortController()
-    let timeout = window.setTimeout(
-      () => controller.abort(),
+    let timedOut = false
+    const abortForTimeout = (): void => {
+      timedOut = true
+      controller.abort()
+    }
+    let timeout = globalThis.setTimeout(
+      abortForTimeout,
       options.responseTimeoutMs ?? options.timeoutMs ?? SEARCH_TIMEOUT_MS,
     )
     const abortFromCaller = (): void => controller.abort()
     const matches: StreamItem[] = []
+    const collectMatches = options.collectMatches !== false
+    let responseStatus: number | null = null
+    let responseHeaderElapsedMs: number | null = null
+    let bytesReceived = 0
+    let recordsParsed = 0
+    let matchCount = 0
     let pendingMatches: StreamItem[] = []
     let objectParts: string[] = []
     let objectLength = 0
     let objectDepth = 0
     let inString = false
     let escaped = false
+    let rootState: 'before' | 'items' | 'after' = 'before'
+    let rootHasValue = false
+    let rootExpectsValue = true
+    let validationCondition: CatalogScanValidationCondition | null = null
+    let scanSucceeded = false
+    let terminalFailureKind: string | null = null
+
+    const invalidCatalogResponse = (
+      condition: CatalogScanValidationCondition,
+      message = 'The provider sent an invalid catalog response.',
+    ): ProviderError => {
+      validationCondition = condition
+      return new ProviderError('invalid-response', message, false)
+    }
 
     if (options.signal?.aborted) {
       controller.abort()
@@ -978,6 +1066,7 @@ export class XtreamClient {
 
       try {
         const record = readRecord(JSON.parse(source))
+        recordsParsed += 1
         const name = readString(record.name ?? record.title) ?? ''
 
         if (!matchesQuery(foldText(name), tokens)) {
@@ -993,14 +1082,25 @@ export class XtreamClient {
         const stream = this.normalizeStream(record, section)
 
         if (stream.id) {
-          matches.push(stream)
+          matchCount += 1
+
+          if (collectMatches) {
+            matches.push(stream)
+          }
+
           pendingMatches.push(stream)
         }
-      } catch {
-        // Ignore one malformed record without discarding the rest of the search.
+      } catch (reason) {
+        if (options.requireCompleteArray) {
+          throw invalidCatalogResponse('record-json-invalid')
+        }
+
+        // Search can tolerate one malformed candidate record and continue with
+        // the rest of a user-requested result set.
+        void reason
       }
 
-      return matches.length >= limit
+      return matchCount >= limit
     }
 
     const processChunk = async (chunk: string): Promise<boolean> => {
@@ -1015,7 +1115,44 @@ export class XtreamClient {
         const character = chunk[index]
 
         if (objectDepth === 0) {
-          if (character === '{') {
+          if (options.requireCompleteArray) {
+            if (rootState === 'before') {
+              if (/\s/.test(character)) {
+                // Leading response whitespace is valid.
+              } else if (character === '[') {
+                rootState = 'items'
+              } else {
+                throw invalidCatalogResponse('root-not-array')
+              }
+            } else if (rootState === 'after') {
+              if (!/\s/.test(character)) {
+                throw invalidCatalogResponse('trailing-content')
+              }
+            } else if (character === '{') {
+              if (!rootExpectsValue) {
+                throw invalidCatalogResponse('missing-item-separator')
+              }
+
+              objectChunkStart = index
+              objectDepth = 1
+              inString = false
+              escaped = false
+            } else if (character === ',') {
+              if (rootExpectsValue) {
+                throw invalidCatalogResponse('unexpected-item-separator')
+              }
+
+              rootExpectsValue = true
+            } else if (character === ']') {
+              if (rootExpectsValue && rootHasValue) {
+                throw invalidCatalogResponse('trailing-item-separator')
+              }
+
+              rootState = 'after'
+            } else if (!/\s/.test(character)) {
+                throw invalidCatalogResponse('unexpected-root-token')
+            }
+          } else if (character === '{') {
             objectChunkStart = index
             objectDepth = 1
             inString = false
@@ -1025,6 +1162,10 @@ export class XtreamClient {
           objectChunkStart >= 0 &&
           objectLength + index - objectChunkStart + 1 > MAX_SEARCH_RECORD_CHARS
         ) {
+          if (options.requireCompleteArray) {
+            throw invalidCatalogResponse('record-exceeds-limit')
+          }
+
           objectParts = []
           objectLength = 0
           objectDepth = 0
@@ -1052,6 +1193,11 @@ export class XtreamClient {
             objectParts = []
             objectLength = 0
             objectChunkStart = -1
+
+            if (options.requireCompleteArray) {
+              rootHasValue = true
+              rootExpectsValue = false
+            }
 
             if (processRecord(recordSource)) {
               flushMatches()
@@ -1085,7 +1231,7 @@ export class XtreamClient {
         throw new ProviderError('cancelled', 'Request cancelled.', false)
       }
 
-      return matches.length >= limit
+      return matchCount >= limit
     }
 
     try {
@@ -1098,9 +1244,15 @@ export class XtreamClient {
           { operation },
           { requestId: requestId ?? undefined },
         )
-        response = await fetch(this.apiUrl(operation), {
+        const parameters: Record<string, string> = options.categoryId
+          ? { category_id: options.categoryId }
+          : {}
+
+        response = await this.transport.fetch(this.apiUrl(operation, parameters), {
           signal: controller.signal,
         })
+        responseStatus = response.status
+        responseHeaderElapsedMs = Date.now() - scanStartedAt
         performanceTrace.event(
           'network',
           'xtream-search-response-headers',
@@ -1113,9 +1265,9 @@ export class XtreamClient {
         )
 
         if (options.responseTimeoutMs !== undefined) {
-          window.clearTimeout(timeout)
-          timeout = window.setTimeout(
-            () => controller.abort(),
+          globalThis.clearTimeout(timeout)
+          timeout = globalThis.setTimeout(
+            abortForTimeout,
             options.timeoutMs ?? SEARCH_TIMEOUT_MS,
           )
         }
@@ -1144,15 +1296,16 @@ export class XtreamClient {
         )
       }
 
-      if (
-        response.body &&
-        typeof response.body.getReader === 'function' &&
-        typeof TextDecoder === 'function'
-      ) {
+      try {
+        if (
+          response.body &&
+          typeof response.body.getReader === 'function' &&
+          typeof TextDecoder === 'function'
+        ) {
         const reader = response.body.getReader()
         const decoder = textDecoder()
 
-        while (matches.length < limit) {
+        while (matchCount < limit) {
           const { done, value } = await reader.read()
 
           if (done) {
@@ -1160,40 +1313,113 @@ export class XtreamClient {
             break
           }
 
-          if (value && await processChunk(decoder.decode(value, { stream: true }))) {
-            await reader.cancel()
-            break
+          if (value) {
+            bytesReceived += value.byteLength
+
+            if (bytesReceived > maxResponseBytes) {
+              await reader.cancel()
+              throw new ProviderError('too-large', RESPONSE_TOO_LARGE_MESSAGE, false)
+            }
+
+            if (await processChunk(decoder.decode(value, { stream: true }))) {
+              await reader.cancel()
+              break
+            }
           }
         }
-      } else {
-        await processChunk(await response.text())
+        } else {
+          const source = await response.text()
+          bytesReceived = source.length
+
+          if (bytesReceived > maxResponseBytes) {
+            throw new ProviderError('too-large', RESPONSE_TOO_LARGE_MESSAGE, false)
+          }
+
+          await processChunk(source)
+        }
+      } catch (reason) {
+        if (reason instanceof ProviderError) {
+          throw reason
+        }
+
+        // A stream read that breaks after HTTP headers is a transport failure,
+        // not a malformed catalog. Keep it distinct from strict-array rejection.
+        throw new ProviderError('network', 'The provider response could not be read.', true)
       }
 
+      if (
+        options.requireCompleteArray &&
+        (!hasCompleteArrayRoot(rootState) || objectDepth !== 0 || inString || objectParts.length > 0)
+      ) {
+        const condition = objectDepth !== 0
+          ? 'object-not-closed'
+          : inString
+            ? 'string-not-closed'
+            : objectParts.length > 0
+              ? 'record-buffer-not-empty'
+              : 'root-not-closed'
+        throw invalidCatalogResponse(
+          condition,
+          'The provider sent an incomplete catalog response.',
+        )
+      }
+
+      scanSucceeded = true
       flushMatches()
       return matches
     } catch (reason) {
       flushMatches()
 
       if (options.signal?.aborted) {
+        terminalFailureKind = 'cancelled'
         throw new ProviderError('cancelled', 'Request cancelled.', false)
       }
 
       if (controller.signal.aborted) {
+        terminalFailureKind = timedOut ? 'timeout' : 'cancelled'
         throw new ProviderError(
-            'timeout',
-            'The provider search took too long. Please try again.',
-            true,
-          )
+          timedOut
+            ? 'timeout'
+            : 'cancelled',
+          timedOut
+            ? 'The provider search took too long. Please try again.'
+            : 'Request cancelled.',
+          timedOut,
+        )
       }
 
+      terminalFailureKind = reason instanceof ProviderError ? reason.kind : 'unknown'
       throw reason
     } finally {
+      if (options.requireCompleteArray) {
+        performanceTrace.event(
+          'data',
+          'xtream-catalog-scan-terminal',
+          {
+            operation,
+            section,
+            categorySlice: Boolean(options.categoryId),
+            status: responseStatus,
+            headerElapsedMs: responseHeaderElapsedMs,
+            elapsedMs: Date.now() - scanStartedAt,
+            bytesReceived,
+            recordsParsed,
+            topLevelArrayClosed: hasCompleteArrayRoot(rootState),
+            scanTimedOut: timedOut,
+            scanSucceeded,
+            failureKind: terminalFailureKind,
+            validationCondition,
+          },
+          { requestId: requestId ?? undefined },
+        )
+      }
+
       performanceTrace.endRequest(requestId, {
         operation,
         aborted: controller.signal.aborted,
-        matchCount: matches.length,
+        matchCount,
       })
-      window.clearTimeout(timeout)
+      globalThis.clearTimeout(timeout)
       options.signal?.removeEventListener('abort', abortFromCaller)
     }
   }
