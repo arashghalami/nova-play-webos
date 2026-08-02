@@ -1203,7 +1203,7 @@ The run stopped after five serial provider requests because the VOD category-man
 ### Source-control and gate decision
 
 - Baseline corrective-work checkpoint before this change set: `05ca1e2` (`feat: add local catalog cache and sync foundation`).
-- The physical ReferenceError diagnosis and corrective bundle work remain to be committed after the final diff/cleanup verification.
+- The physical ReferenceError diagnosis and corrective bundle work are committed in `790d70e` (`fix: isolate webos publication runtime faults`).
 - Gate 1 remains **rejected/pending**: this entry proves the local post-scan publication path, not all-three-section authoritative provider synchronization.
 - Phase 2A remains **not started and not authorized**.
 - The next provider action remains exactly one separately approved serial Gate 1 sync in a future UTC window with all six sync debits available. No provider request is authorized before that condition is met.
