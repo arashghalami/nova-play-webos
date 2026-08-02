@@ -129,6 +129,7 @@ import {
   CATALOG_SYNC_SECTIONS,
   CatalogSyncCoordinator,
 } from './library/catalog-sync'
+import { catalogSyncRearmDelay } from './library/catalog-sync-scheduler'
 import {
   hlsConstructor,
   mpegtsEngine,
@@ -2666,6 +2667,12 @@ function renderSettings(): void {
       </section>
       <section class="settings-panel">
         <p class="panel-kicker">Library</p>
+        <h2>Downloaded library</h2>
+        <p class="hint">Refresh is manual so it can be observed and controlled. It never starts automatically when the app launches.</p>
+        <button class="secondary-button" data-action="refresh-library" data-focus-id="settings-refresh-library">Refresh downloaded library</button>
+      </section>
+      <section class="settings-panel">
+        <p class="panel-kicker">Library</p>
         <h2>Playlists</h2>
         <p class="hint">Favorites and watch history stay separate for every playlist.</p>
         <div class="profile-list">
@@ -4485,6 +4492,28 @@ async function handleAction(element: HTMLElement): Promise<void> {
     return
   }
 
+  if (action === 'refresh-library') {
+    const result = await runCatalogSync()
+
+    if (!result) {
+      showToast('Library refresh is unavailable right now.')
+      return
+    }
+
+    if (result.status === 'completed') {
+      showToast('Downloaded library refreshed.')
+    } else if (result.status === 'cooldown') {
+      showToast('Downloaded library is already up to date.')
+    } else if (result.status === 'deferred') {
+      showToast('Library refresh is deferred until the next provider sync window.')
+    } else if (result.status === 'busy') {
+      showToast('Library refresh is already running.')
+    } else {
+      showToast('Library refresh did not complete.')
+    }
+    return
+  }
+
   if (action === 'settings') {
     if (view !== 'settings') {
       pushRouteHistory()
@@ -5227,7 +5256,6 @@ function closePlayer(): void {
   }
 
   render()
-  scheduleCatalogSync()
 }
 
 function togglePlayback(): void {
@@ -5619,10 +5647,13 @@ function scheduleCatalogSync(delayMs = LIBRARY_SYNC_IDLE_DELAY_MS): boolean {
   }
 
   cancelScheduledCatalogSync()
+  const now = Date.now()
+  const requestedDueAt = Number.isFinite(delayMs) ? now + Math.max(0, delayMs) : now
+
   catalogSyncTimer = window.setTimeout(() => {
     catalogSyncTimer = null
     void runCatalogSync()
-  }, Math.max(0, delayMs))
+  }, catalogSyncRearmDelay(requestedDueAt, now))
   return true
 }
 
@@ -5687,12 +5718,9 @@ async function runCatalogSync() {
     performanceTrace.event('library', 'catalog-sync-complete', {
       profileId: activeProfile.id,
       status: result.status,
-      requestCount: result.requestCount,
+      attemptedRequestCount: result.requestCount,
+      issuedRequestCount: result.issuedRequestCount,
     })
-
-    if (result.nextDueAt !== undefined && activeSync === catalogSync) {
-      scheduleCatalogSync(Math.max(0, result.nextDueAt - Date.now()))
-    }
 
     return result
   } catch {
@@ -5738,7 +5766,6 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: ProviderBroker
   adultCategoryIds.clear()
   knownStreams.clear()
   nowNextCache.clear()
-  scheduleCatalogSync()
 }
 
 async function refreshAccount(silent = false): Promise<void> {
@@ -6895,4 +6922,3 @@ if (
 
 initializeAppHistory()
 render()
-scheduleCatalogSync()

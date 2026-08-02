@@ -32,9 +32,15 @@ export type CatalogSyncProvider = Pick<
   canBeginCatalogSync?: (
     requestCount: number,
   ) => ProviderCatalogSyncPreflight
+  /**
+   * The broker reports only requests that crossed the transport handoff. It is
+   * intentionally separate from coordinator attempts, which can fail before
+   * a provider request exists.
+   */
+  issuedRequestCount?: (budget: 'sync') => number
 }
 
-export type CatalogSyncSectionResult = {
+type CatalogSyncSectionOutcome = {
   section: LibrarySection
   mode: 'whole-section' | 'category-slice' | 'skipped'
   success: boolean
@@ -43,16 +49,41 @@ export type CatalogSyncSectionResult = {
   refused?: boolean
 }
 
+type CatalogSyncSectionRequestCounts = {
+  attempted: number
+  issued: number | null
+}
+
+export type CatalogSyncSectionResult = CatalogSyncSectionOutcome & {
+  /**
+   * Coordinator calls attempted for this section. This includes pre-handoff
+   * failures and therefore is not interchangeable with issuedRequestCount.
+   */
+  attemptedRequestCount: number
+  /**
+   * Transport handoffs observed by ProviderBroker for this section. Fixture
+   * providers that do not expose broker accounting report null.
+   */
+  issuedRequestCount: number | null
+  categoryId?: string
+  reason?: 'category-request-failed' | 'scan-failed' | 'no-categories' | 'cancelled'
+  refused?: boolean
+}
+
 export type CatalogSyncResult =
   | {
       status: 'completed' | 'failed' | 'cancelled'
+      /** Coordinator attempts across every section. */
       requestCount: number
+      /** Broker-issued/debited requests across every section, if observable. */
+      issuedRequestCount: number | null
       nextDueAt: number
       sections: CatalogSyncSectionResult[]
     }
   | {
       status: 'busy' | 'cooldown' | 'deferred'
       requestCount: 0
+      issuedRequestCount: 0
       nextDueAt?: number
       sections: []
     }
@@ -126,13 +157,14 @@ export class CatalogSyncCoordinator {
       return {
         status: 'cooldown',
         requestCount: 0,
+        issuedRequestCount: 0,
         nextDueAt: priorMeta.nextDueAt,
         sections: [],
       }
     }
 
     if (this.activeController) {
-      return { status: 'busy', requestCount: 0, sections: [] }
+      return { status: 'busy', requestCount: 0, issuedRequestCount: 0, sections: [] }
     }
 
     const preflight = this.provider.canBeginCatalogSync?.(
@@ -143,6 +175,7 @@ export class CatalogSyncCoordinator {
       return {
         status: 'deferred',
         requestCount: 0,
+        issuedRequestCount: 0,
         nextDueAt: preflight.nextEligibleAt,
         sections: [],
       }
@@ -154,7 +187,7 @@ export class CatalogSyncCoordinator {
 
     if (!await this.repository.tryBeginSync(profileId, runId, this.staleRunMs)) {
       this.activeController = null
-      return { status: 'busy', requestCount: 0, sections: [] }
+      return { status: 'busy', requestCount: 0, issuedRequestCount: 0, sections: [] }
     }
 
     const sectionStates = new Map<LibrarySection, LibrarySyncSectionState>()
@@ -170,8 +203,38 @@ export class CatalogSyncCoordinator {
     }
 
     const categoriesBySection = new Map<LibrarySection, Category[]>()
-    const sections: CatalogSyncSectionResult[] = []
+    const sections: CatalogSyncSectionOutcome[] = []
+    const sectionRequestCounts = new Map<LibrarySection, CatalogSyncSectionRequestCounts>(
+      CATALOG_SYNC_SECTIONS.map((section) => [
+        section,
+        {
+          attempted: 0,
+          issued: this.provider.issuedRequestCount ? 0 : null,
+        },
+      ]),
+    )
+    const issuedRequestCountAtStart = this.provider.issuedRequestCount?.('sync')
     let requestCount = 0
+
+    const beginProviderRequest = (section: LibrarySection): (() => void) => {
+      const counts = sectionRequestCounts.get(section)!
+
+      counts.attempted += 1
+      requestCount += 1
+      const issuedRequestCountBefore = this.provider.issuedRequestCount?.('sync')
+      let finished = false
+
+      return () => {
+        if (finished || issuedRequestCountBefore === undefined || counts.issued === null) {
+          return
+        }
+
+        finished = true
+        const issuedRequestCountAfter =
+          this.provider.issuedRequestCount?.('sync') ?? issuedRequestCountBefore
+        counts.issued += Math.max(0, issuedRequestCountAfter - issuedRequestCountBefore)
+      }
+    }
     let failed = false
     let cancelled = false
     let refusal = false
@@ -184,8 +247,9 @@ export class CatalogSyncCoordinator {
 
         const attemptAt = this.now()
 
+        const finishRequest = beginProviderRequest(section)
+
         try {
-          requestCount += 1
           const categories = uniqueCategories(
             await this.provider.backgroundCategories(
               section,
@@ -193,6 +257,7 @@ export class CatalogSyncCoordinator {
               CATALOG_SYNC_HEADER_TIMEOUT_MS,
             ),
           )
+          finishRequest()
           categoriesBySection.set(section, categories)
 
           // The manifest is updated only after its own request succeeds. Its
@@ -206,6 +271,7 @@ export class CatalogSyncCoordinator {
             { lastAttemptAt: attemptAt },
           )
         } catch (reason) {
+          finishRequest()
           if (isCancelled(reason, controller.signal)) {
             cancelled = true
             break
@@ -254,9 +320,7 @@ export class CatalogSyncCoordinator {
             state,
             sectionStates,
             controller.signal,
-            () => {
-              requestCount += 1
-            },
+            () => beginProviderRequest(section),
           )
           sections.push(result)
 
@@ -281,9 +345,7 @@ export class CatalogSyncCoordinator {
           state,
           sectionStates,
           controller.signal,
-          () => {
-            requestCount += 1
-          },
+          () => beginProviderRequest(section),
         )
         sections.push(result)
 
@@ -347,11 +409,27 @@ export class CatalogSyncCoordinator {
         this.activeController = null
       }
 
+      const issuedRequestCountAtEnd = this.provider.issuedRequestCount?.('sync')
+      const issuedRequestCount =
+        issuedRequestCountAtStart === undefined || issuedRequestCountAtEnd === undefined
+          ? null
+          : Math.max(0, issuedRequestCountAtEnd - issuedRequestCountAtStart)
+      const reportedSections: CatalogSyncSectionResult[] = sections.map((section) => {
+        const counts = sectionRequestCounts.get(section.section)!
+
+        return {
+          ...section,
+          attemptedRequestCount: counts.attempted,
+          issuedRequestCount: counts.issued,
+        }
+      })
+
       return {
         status: outcome,
         requestCount,
+        issuedRequestCount,
         nextDueAt,
-        sections,
+        sections: reportedSections,
       }
     }
   }
@@ -364,15 +442,16 @@ export class CatalogSyncCoordinator {
     state: LibrarySyncSectionState,
     states: Map<LibrarySection, LibrarySyncSectionState>,
     signal: AbortSignal,
-    recordRequest: () => void,
-  ): Promise<CatalogSyncSectionResult> {
+    recordRequest: () => (() => void),
+  ): Promise<CatalogSyncSectionOutcome> {
     const attemptAt = this.now()
     const buckets = new Map<string, StreamItem[]>()
     let failureStage: CatalogSyncFailureStage = 'provider-scan'
     let publishStage: SnapshotPublishStage | null = null
 
+    const finishRequest = recordRequest()
+
     try {
-      recordRequest()
       await this.provider.backgroundScanSection(section, {
         signal,
         responseTimeoutMs: CATALOG_SYNC_HEADER_TIMEOUT_MS,
@@ -391,6 +470,7 @@ export class CatalogSyncCoordinator {
         },
       })
 
+      finishRequest()
       failureStage = 'snapshot-publish'
       await this.repository.replaceSectionSnapshots(
         {
@@ -420,6 +500,8 @@ export class CatalogSyncCoordinator {
 
       return { section, mode: 'whole-section', success: true }
     } catch (reason) {
+      finishRequest()
+
       if (isCancelled(reason, signal)) {
         return { section, mode: 'whole-section', success: false, reason: 'cancelled' }
       }
@@ -459,8 +541,8 @@ export class CatalogSyncCoordinator {
     state: LibrarySyncSectionState,
     states: Map<LibrarySection, LibrarySyncSectionState>,
     signal: AbortSignal,
-    recordRequest: () => void,
-  ): Promise<CatalogSyncSectionResult> {
+    recordRequest: () => (() => void),
+  ): Promise<CatalogSyncSectionOutcome> {
     if (!categories.length) {
       return {
         section,
@@ -477,8 +559,9 @@ export class CatalogSyncCoordinator {
     let failureStage: CatalogSyncFailureStage = 'provider-scan'
     let publishStage: SnapshotPublishStage | null = null
 
+    const finishRequest = recordRequest()
+
     try {
-      recordRequest()
       await this.provider.backgroundScanSection(section, {
         signal,
         categoryId: category.id,
@@ -487,6 +570,7 @@ export class CatalogSyncCoordinator {
         onMatches: (batch) => items.push(...batch),
       })
 
+      finishRequest()
       failureStage = 'snapshot-publish'
       await this.repository.replaceCategorySnapshot(
         {
@@ -524,6 +608,8 @@ export class CatalogSyncCoordinator {
         categoryId: category.id,
       }
     } catch (reason) {
+      finishRequest()
+
       if (isCancelled(reason, signal)) {
         return {
           section,

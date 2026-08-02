@@ -1272,3 +1272,60 @@ The run stopped after five serial provider requests because the VOD category-man
 - A normal, non-probe `com.arash.novaplay` `1.0.13` package was rebuilt with the same ES2015 app/IIFE and standalone-media boundary checks, installed, and launched on `OLED55G1RLA`.
 - Physical CDP verification returned `typeof window.__NOVA_LIBRARY_PROBE__ === "undefined"`.
 - The development/probe surface is therefore absent from the installed normal package. The package remains on the corrected no-partial-run and standalone-media implementation.
+
+## 2026-08-03 — Explicit Gate 1 arming, request-count reconciliation, and independent media-engine proof
+
+### Gate 1 scheduler control
+
+- The launch-time and deferred-boundary scheduler path that caused the earlier final-debit loss is now removed from normal operation:
+  - application bootstrap no longer calls `scheduleCatalogSync()`;
+  - profile activation and player exit no longer schedule a run;
+  - `runCatalogSync()` no longer re-arms itself at `nextDueAt`;
+  - the normal Settings view now exposes the explicit **Refresh downloaded library** action.
+- A Gate 1 refresh therefore begins only after capture is already attached and an operator explicitly invokes the refresh action. Leaving the app running across a UTC rollover cannot autonomously consume a fresh six-request sync window.
+- The old internal scheduling helper remains probe-only support; it is not called by normal application lifecycle paths.
+- `catalogSyncRearmDelay()` imposes a 1,000 ms minimum retry delay for a due, past-due, or invalid deferred deadline. This prevents a zero-delay retry loop from repeatedly invoking the broker preflight and persisting state at the same instant.
+- Regression coverage verifies a future deadline is preserved and that due/past/invalid deadlines receive the minimum delay. Source-level local-first regression coverage also rejects reintroduction of startup, profile-activation, or player-exit scheduling.
+
+### Attempted versus issued/debited accounting
+
+- `CatalogSyncResult.requestCount` is now explicitly the coordinator **attempted** count.
+- `CatalogSyncResult.issuedRequestCount` is the broker-observed transport-handoff count for the run, or `null` for non-broker fixture providers that cannot observe handoffs.
+- Each section carries the same two values as `attemptedRequestCount` and `issuedRequestCount`. Gate reporting must capture both values and the persisted sync-budget delta; they are separate evidence fields rather than interchangeable proof.
+- The broker now retains an in-process issued counter that increments only beside the existing transport-handoff debit. A real completed run tested through the broker reported six attempts, six issued/debited requests, and two attempts/two issued requests for each of Live, VOD, and Series.
+- A synchronous pre-handoff transport failure test reported three coordinator attempts, zero issued/debited requests, and zero persisted sync-budget use. This is the expected legitimate divergence: the coordinator tried each manifest call, but no provider request crossed the transport boundary.
+- The fixed six-slot normal-run preflight remains deliberately conservative for checkpointed category-slice work. Computing a smaller future preflight from planned resume work is recorded as a later multi-day acquisition improvement, not part of this Gate 1 change.
+
+### Physical normal-package and engine verification
+
+- Normal package `com.arash.novaplay` `1.0.14` was built and installed on `OLED55G1RLA` with the standalone Dash.js/Hls.js/MPEG-TS boundary checks passing.
+- Physical CDP inspection of the normal package confirmed:
+  - `window.__NOVA_LIBRARY_PROBE__` is `undefined`;
+  - the separately packaged Dash.js, MPEG-TS, and Hls.js globals resolve;
+  - after launch and idle observation, persisted sync usage remained at its prior exhausted value of `6/6`; no automatic catalog run was armed or issued.
+- DASH wrapper verification used a public, non-provider static H.264/AAC conformance MPD:
+  - the Dash.js UMD global resolved as a function and constructed a player;
+  - `STREAM_INITIALIZED` fired with no DASH error;
+  - the visible MediaSource-backed track reached `320×180`, playback was unpaused, and time advanced to 5.8 seconds during the sample.
+- MPEG-TS wrapper verification used a public, non-provider H.264/AAC TS fixture:
+  - the MPEG-TS UMD global resolved and `createPlayer()` constructed successfully;
+  - media information reported both video and audio with `avc1.64001f` and `mp4a.40.2`;
+  - the MediaSource-backed video reached `readyState=4`, a visible `1280×720` track, and 10.02 seconds of playback with no engine error.
+- Both temporary CDP fixture elements and player instances were destroyed and removed after their samples. These playback checks used no IPTV provider request and no catalog-sync budget.
+- This supersedes the previous “wrapper unverified” status for DASH and MPEG-TS. In-app live channel switching remains deferred until after a successful Gate 1 download populates local live entries.
+
+### Validation and decision
+
+- Automated validation after these changes: full suite passed — 32 files and 243 tests.
+- Production package validation passed:
+  - TypeScript completed with no errors;
+  - 34 runtime source modules have no relative import cycles;
+  - standalone-media bundle checks passed;
+  - normal `app.js` is 466.16 kB (103.45 kB gzip), with no prohibited post-ES2015 globals or media-engine imports in the app IIFE.
+- Gate 1 prerequisites are now satisfied except for the separate future-window provider operation:
+  1. wait for a fresh UTC sync window with `0/6` used and no refusal block;
+  2. attach CDP/trace capture and record broker/storage baseline before any manual refresh;
+  3. invoke exactly one manual **Refresh downloaded library** run;
+  4. record per-section attempted, issued/debited, status, bytes, elapsed, parsed records, snapshots, item counts, coverage, checkpoints/cursors, and final persisted budget delta;
+  5. confirm a follow-up call returns cooldown with zero attempted and zero issued requests.
+- Gate 1 remains **pending**, not accepted. Phase 2A remains **blocked** until the one authorized serial run completes Live, VOD, and Series authoritatively with no residual failed checkpoint/cursor or snapshot-publication fault.

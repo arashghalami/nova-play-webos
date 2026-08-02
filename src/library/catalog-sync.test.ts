@@ -98,7 +98,16 @@ describe('CatalogSyncCoordinator', () => {
       fixtureProfile.id,
     )
 
-    expect(result).toMatchObject({ status: 'completed', requestCount: 6 })
+    expect(result).toMatchObject({
+      status: 'completed',
+      requestCount: 6,
+      issuedRequestCount: 6,
+      sections: [
+        { section: 'live', attemptedRequestCount: 2, issuedRequestCount: 2 },
+        { section: 'vod', attemptedRequestCount: 2, issuedRequestCount: 2 },
+        { section: 'series', attemptedRequestCount: 2, issuedRequestCount: 2 },
+      ],
+    })
     const cooldown = await new CatalogSyncCoordinator(broker, repository).sync(fixtureProfile.id)
     expect(cooldown).toMatchObject({ status: 'cooldown', requestCount: 0 })
     expect(broker.inspectBudget()).toMatchObject({
@@ -145,6 +154,55 @@ describe('CatalogSyncCoordinator', () => {
       interactive: { used: 0 },
       sync: { used: 5, remaining: 1 },
     })
+  })
+
+  it('reports an attempted request without a debit when transport fails before handoff', async () => {
+    vi.stubGlobal('localStorage', new MemoryStorage())
+    const repository = createRepository()
+    const transport = {
+      fetch: vi.fn(() => {
+        throw new Error('Synchronous fixture transport failure.')
+      }),
+    }
+    const broker = new ProviderBroker(fixtureProfile, {
+      transport,
+      syncDailyRequestBudget: 6,
+    })
+
+    const result = await new CatalogSyncCoordinator(broker, repository).sync(fixtureProfile.id)
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      requestCount: 3,
+      issuedRequestCount: 0,
+      sections: [
+        {
+          section: 'live',
+          mode: 'skipped',
+          attemptedRequestCount: 1,
+          issuedRequestCount: 0,
+          reason: 'category-request-failed',
+        },
+        {
+          section: 'vod',
+          mode: 'skipped',
+          attemptedRequestCount: 1,
+          issuedRequestCount: 0,
+          reason: 'category-request-failed',
+        },
+        {
+          section: 'series',
+          mode: 'skipped',
+          attemptedRequestCount: 1,
+          issuedRequestCount: 0,
+          reason: 'category-request-failed',
+        },
+      ],
+    })
+    expect(broker.inspectBudget()).toMatchObject({
+      sync: { used: 0, remaining: 6 },
+    })
+    expect(transport.fetch).toHaveBeenCalledTimes(3)
   })
 
   it('acquires a complete catalog in exactly six serial background requests', async () => {
@@ -202,6 +260,7 @@ describe('CatalogSyncCoordinator', () => {
     expect(next).toEqual({
       status: 'cooldown',
       requestCount: 0,
+      issuedRequestCount: 0,
       nextDueAt: completed.nextDueAt,
       sections: [],
     })

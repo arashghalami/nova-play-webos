@@ -103,6 +103,10 @@ export class ProviderBroker {
     catalog: [],
     background: [],
   }
+  private readonly issuedRequestCounts: Record<ProviderBudgetKind, number> = {
+    interactive: 0,
+    sync: 0,
+  }
   private running = false
 
   constructor(profile: XtreamProfile, options: ProviderBrokerOptions = {}) {
@@ -267,6 +271,15 @@ export class ProviderBroker {
     state.updatedAt = now
     saveProviderAccessState(this.profileId, state)
     return this.budgetSnapshot(state, 'current UTC window remains active', now)
+  }
+
+  /**
+   * Returns transport handoffs observed by this broker instance. It is distinct
+   * from persisted daily budget state so a catalog coordinator can reconcile
+   * attempted calls with requests the provider actually received.
+   */
+  issuedRequestCount(budget: ProviderBudgetKind): number {
+    return this.issuedRequestCounts[budget]
   }
 
   private request<T>(
@@ -536,6 +549,7 @@ export class ProviderBroker {
           // but the provider has still received the request and it must be
           // represented by exactly one debit.
           this.debitBudget(state, activeRequest.budget)
+          this.issuedRequestCounts[activeRequest.budget] += 1
           state.updatedAt = this.now()
           saveProviderAccessState(this.profileId, state)
           this.traceBudgetEvent(

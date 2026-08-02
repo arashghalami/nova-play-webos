@@ -35,6 +35,13 @@ describe('local-first catalog regressions', () => {
     expect(mainSource).not.toMatch(/catalogRepository\.readCategoryShard\(/)
     expect(mainSource).not.toMatch(/catalogRepository\.search\(/)
     expect(mainSource).toMatch(/function scheduleCatalogSync\(/)
+    expect(mainSource).toMatch(/data-action="refresh-library"/)
+    expect(mainSource).toMatch(/if \(action === 'refresh-library'\)/)
     expect(mainSource).toMatch(/catalogSync\?\.cancel\(\)/)
+    expect(mainSource).not.toMatch(
+      /initializeAppHistory\(\)\s*\nrender\(\)\s*\nscheduleCatalogSync\(\)/,
+    )
+    expect(mainSource).not.toMatch(/nowNextCache\.clear\(\)\s*\n\s*scheduleCatalogSync\(\)/)
+    expect(mainSource).not.toMatch(/render\(\)\s*\n\s*scheduleCatalogSync\(\)\s*\n}\s*\n\s*function togglePlayback/)
   })
 })
