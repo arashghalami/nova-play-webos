@@ -1207,3 +1207,68 @@ The run stopped after five serial provider requests because the VOD category-man
 - Gate 1 remains **rejected/pending**: this entry proves the local post-scan publication path, not all-three-section authoritative provider synchronization.
 - Phase 2A remains **not started and not authorized**.
 - The next provider action remains exactly one separately approved serial Gate 1 sync in a future UTC window with all six sync debits available. No provider request is authorized before that condition is met.
+
+## 2026-08-02 — Sync-debit diagnosis, bounded playback verification, and compatibility guidance correction
+
+### Unexplained sync-debit diagnosis and correction
+
+- The apparent unexplained transition from sync `5/6` to `6/6` was traced to the automatic catalog scheduler. On launch/relaunch, a due coordinator run was scheduled after its 10-second idle delay. With only one sync debit remaining, it issued the first category-manifest request, consumed that final debit, and could not complete the remaining five fixed request slots.
+- This was a real provider request caused by the scheduled partial run; it was not caused by the local publication probe, device installation, DevTools inspection, counter inspection, or any budget reset.
+- The corrective policy is now explicit:
+  - `CatalogSyncCoordinator` asks the real broker for a six-slot preflight before beginning a normal scheduled run.
+  - A run with fewer than all six available sync debits returns `deferred`, has `requestCount=0`, and does not create a sync lease, mutate catalog state, or issue provider traffic.
+  - Broker accounting now debits only at the actual `XtreamClient` transport-handoff boundary. A pre-aborted request, a persisted refusal, an exhausted budget, or a synchronous transport setup failure consumes no debit.
+- Regressions cover pre-aborted work, blocked work, cooled-down coordinator work, transport failure before a request handoff, a five-of-six partial preflight, and a full completed run followed by a zero-request cooldown call.
+- Automated evidence after this correction:
+  - targeted broker/coordinator/client suite: 48 tests passed;
+  - full suite: 31 files, 239 tests passed;
+  - build/package checks: 33 runtime source modules have no relative import cycles; the ES2015 IIFE and standalone-media bundle checks passed.
+- Probe-enabled package `com.arash.novaplay` `1.0.13` was installed on `OLED55G1RLA`. With the persisted counter at interactive `2/24`, sync `6/6`, and no refusal block, the probe cleared only stale local scheduler/checkpoint state and invoked a due run:
+  - result: `deferred`, `requestCount=0`, and `nextDueAt` equal to the next UTC boundary;
+  - counters before/after: unchanged at interactive `2/24`, sync `6/6`, block `null`;
+  - no provider request, provider-budget debit, ceiling change, or refusal-state mutation occurred.
+- This physically proves that a future relaunch cannot spend a lone final sync debit on an incomplete scheduled run.
+
+### Playback verification scope and evidence
+
+- Playback checks used only reversible local probe fixtures built from an already cached live item. The fixture changed only the in-memory persisted container-extension label for the selected local test, never recorded a provider URL/title in this report, and was restored afterward. No catalog-sync debit or provider acquisition was used.
+- Existing native VOD/episode playback remained operational on the physical TV:
+  - video reached `readyState=4` with a visible `1280×720` track and no media error;
+  - pause held position exactly over the sampled interval;
+  - resume advanced approximately 1.209 seconds over the next sample interval;
+  - a 20-second seek landed at the exact requested position with no media error.
+- HLS fallback was exercised with a deliberate first native-attempt error against the local HLS-labelled fixture:
+  - the fallback reached a `blob:` MediaSource pipeline with a visible `1920×1080` track, advancing playback time, no media error, and hidden diagnostics;
+  - this confirms the standalone Hls.js global, construction path, engine switch, and HLS playback path operate on the physical package.
+- MPEG-TS capability is present on the device (`mseLivePlayback=true`), and a TS-labelled fixture played natively with a visible `1920×1080` track. A deliberate failure surfaced the `MPEG-TS · network` fallback diagnostic.
+  - The external MPEG-TS engine constructor was not observed before the provider stream's later network failure, so this is **not** a physical pass for the MPEG-TS wrapper itself.
+- No safe cached DASH/MPD candidate was available, and no hydrated multi-channel live queue was available without issuing an additional interactive catalog request. DASH wrapper playback and in-app channel switching are therefore **unverified**, not passed.
+- The normal fallback chain, seek, pause, and resume have physical evidence above. HLS engine-switch evidence is accepted only for the tested fixture. DASH, MPEG-TS-wrapper, and channel-switch evidence remain open requirements for a future safe playback procedure.
+
+### Startup observation
+
+- A single physical navigation-timing sample from the standalone-media probe build recorded `domContentLoaded=936 ms` and `load=957 ms`.
+- The initial Home render is synchronous in the application IIFE and was present by the completed load sample. This is recorded as the current single-sample time-to-stable-Home observation, not as a before/after performance comparison.
+- The previously measured pre-boundary baseline is not available in the same instrumentation shape. Deferring unused media engines remains an available future optimization if a representative multi-sample regression is material; it was not implemented here.
+
+### Corrected Dash.js/minifier guidance
+
+- Historical entries that described the Dash.js `[COMMONJS_VARIABLE_IN_ESM]`/CommonJS-in-ESM warning as “non-blocking” are superseded. It was the diagnostic fingerprint of the physical temporal-dead-zone defect: the transformed Dash.js ESM initializer produced `ReferenceError: Cannot access 'i' before initialization` on the target webOS Chromium runtime.
+- Do not dismiss that warning if the Dash.js module is ever reintroduced into the application IIFE. Treat it as a release blocker requiring physical legacy-webOS verification.
+- The corrective boundary remains: Dash.js, Hls.js, and MPEG-TS load as separately packaged UMD scripts before the app IIFE; the build rejects their inclusion in `app.js`.
+- **Known unresolved compatibility issue:** enabling minification for the ES2015 application IIFE recreates a physical TDZ failure in transformed coroutine-local publication code. The exact old-Chromium/minifier interaction remains unidentified. The tested workaround is `build.minify = false`; it preserves the ES2015 target and keeps upstream media UMD assets minified. Do not re-enable IIFE minification without a new physical synthetic-publication proof.
+
+### Decision
+
+- Debit diagnosis and no-partial-run enforcement: **accepted**.
+- Physical HLS wrapper fallback, native seek/pause/resume, and local counter preflight evidence: **accepted within the stated test scope**.
+- DASH wrapper, MPEG-TS wrapper, and live channel-switch verification: **pending**; no unverified engine may be claimed as passing.
+- Gate 1: **rejected/pending**. The future approved serial provider sync still requires all six sync debits available, Live/VOD/Series authoritative completion, no failed checkpoint/cursor, and no snapshot-publication fault.
+- Phase 2A remains **not started and not authorized**.
+
+### Normal-package deployment closure
+
+- The temporary probe-only build setting was removed after the bounded physical evidence was captured.
+- A normal, non-probe `com.arash.novaplay` `1.0.13` package was rebuilt with the same ES2015 app/IIFE and standalone-media boundary checks, installed, and launched on `OLED55G1RLA`.
+- Physical CDP verification returned `typeof window.__NOVA_LIBRARY_PROBE__ === "undefined"`.
+- The development/probe surface is therefore absent from the installed normal package. The package remains on the corrected no-partial-run and standalone-media implementation.

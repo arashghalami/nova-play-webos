@@ -99,6 +99,12 @@ describe('CatalogSyncCoordinator', () => {
     )
 
     expect(result).toMatchObject({ status: 'completed', requestCount: 6 })
+    const cooldown = await new CatalogSyncCoordinator(broker, repository).sync(fixtureProfile.id)
+    expect(cooldown).toMatchObject({ status: 'cooldown', requestCount: 0 })
+    expect(broker.inspectBudget()).toMatchObject({
+      interactive: { used: 0 },
+      sync: { used: 6, remaining: 0 },
+    })
     await expect(broker.backgroundCategories('live')).rejects.toMatchObject({
       kind: 'rate-limited',
     })
@@ -107,6 +113,37 @@ describe('CatalogSyncCoordinator', () => {
     ).resolves.toMatchObject({
       coverage: 'complete',
       items: [expect.objectContaining({ id: 'series-1' })],
+    })
+  })
+
+  it('defers a scheduled run before provider traffic when fewer than six sync debits remain', async () => {
+    vi.stubGlobal('localStorage', new MemoryStorage())
+    const repository = createRepository()
+    const transport = {
+      fetch: vi.fn(async () => new Response('[]', { status: 200 })),
+    }
+    const broker = new ProviderBroker(fixtureProfile, {
+      transport,
+      interactiveDailyRequestBudget: 24,
+      syncDailyRequestBudget: 6,
+    })
+
+    for (let index = 0; index < 5; index += 1) {
+      await broker.backgroundCategories('live')
+    }
+
+    const result = await new CatalogSyncCoordinator(broker, repository).sync(fixtureProfile.id)
+
+    expect(result).toMatchObject({
+      status: 'deferred',
+      requestCount: 0,
+      sections: [],
+      nextDueAt: expect.any(Number),
+    })
+    expect(transport.fetch).toHaveBeenCalledTimes(5)
+    expect(broker.inspectBudget()).toMatchObject({
+      interactive: { used: 0 },
+      sync: { used: 5, remaining: 1 },
     })
   })
 

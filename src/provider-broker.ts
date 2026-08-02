@@ -35,6 +35,13 @@ export type ProviderBrokerOptions = {
   now?: () => number
 }
 
+export type ProviderCatalogSyncPreflight = {
+  allowed: boolean
+  reason: 'provider-blocked' | 'budget-exhausted' | null
+  nextEligibleAt?: number
+  budget: ProviderBudgetSnapshot
+}
+
 export type ProviderBudgetSnapshot = {
   now: number
   windowStartAt: number
@@ -207,6 +214,43 @@ export class ProviderBroker {
     const { state, resetRule } = this.normalizedState(this.now())
     saveProviderAccessState(this.profileId, state)
     return this.budgetSnapshot(state, resetRule, this.now())
+  }
+
+  /**
+   * Refuses a partial scheduled catalog pass up front. A due run must have all
+   * of its fixed request slots available, so a relaunch cannot consume the
+   * final debit and leave the following run short of its section scan.
+   */
+  canBeginCatalogSync(requestCount: number): ProviderCatalogSyncPreflight {
+    if (!Number.isInteger(requestCount) || requestCount < 1) {
+      throw new Error('Catalog sync request count must be a positive integer.')
+    }
+
+    const now = this.now()
+    const { state, resetRule } = this.normalizedState(now)
+    state.updatedAt = now
+    saveProviderAccessState(this.profileId, state)
+    const budget = this.budgetSnapshot(state, resetRule, now)
+
+    if (state.block && isProviderBlocked(state.block, now)) {
+      return {
+        allowed: false,
+        reason: 'provider-blocked',
+        ...(state.block.until === null ? {} : { nextEligibleAt: state.block.until }),
+        budget,
+      }
+    }
+
+    if (budget.sync.remaining < requestCount) {
+      return {
+        allowed: false,
+        reason: 'budget-exhausted',
+        nextEligibleAt: budget.nextResetAt,
+        budget,
+      }
+    }
+
+    return { allowed: true, reason: null, budget }
   }
 
   /**
@@ -432,6 +476,7 @@ export class ProviderBroker {
           continue
         }
 
+        const activeRequest = pending
         const now = this.now()
         const { state } = this.normalizedState(now)
 
@@ -440,41 +485,78 @@ export class ProviderBroker {
           this.traceBudgetEvent(
             'provider-request-blocked',
             state,
-            pending.priority,
-            pending.budget,
+            activeRequest.priority,
+            activeRequest.budget,
             'refusal',
           )
-          pending.reject(error)
+          activeRequest.reject(error)
           this.rejectQueued(error)
           continue
         }
 
-        if (this.budgetUsed(state, pending.budget) >= this.budgetLimit(pending.budget)) {
+        if (
+          this.budgetUsed(state, activeRequest.budget) >=
+          this.budgetLimit(activeRequest.budget)
+        ) {
           state.updatedAt = now
           saveProviderAccessState(this.profileId, state)
           this.traceBudgetEvent(
             'provider-budget-rejected',
             state,
-            pending.priority,
-            pending.budget,
+            activeRequest.priority,
+            activeRequest.budget,
             'budget-exhausted',
           )
-          pending.reject(this.budgetExceededError(pending.budget))
+          activeRequest.reject(this.budgetExceededError(activeRequest.budget))
           continue
         }
 
-        this.debitBudget(state, pending.budget)
-        state.updatedAt = now
-        saveProviderAccessState(this.profileId, state)
-        this.traceBudgetEvent('provider-budget-debit', state, pending.priority, pending.budget)
+        const assertCanIssue = (): void => {
+          if (activeRequest.signal?.aborted) {
+            throw new ProviderError('cancelled', 'Request cancelled.', false)
+          }
+
+          const issueNow = this.now()
+
+          if (state.block && isProviderBlocked(state.block, issueNow)) {
+            throw this.accessBlockedError()
+          }
+
+          if (
+            this.budgetUsed(state, activeRequest.budget) >=
+            this.budgetLimit(activeRequest.budget)
+          ) {
+            throw this.budgetExceededError(activeRequest.budget)
+          }
+        }
+
+        const recordIssuedRequest = (): void => {
+          // The transport handoff has already happened. Do not re-check abort or
+          // capacity here: either could change immediately after fetch begins,
+          // but the provider has still received the request and it must be
+          // represented by exactly one debit.
+          this.debitBudget(state, activeRequest.budget)
+          state.updatedAt = this.now()
+          saveProviderAccessState(this.profileId, state)
+          this.traceBudgetEvent(
+            'provider-budget-debit',
+            state,
+            activeRequest.priority,
+            activeRequest.budget,
+          )
+        }
 
         try {
-          const result = await pending.run(this.client)
+          const result = await this.client.runWithRequestIssueObserver(
+            assertCanIssue,
+            recordIssuedRequest,
+            () => activeRequest.run(this.client),
+          )
           state.failureCount = 0
           state.nextAttemptAt = null
           state.updatedAt = this.now()
           saveProviderAccessState(this.profileId, state)
-          pending.resolve(result)
+          activeRequest.resolve(result)
         } catch (reason) {
           const block = providerBlockForFailure(reason, this.now())
 
@@ -485,11 +567,11 @@ export class ProviderBroker {
             this.traceBudgetEvent(
               'provider-refusal-recorded',
               state,
-              pending.priority,
-              pending.budget,
+              activeRequest.priority,
+              activeRequest.budget,
               'refusal',
             )
-            pending.reject(reason)
+            activeRequest.reject(reason)
             this.rejectQueued(reason)
             continue
           }
@@ -497,7 +579,7 @@ export class ProviderBroker {
           state.failureCount += 1
           state.updatedAt = this.now()
           saveProviderAccessState(this.profileId, state)
-          pending.reject(reason)
+          activeRequest.reject(reason)
         }
       }
     } finally {

@@ -128,6 +128,50 @@ describe('ProviderBroker', () => {
     await broker.validate()
     await expect(broker.validate()).rejects.toMatchObject({ kind: 'rate-limited' })
     expect(transport.fetch).toHaveBeenCalledTimes(1)
+    expect(broker.inspectBudget()).toMatchObject({
+      interactive: { used: 1 },
+      sync: { used: 0 },
+    })
+  })
+
+  it('does not debit an attempt already aborted before it can reach transport', async () => {
+    vi.stubGlobal('localStorage', new MemoryStorage())
+    const transport: ProviderTransport = {
+      fetch: vi.fn(async () => new Response('[]', { status: 200 })),
+    }
+    const broker = new ProviderBroker(profile, { transport })
+    const controller = new AbortController()
+    controller.abort()
+
+    await expect(broker.backgroundCategories('live', controller.signal)).rejects.toMatchObject({
+      kind: 'cancelled',
+    })
+
+    expect(transport.fetch).not.toHaveBeenCalled()
+    expect(broker.inspectBudget()).toMatchObject({
+      interactive: { used: 0 },
+      sync: { used: 0 },
+    })
+  })
+
+  it('does not debit when the transport throws before issuing a request', async () => {
+    vi.stubGlobal('localStorage', new MemoryStorage())
+    const transport: ProviderTransport = {
+      fetch: vi.fn(() => {
+        throw new Error('Transport setup failed before request handoff.')
+      }),
+    }
+    const broker = new ProviderBroker(profile, { transport })
+
+    await expect(broker.backgroundCategories('live')).rejects.toMatchObject({
+      kind: 'network',
+    })
+
+    expect(transport.fetch).toHaveBeenCalledTimes(1)
+    expect(broker.inspectBudget()).toMatchObject({
+      interactive: { used: 0 },
+      sync: { used: 0 },
+    })
   })
 
   it('persists a provider refusal and blocks requests after a simulated relaunch', async () => {
@@ -152,6 +196,10 @@ describe('ProviderBroker', () => {
 
     await expect(relaunchedBroker.validate()).rejects.toMatchObject({ kind: 'rate-limited' })
     expect(laterTransport.fetch).not.toHaveBeenCalled()
+    expect(relaunchedBroker.inspectBudget()).toMatchObject({
+      interactive: { used: 1 },
+      sync: { used: 0 },
+    })
   })
 
   it('runs interactive work before queued catalog and background work', async () => {
@@ -261,6 +309,36 @@ describe('ProviderBroker', () => {
     expect(JSON.stringify(debit)).not.toContain(profile.serverUrl)
     expect(JSON.stringify(debit)).not.toContain(profile.username)
     expect(JSON.stringify(debit)).not.toContain(profile.password)
+  })
+
+  it('refuses a partial scheduled catalog pass without consuming its final sync debit', async () => {
+    vi.stubGlobal('localStorage', new MemoryStorage())
+    const transport: ProviderTransport = {
+      fetch: vi.fn(async () => new Response('[]', { status: 200 })),
+    }
+    const broker = new ProviderBroker(profile, {
+      transport,
+      interactiveDailyRequestBudget: 24,
+      syncDailyRequestBudget: 6,
+    })
+
+    for (let index = 0; index < 5; index += 1) {
+      await broker.backgroundCategories('live')
+    }
+
+    const preflight = broker.canBeginCatalogSync(6)
+
+    expect(preflight).toMatchObject({
+      allowed: false,
+      reason: 'budget-exhausted',
+      budget: { sync: { used: 5, remaining: 1 } },
+    })
+    expect(preflight.nextEligibleAt).toEqual(expect.any(Number))
+    expect(transport.fetch).toHaveBeenCalledTimes(5)
+    expect(broker.inspectBudget()).toMatchObject({
+      interactive: { used: 0 },
+      sync: { used: 5, remaining: 1 },
+    })
   })
 
   it('keeps normal interactive use out of the six-request catalog-sync budget', async () => {

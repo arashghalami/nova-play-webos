@@ -1,6 +1,9 @@
 import { isProviderError, isProviderRefusal } from '../provider-error'
 import { performanceTrace } from '../performance-trace'
-import type { ProviderBroker } from '../provider-broker'
+import type {
+  ProviderBroker,
+  ProviderCatalogSyncPreflight,
+} from '../provider-broker'
 import { internalFaultTraceData } from './internal-fault-diagnostics'
 import type { Category, LibrarySection, StreamItem } from '../types'
 import {
@@ -20,11 +23,16 @@ export const CATALOG_SYNC_SUCCESS_COOLDOWN_MS = 24 * 60 * 60 * 1000
 export const CATALOG_SYNC_FAILURE_COOLDOWN_INITIAL_MS = 6 * 60 * 60 * 1000
 export const CATALOG_SYNC_FAILURE_COOLDOWN_MAX_MS = 24 * 60 * 60 * 1000
 export const CATALOG_SYNC_STALE_RUN_MS = 10 * 60 * 1000
+export const CATALOG_SYNC_REQUESTS_PER_COMPLETE_RUN = 6
 
 export type CatalogSyncProvider = Pick<
   ProviderBroker,
   'backgroundCategories' | 'backgroundScanSection'
->
+> & {
+  canBeginCatalogSync?: (
+    requestCount: number,
+  ) => ProviderCatalogSyncPreflight
+}
 
 export type CatalogSyncSectionResult = {
   section: LibrarySection
@@ -43,7 +51,7 @@ export type CatalogSyncResult =
       sections: CatalogSyncSectionResult[]
     }
   | {
-      status: 'busy' | 'cooldown'
+      status: 'busy' | 'cooldown' | 'deferred'
       requestCount: 0
       nextDueAt?: number
       sections: []
@@ -125,6 +133,19 @@ export class CatalogSyncCoordinator {
 
     if (this.activeController) {
       return { status: 'busy', requestCount: 0, sections: [] }
+    }
+
+    const preflight = this.provider.canBeginCatalogSync?.(
+      CATALOG_SYNC_REQUESTS_PER_COMPLETE_RUN,
+    )
+
+    if (preflight && !preflight.allowed) {
+      return {
+        status: 'deferred',
+        requestCount: 0,
+        nextDueAt: preflight.nextEligibleAt,
+        sections: [],
+      }
     }
 
     const controller = new AbortController()

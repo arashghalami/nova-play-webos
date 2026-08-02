@@ -653,11 +653,52 @@ export class XtreamClient {
   readonly baseUrl: string
   private readonly profile: XtreamProfile
   private readonly transport: ProviderTransport
+  private requestIssueObserver: {
+    assertCanIssue: () => void
+    reportIssued: () => void
+  } | null = null
 
   constructor(profile: XtreamProfile, transport: ProviderTransport = appProviderTransport()) {
     this.profile = profile
     this.transport = transport
     this.baseUrl = toBaseUrl(profile.serverUrl)
+  }
+
+  /**
+   * Runs one broker-owned operation while guarding and recording each actual
+   * transport handoff. A synchronous transport failure never reaches
+   * `reportIssued`, so it cannot consume a provider budget unit.
+   */
+  async runWithRequestIssueObserver<T>(
+    assertCanIssue: () => void,
+    onRequestIssued: () => void,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (this.requestIssueObserver) {
+      throw new Error('An Xtream request issue observer is already active.')
+    }
+
+    const observer = {
+      assertCanIssue,
+      reportIssued: onRequestIssued,
+    }
+    this.requestIssueObserver = observer
+
+    try {
+      return await operation()
+    } finally {
+      if (this.requestIssueObserver === observer) {
+        this.requestIssueObserver = null
+      }
+    }
+  }
+
+  private assertCanIssueRequest(): void {
+    this.requestIssueObserver?.assertCanIssue()
+  }
+
+  private reportRequestIssued(): void {
+    this.requestIssueObserver?.reportIssued()
   }
 
   private apiUrl(action?: string, parameters: Record<string, string> = {}): string {
@@ -697,15 +738,21 @@ export class XtreamClient {
     }
 
     try {
+      if (controller.signal.aborted) {
+        throw new ProviderError('cancelled', 'Request cancelled.', false)
+      }
       let response: Response
 
       try {
         performanceTrace.event('network', 'xtream-fetch-start', { operation }, {
           requestId: requestId ?? undefined,
         })
-        response = await this.transport.fetch(this.apiUrl(action, parameters), {
+        this.assertCanIssueRequest()
+        const responsePromise = this.transport.fetch(this.apiUrl(action, parameters), {
           signal: controller.signal,
         })
+        this.reportRequestIssued()
+        response = await responsePromise
         performanceTrace.event(
           'network',
           'xtream-response-headers',
@@ -716,7 +763,11 @@ export class XtreamClient {
           },
           { requestId: requestId ?? undefined },
         )
-      } catch {
+      } catch (reason) {
+        if (reason instanceof ProviderError) {
+          throw reason
+        }
+
         if (options.signal?.aborted) {
           throw new ProviderError('cancelled', 'Request cancelled.', false)
         }
@@ -1235,6 +1286,10 @@ export class XtreamClient {
     }
 
     try {
+      if (controller.signal.aborted) {
+        throw new ProviderError('cancelled', 'Request cancelled.', false)
+      }
+
       let response: Response
 
       try {
@@ -1248,9 +1303,12 @@ export class XtreamClient {
           ? { category_id: options.categoryId }
           : {}
 
-        response = await this.transport.fetch(this.apiUrl(operation, parameters), {
+        this.assertCanIssueRequest()
+        const responsePromise = this.transport.fetch(this.apiUrl(operation, parameters), {
           signal: controller.signal,
         })
+        this.reportRequestIssued()
+        response = await responsePromise
         responseStatus = response.status
         responseHeaderElapsedMs = Date.now() - scanStartedAt
         performanceTrace.event(
@@ -1271,7 +1329,11 @@ export class XtreamClient {
             options.timeoutMs ?? SEARCH_TIMEOUT_MS,
           )
         }
-      } catch {
+      } catch (reason) {
+        if (reason instanceof ProviderError) {
+          throw reason
+        }
+
         if (options.signal?.aborted) {
           throw new ProviderError('cancelled', 'Request cancelled.', false)
         }
