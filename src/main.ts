@@ -5722,6 +5722,18 @@ async function runCatalogSync() {
       issuedRequestCount: result.issuedRequestCount,
     })
 
+    result.sections.forEach((section) => {
+      performanceTrace.event('library', 'catalog-sync-section-result', {
+        section: section.section,
+        mode: section.mode,
+        success: section.success,
+        reason: section.reason ?? null,
+        refused: section.refused === true,
+        attemptedRequestCount: section.attemptedRequestCount,
+        issuedRequestCount: section.issuedRequestCount,
+      })
+    })
+
     return result
   } catch {
     performanceTrace.event('library', 'catalog-sync-failed', {
