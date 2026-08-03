@@ -1329,3 +1329,54 @@ The run stopped after five serial provider requests because the VOD category-man
   4. record per-section attempted, issued/debited, status, bytes, elapsed, parsed records, snapshots, item counts, coverage, checkpoints/cursors, and final persisted budget delta;
   5. confirm a follow-up call returns cooldown with zero attempted and zero issued requests.
 - Gate 1 remains **pending**, not accepted. Phase 2A remains **blocked** until the one authorized serial run completes Live, VOD, and Series authoritatively with no residual failed checkpoint/cursor or snapshot-publication fault.
+
+## 2026-08-03 — Single manual Gate 1 run: bounded VOD response rejected
+
+### Controlled procedure and preflight
+
+- Installed normal package `com.arash.novaplay` `1.0.15`, which contains the explicit manual-refresh control and sanitized per-section result tracing. The normal package continued to expose no library-probe surface.
+- The app was closed through the UTC boundary and then launched only after the new window began. CDP capture and the existing performance trace were enabled before the operator navigated to Settings.
+- Fresh-window preflight recorded:
+  - sync budget `0/6` used;
+  - no persisted refusal block;
+  - current stored UTC window start matched the current UTC boundary;
+  - the explicit **Refresh downloaded library** control was present.
+- The trace was cleared immediately before invoking that control. Exactly one manual refresh was invoked. No provider-budget reset, limit change, checkpoint clearing, or auxiliary provider request occurred.
+
+### Serialized provider and coordinator evidence
+
+- The broker recorded exactly six background/sync handoff debits, progressing from `1/6` through `6/6`; no budget rejection, refusal recording, or provider block occurred.
+- Each request was serialized. The three category manifests were followed by one whole-section scan for Live, VOD, and Series.
+- Sanitized scan-terminal measurements:
+
+| Section | HTTP | Header elapsed | Total elapsed | Bytes | Parsed records | Array closed | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| Live | 200 | 274 ms | 13,156 ms | 18,070,388 | 52,209 | yes | complete |
+| VOD | 200 | 5,061 ms | 58,795 ms | 67,122,387 | 164,074 | no — bounded read cancelled | failed: `too-large` |
+| Series | 200 | 471 ms | 35,972 ms | 51,506,944 | 44,684 | yes | complete |
+
+- VOD exceeded the configured strict catalog response ceiling of 64 MiB by a small amount. The client correctly aborted the bounded read, classified the condition as `too-large`, and did not publish a partial VOD catalog. This is a provider-payload-size limit, not a refusal, timeout, parser-closure acceptance, or local publication failure.
+- Coordinator result:
+  - `status=failed`;
+  - attempted requests `6`;
+  - issued/debited requests `6`;
+  - Live: whole-section success, attempted `2`, issued `2`;
+  - VOD: whole-section `scan-failed`, attempted `2`, issued `2`;
+  - Series: whole-section success, attempted `2`, issued `2`.
+- The persisted broker state after the run was interactive `4/24`, sync `6/6`, with no refusal block. The interactive count is reported separately and is not part of Gate 1 sync accounting.
+
+### Published-state and cooldown evidence
+
+- Persisted catalog state after the run:
+  - Live: coverage `complete`; 823 manifest categories; 825 active snapshots; 52,209 items; checkpoint failure count `0`; success timestamp present.
+  - Series: coverage `complete`; 231 manifest categories; 231 active snapshots; 44,684 items; checkpoint failure count `0`; success timestamp present.
+  - VOD: coverage `none`; 362 manifest categories; zero active snapshots/items; checkpoint failure count `1`; no success timestamp.
+  - Global sync state: `inProgress=false`, `failureCount=1`, and a six-hour failure cooldown deadline.
+- The one permitted follow-up manual invocation returned `cooldown` with attempted requests `0` and issued requests `0`. The persisted sync counter remained `6/6`; no extra provider debit occurred.
+
+### Decision and next step
+
+- Request accounting, serialization, fixed-six preflight, issued-versus-attempted reconciliation, section-level tracing, and zero-request cooldown behavior are **accepted**.
+- Gate 1 is **rejected**. Live and Series are authoritative, but VOD is not authoritative because its whole-section response exceeded the established 64 MiB safety ceiling.
+- Phase 2A remains **blocked**. Do not treat the two successful sections as an accepted all-library cutover.
+- The next task is not another provider run. It requires a separately approved bounded VOD acquisition design that preserves strict completeness, bounded memory/work, cache authority, and the no-partial-publication rule (for example, a proven section-safe continuation strategy or a sufficiently bounded provider-supported acquisition path). No budget increase or repeated same-window run is authorized by this result.
