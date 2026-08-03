@@ -24,6 +24,21 @@ export const CATALOG_SYNC_FAILURE_COOLDOWN_INITIAL_MS = 6 * 60 * 60 * 1000
 export const CATALOG_SYNC_FAILURE_COOLDOWN_MAX_MS = 24 * 60 * 60 * 1000
 export const CATALOG_SYNC_STALE_RUN_MS = 10 * 60 * 1000
 export const CATALOG_SYNC_REQUESTS_PER_COMPLETE_RUN = 6
+/**
+ * Keep per-category partial publication bounded below the repository's physical
+ * snapshot limit so each parser checkpoint is one cooperative cache unit.
+ */
+export const PARTIAL_CATEGORY_FLUSH_ITEMS = 128
+/**
+ * The physical VOD measurement completed at 79,696,256 bytes. 96 MiB leaves
+ * more than 20 MiB of headroom while retaining a bounded sync-lane response.
+ */
+export const VOD_SYNC_MAX_RESPONSE_BYTES = 96 * 1024 * 1024
+/**
+ * Explicit VOD measurement runs use this temporary discovery ceiling. It is not
+ * the normal production setting and exists only for controlled sizing passes.
+ */
+export const VOD_SYNC_MEASUREMENT_MAX_RESPONSE_BYTES = 192 * 1024 * 1024
 
 export type CatalogSyncProvider = Pick<
   ProviderBroker,
@@ -88,6 +103,19 @@ export type CatalogSyncResult =
       sections: []
     }
 
+export type CatalogSyncRunOptions = {
+  /**
+   * An explicitly invoked, section-scoped recovery scan. It reuses the persisted
+   * category manifest, so its provider plan is exactly one section scan.
+   */
+  section?: LibrarySection
+  /**
+   * Applies only to an explicitly scoped section scan. Normal complete runs
+   * retain the default provider response bound.
+   */
+  maxResponseBytes?: number
+}
+
 export type CatalogSyncOptions = {
   now?: () => number
   successCooldownMs?: number
@@ -149,11 +177,25 @@ export class CatalogSyncCoordinator {
     this.activeController?.abort()
   }
 
-  async sync(profileId: string): Promise<CatalogSyncResult> {
+  async sync(
+    profileId: string,
+    runOptions: CatalogSyncRunOptions = {},
+  ): Promise<CatalogSyncResult> {
     const now = this.now()
     const priorMeta = await this.repository.getMeta(profileId)
+    const targetedSection = runOptions.section
+    const plannedSections = targetedSection
+      ? [targetedSection]
+      : CATALOG_SYNC_SECTIONS
+    const plannedRequestCount = targetedSection
+      ? 1
+      : CATALOG_SYNC_REQUESTS_PER_COMPLETE_RUN
 
-    if (priorMeta?.nextDueAt !== undefined && priorMeta.nextDueAt > now) {
+    if (
+      !targetedSection &&
+      priorMeta?.nextDueAt !== undefined &&
+      priorMeta.nextDueAt > now
+    ) {
       return {
         status: 'cooldown',
         requestCount: 0,
@@ -167,9 +209,7 @@ export class CatalogSyncCoordinator {
       return { status: 'busy', requestCount: 0, issuedRequestCount: 0, sections: [] }
     }
 
-    const preflight = this.provider.canBeginCatalogSync?.(
-      CATALOG_SYNC_REQUESTS_PER_COMPLETE_RUN,
-    )
+    const preflight = this.provider.canBeginCatalogSync?.(plannedRequestCount)
 
     if (preflight && !preflight.allowed) {
       return {
@@ -191,7 +231,7 @@ export class CatalogSyncCoordinator {
     }
 
     const sectionStates = new Map<LibrarySection, LibrarySyncSectionState>()
-    for (const section of CATALOG_SYNC_SECTIONS) {
+    for (const section of plannedSections) {
       const manifest = await this.repository.getManifest(profileId, section)
       sectionStates.set(
         section,
@@ -205,7 +245,7 @@ export class CatalogSyncCoordinator {
     const categoriesBySection = new Map<LibrarySection, Category[]>()
     const sections: CatalogSyncSectionOutcome[] = []
     const sectionRequestCounts = new Map<LibrarySection, CatalogSyncSectionRequestCounts>(
-      CATALOG_SYNC_SECTIONS.map((section) => [
+      plannedSections.map((section) => [
         section,
         {
           attempted: 0,
@@ -240,9 +280,28 @@ export class CatalogSyncCoordinator {
     let refusal = false
 
     try {
-      for (const section of CATALOG_SYNC_SECTIONS) {
+      for (const section of plannedSections) {
         if (controller.signal.aborted || refusal) {
           break
+        }
+
+        if (targetedSection) {
+          const manifest = await this.repository.getManifest(profileId, section)
+          const categories = categoriesFromManifest(manifest)
+
+          if (!categories.length) {
+            failed = true
+            sections.push({
+              section,
+              mode: 'skipped',
+              success: false,
+              reason: 'no-categories',
+            })
+          } else {
+            categoriesBySection.set(section, categories)
+          }
+
+          continue
         }
 
         const attemptAt = this.now()
@@ -298,7 +357,7 @@ export class CatalogSyncCoordinator {
         }
       }
 
-      for (const section of CATALOG_SYNC_SECTIONS) {
+      for (const section of plannedSections) {
         if (controller.signal.aborted || refusal) {
           break
         }
@@ -311,7 +370,7 @@ export class CatalogSyncCoordinator {
 
         const state = sectionStates.get(section) ?? normalizeSectionState(undefined, 'none')
 
-        if (state.wholeSectionFailureCount > 0) {
+        if (!targetedSection && state.wholeSectionFailureCount > 0) {
           const result = await this.syncCategorySlice(
             profileId,
             runId,
@@ -346,6 +405,7 @@ export class CatalogSyncCoordinator {
           sectionStates,
           controller.signal,
           () => beginProviderRequest(section),
+          runOptions.maxResponseBytes ?? syncResponseByteLimit(section),
         )
         sections.push(result)
 
@@ -443,41 +503,51 @@ export class CatalogSyncCoordinator {
     states: Map<LibrarySection, LibrarySyncSectionState>,
     signal: AbortSignal,
     recordRequest: () => (() => void),
+    maxResponseBytes?: number,
   ): Promise<CatalogSyncSectionOutcome> {
     const attemptAt = this.now()
-    const buckets = new Map<string, StreamItem[]>()
+    const incrementalPublication = state.coverage !== 'complete'
+    const buckets = incrementalPublication ? null : new Map<string, StreamItem[]>()
+    const categoryById = new Map(categories.map((category) => [category.id, category]))
+    const pendingByCategory = new Map<string, StreamItem[]>()
+    const partialCategoryKeys = new Set<string>()
+    const heap = createHeapSampler()
+    let streamedRecordCount = 0
+    let nextHeapSampleAt = 1_024
     let failureStage: CatalogSyncFailureStage = 'provider-scan'
     let publishStage: SnapshotPublishStage | null = null
 
-    const finishRequest = recordRequest()
+    const categoryForKey = (categoryKey: string): Category => {
+      const known = categoryById.get(categoryKey)
 
-    try {
-      await this.provider.backgroundScanSection(section, {
-        signal,
-        responseTimeoutMs: CATALOG_SYNC_HEADER_TIMEOUT_MS,
-        timeoutMs: CATALOG_SYNC_TOTAL_TIMEOUT_MS,
-        onMatches: (batch) => {
-          for (const item of batch) {
-            const categoryKey = item.categoryId || 'uncategorized'
-            const existing = buckets.get(categoryKey)
+      if (known) {
+        return known
+      }
 
-            if (existing) {
-              existing.push(item)
-            } else {
-              buckets.set(categoryKey, [item])
-            }
-          }
-        },
-      })
+      const category = {
+        id: categoryKey,
+        name: categoryKey === 'uncategorized' ? 'Uncategorized' : `Category ${categoryKey}`,
+      }
+      categoryById.set(categoryKey, category)
+      return category
+    }
 
-      finishRequest()
+    const flushPartialCategory = async (categoryKey: string): Promise<void> => {
+      const items = pendingByCategory.get(categoryKey)
+
+      if (!items?.length) {
+        return
+      }
+
+      pendingByCategory.delete(categoryKey)
       failureStage = 'snapshot-publish'
-      await this.repository.replaceSectionSnapshots(
+      await this.repository.appendPartialCategorySnapshot(
         {
           profileId,
           section,
+          category: categoryForKey(categoryKey),
+          items,
           runId,
-          snapshots: snapshotsForWholeSection(categories, buckets),
         },
         {
           signal,
@@ -487,6 +557,111 @@ export class CatalogSyncCoordinator {
           },
         },
       )
+      partialCategoryKeys.add(categoryKey)
+      failureStage = 'provider-scan'
+    }
+
+    const flushPartialSnapshots = async (): Promise<void> => {
+      for (const categoryKey of [...pendingByCategory.keys()]) {
+        await flushPartialCategory(categoryKey)
+      }
+    }
+
+    const finishRequest = recordRequest()
+
+    try {
+      if (incrementalPublication) {
+        failureStage = 'snapshot-publish'
+        await this.repository.preparePartialSectionSnapshotRun(profileId, section, runId)
+        failureStage = 'provider-scan'
+      }
+
+      await this.provider.backgroundScanSection(section, {
+        signal,
+        responseTimeoutMs: CATALOG_SYNC_HEADER_TIMEOUT_MS,
+        timeoutMs: CATALOG_SYNC_TOTAL_TIMEOUT_MS,
+        maxResponseBytes,
+        onMatches: async (batch) => {
+          streamedRecordCount += batch.length
+
+          if (streamedRecordCount >= nextHeapSampleAt) {
+            heap.sample()
+            nextHeapSampleAt = streamedRecordCount + 1_024
+          }
+
+          for (const item of batch) {
+            const categoryKey = item.categoryId || 'uncategorized'
+
+            if (incrementalPublication) {
+              const pending = pendingByCategory.get(categoryKey) ?? []
+              pending.push(item)
+              pendingByCategory.set(categoryKey, pending)
+
+              if (pending.length >= PARTIAL_CATEGORY_FLUSH_ITEMS) {
+                await flushPartialCategory(categoryKey)
+              }
+              continue
+            }
+
+            const existing = buckets!.get(categoryKey)
+
+            if (existing) {
+              existing.push(item)
+            } else {
+              buckets!.set(categoryKey, [item])
+            }
+          }
+        },
+      })
+
+      finishRequest()
+      failureStage = 'snapshot-publish'
+
+      if (incrementalPublication) {
+        await flushPartialSnapshots()
+
+        for (const category of categories) {
+          if (partialCategoryKeys.has(category.id)) {
+            continue
+          }
+
+          await this.repository.appendPartialCategorySnapshot(
+            {
+              profileId,
+              section,
+              category,
+              items: [],
+              runId,
+            },
+            {
+              signal,
+              onSnapshotPut: this.onSnapshotPut,
+              onPublishStage: (stage) => {
+                publishStage = stage
+              },
+            },
+          )
+          partialCategoryKeys.add(category.id)
+        }
+
+        await this.repository.promotePartialSectionSnapshots(profileId, section, runId)
+      } else {
+        await this.repository.replaceSectionSnapshots(
+          {
+            profileId,
+            section,
+            runId,
+            snapshots: snapshotsForWholeSection(categories, buckets!),
+          },
+          {
+            signal,
+            onSnapshotPut: this.onSnapshotPut,
+            onPublishStage: (stage) => {
+              publishStage = stage
+            },
+          },
+        )
+      }
       failureStage = 'manifest-read'
       const manifest = await this.repository.getManifest(profileId, section)
       failureStage = 'sync-state'
@@ -497,16 +672,37 @@ export class CatalogSyncCoordinator {
         lastAttemptAt: attemptAt,
         lastSuccessAt: this.now(),
       })
+      traceWholeSectionMemory(
+        section,
+        'completed',
+        streamedRecordCount,
+        maxResponseBytes,
+        heap,
+      )
 
       return { section, mode: 'whole-section', success: true }
     } catch (reason) {
       finishRequest()
 
       if (isCancelled(reason, signal)) {
+        traceWholeSectionMemory(
+          section,
+          'cancelled',
+          streamedRecordCount,
+          maxResponseBytes,
+          heap,
+        )
         return { section, mode: 'whole-section', success: false, reason: 'cancelled' }
       }
 
       const refused = isProviderRefusal(reason)
+      traceWholeSectionMemory(
+        section,
+        'failed',
+        streamedRecordCount,
+        maxResponseBytes,
+        heap,
+      )
       traceSectionFailure(
         section,
         'whole-section',
@@ -520,6 +716,7 @@ export class CatalogSyncCoordinator {
       await this.updateSectionState(profileId, runId, section, states, {
         coverage: manifest?.coverage.state ?? state.coverage,
         wholeSectionFailureCount: state.wholeSectionFailureCount + 1,
+        nextCategoryCursor: firstIncompleteCategoryCursor(categories, manifest),
         lastAttemptAt: attemptAt,
         lastFailureAt: this.now(),
       })
@@ -552,7 +749,12 @@ export class CatalogSyncCoordinator {
       }
     }
 
-    const cursor = state.nextCategoryCursor % categories.length
+    const recoveryManifest = await this.repository.getManifest(profileId, section)
+    const incompleteCursor =
+      state.coverage === 'partial'
+        ? incompleteCategoryCursor(categories, recoveryManifest)
+        : null
+    const cursor = incompleteCursor ?? state.nextCategoryCursor % categories.length
     const category = categories[cursor]
     const attemptAt = this.now()
     const items: StreamItem[] = []
@@ -567,6 +769,7 @@ export class CatalogSyncCoordinator {
         categoryId: category.id,
         responseTimeoutMs: CATALOG_SYNC_HEADER_TIMEOUT_MS,
         timeoutMs: CATALOG_SYNC_TOTAL_TIMEOUT_MS,
+        maxResponseBytes: syncResponseByteLimit(section),
         onMatches: (batch) => items.push(...batch),
       })
 
@@ -590,12 +793,23 @@ export class CatalogSyncCoordinator {
       )
       failureStage = 'manifest-read'
       const manifest = await this.repository.getManifest(profileId, section)
-      const nextCategoryCursor = (cursor + 1) % categories.length
+      const nextIncompleteCursor =
+        state.coverage === 'partial'
+          ? incompleteCategoryCursor(categories, manifest)
+          : null
+      const nextCategoryCursor =
+        state.coverage === 'partial'
+          ? nextIncompleteCursor ?? 0
+          : (cursor + 1) % categories.length
+      const recoveryComplete =
+        state.coverage === 'partial'
+          ? nextIncompleteCursor === null
+          : nextCategoryCursor === 0
       failureStage = 'sync-state'
       await this.updateSectionState(profileId, runId, section, states, {
         coverage: manifest?.coverage.state ?? state.coverage,
         wholeSectionFailureCount:
-          nextCategoryCursor === 0 ? 0 : state.wholeSectionFailureCount,
+          recoveryComplete ? 0 : state.wholeSectionFailureCount,
         nextCategoryCursor,
         lastAttemptAt: attemptAt,
         lastSuccessAt: this.now(),
@@ -682,6 +896,37 @@ function normalizeSectionState(
   }
 }
 
+function syncResponseByteLimit(section: LibrarySection): number | undefined {
+  return section === 'vod' ? VOD_SYNC_MAX_RESPONSE_BYTES : undefined
+}
+
+function firstIncompleteCategoryCursor(
+  categories: readonly Category[],
+  manifest: Awaited<ReturnType<IndexedDbCatalogRepository['getManifest']>>,
+): number {
+  return incompleteCategoryCursor(categories, manifest) ?? 0
+}
+
+function incompleteCategoryCursor(
+  categories: readonly Category[],
+  manifest: Awaited<ReturnType<IndexedDbCatalogRepository['getManifest']>>,
+): number | null {
+  const firstIncomplete = categories.findIndex((category) =>
+    manifest?.categories.find((entry) => entry.categoryKey === category.id)?.coverage !== 'complete',
+  )
+
+  return firstIncomplete >= 0 ? firstIncomplete : null
+}
+
+function categoriesFromManifest(
+  manifest: Awaited<ReturnType<IndexedDbCatalogRepository['getManifest']>>,
+): Category[] {
+  return manifest?.categories.map((category) => ({
+    id: category.categoryId,
+    name: category.name,
+  })) ?? []
+}
+
 function uniqueCategories(categories: readonly Category[]): Category[] {
   const unique = new Map<string, Category>()
 
@@ -718,6 +963,68 @@ function snapshotsForWholeSection(
     categoryKey: category.id,
     items: buckets.get(category.id) ?? [],
   }))
+}
+
+type HeapSampler = {
+  initialUsedJsHeapSize: number | null
+  peakUsedJsHeapSize: number | null
+  sample: () => void
+  finish: () => number | null
+}
+
+function createHeapSampler(): HeapSampler {
+  const initialUsedJsHeapSize = usedJsHeapSize()
+  let peakUsedJsHeapSize = initialUsedJsHeapSize
+
+  const sample = (): void => {
+    const used = usedJsHeapSize()
+
+    if (used !== null && (peakUsedJsHeapSize === null || used > peakUsedJsHeapSize)) {
+      peakUsedJsHeapSize = used
+    }
+  }
+
+  return {
+    initialUsedJsHeapSize,
+    get peakUsedJsHeapSize() {
+      return peakUsedJsHeapSize
+    },
+    sample,
+    finish: () => {
+      sample()
+      return usedJsHeapSize()
+    },
+  }
+}
+
+function usedJsHeapSize(): number | null {
+  const memory = (performance as Performance & {
+    memory?: { usedJSHeapSize?: unknown }
+  }).memory
+  const value = memory?.usedJSHeapSize
+
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.round(value)
+    : null
+}
+
+function traceWholeSectionMemory(
+  section: LibrarySection,
+  outcome: 'completed' | 'failed' | 'cancelled',
+  streamedRecordCount: number,
+  maxResponseBytes: number | undefined,
+  heap: HeapSampler,
+): void {
+  performanceTrace.event('library', 'catalog-sync-section-memory', {
+    section,
+    mode: 'whole-section',
+    outcome,
+    streamedRecordCount,
+    maxResponseBytes: maxResponseBytes ?? null,
+    initialUsedJsHeapSize: heap.initialUsedJsHeapSize,
+    peakUsedJsHeapSize: heap.peakUsedJsHeapSize,
+    finalUsedJsHeapSize: heap.finish(),
+  })
 }
 
 function failureCooldownMs(

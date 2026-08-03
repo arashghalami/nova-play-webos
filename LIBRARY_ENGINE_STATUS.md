@@ -1380,3 +1380,137 @@ The run stopped after five serial provider requests because the VOD category-man
 - Gate 1 is **rejected**. Live and Series are authoritative, but VOD is not authoritative because its whole-section response exceeded the established 64 MiB safety ceiling.
 - Phase 2A remains **blocked**. Do not treat the two successful sections as an accepted all-library cutover.
 - The next task is not another provider run. It requires a separately approved bounded VOD acquisition design that preserves strict completeness, bounded memory/work, cache authority, and the no-partial-publication rule (for example, a proven section-safe continuation strategy or a sufficiently bounded provider-supported acquisition path). No budget increase or repeated same-window run is authorized by this result.
+
+## 2026-08-03 — Authorized VOD measurement, bounded publication, and Live/Series local-read implementation
+
+### Supersession and authorization
+
+- This entry records the subsequently authorized same-day VOD-only iteration. It supersedes the preceding prohibition on a same-day retry, but only for the controlled single-section measurement described below.
+- The provider refusal boundary remains absolute: a 401, 403, 429, or Retry-After would have ended the day without a counter reset or retry. No such response or block occurred.
+- The probe-only counter reset was used only after confirming the persisted provider block was null. It reset interactive and sync counters; it did not clear a refusal block, Retry-After, catalog state, or cooldown metadata.
+
+### Physical VOD measurement
+
+- A probe-enabled `com.arash.novaplay` `1.0.17` measurement package was installed on `OLED55G1RLA` through `lg-oled-g1`. The probe surface was used solely for budget inspection/reset; the physical acquisition itself was invoked through the rendered Settings control **Measure VOD download**.
+- Pre-run provider state was:
+  - interactive `5/24`;
+  - sync `6/6`;
+  - refusal block `null`.
+- The reset result and immediate re-inspection were:
+  - interactive `0/24`;
+  - sync `0/6`;
+  - refusal block still `null`.
+- CDP capture and the normal performance trace were enabled and cleared before the single manual VOD action. The control was confirmed present before it was invoked exactly once.
+- The action used a one-request VOD-only plan based on the existing successful VOD category manifest. It did not request Live categories/streams, Series categories/streams, or the VOD category manifest.
+- Sanitized provider and completion evidence:
+  - HTTP `200`;
+  - header elapsed `4,767 ms`;
+  - total elapsed `71,541 ms`;
+  - received `79,696,256` bytes;
+  - parsed `194,302` records;
+  - strict top-level array closure `true`;
+  - no timeout;
+  - no failure classification;
+  - coordinator attempted requests `1`;
+  - broker issued/debited requests `1`;
+  - final sync budget `1/6`;
+  - refusal block `null`.
+- The completed VOD section published 363 manifest categories, 430 active snapshots, and 194,302 active items. Global sync failure count reset to zero and the ordinary success cooldown was persisted.
+- The device exposes a fixed placeholder `performance.memory.usedJSHeapSize` of `10,000,000`, unchanged at initial, sampled peak, and final observation. It is not a usable heap measurement. No heap-growth claim is made. The measured catalog completed without an observed app crash, provider error, or parse/publication failure.
+
+### Production response bound
+
+- The temporary 192 MiB discovery ceiling is not retained as the production setting.
+- The normal VOD sync scan now uses a bounded 96 MiB limit (`100,663,296` bytes):
+  - the measured complete response is `79,696,256` bytes;
+  - the selected production bound leaves `20,967,040` bytes of headroom;
+  - it remains strictly bounded and is substantially below the temporary 192 MiB discovery ceiling.
+- Live and Series retain their existing default bounded response behavior. No provider limit or broker budget ceiling was increased.
+
+### Incremental publication and restart safety
+
+- Whole-section ingestion now applies backpressure from the snapshot publisher to the incremental parser.
+- For a section without authoritative complete coverage, parser-confirmed records are accumulated in bounded 128-item category batches and persisted as explicit `partial` category generations.
+- Partial generations are deliberately unavailable to normal browse/search reads. Only a closed top-level provider array promotes every category generation to `complete` in a final manifest transition.
+- A malformed, timed-out, cancelled, oversized, or interrupted response therefore:
+  - retains only parser-confirmed partial snapshots;
+  - leaves the section non-authoritative for ordinary reads;
+  - persists `partial` coverage and the first incomplete category cursor;
+  - resumes recovery at that incomplete category in the later category-slice path;
+  - never presents incomplete data as an empty catalog or as complete local search coverage.
+- Regression coverage includes an interrupted VOD first scan that persists a partial batch, records a partial checkpoint at cursor zero, and resumes that first incomplete category rather than issuing another whole VOD scan. Repository coverage verifies partial snapshots cannot be read as complete until a strict closed-array promotion succeeds.
+
+### Local read cutover scope
+
+- Local-first category browse and global search now use only complete per-section IndexedDB snapshots:
+  - Live and Series complete manifests are read through bounded category-shard reads;
+  - global search queries each complete section locally and performs no provider search;
+  - VOD explicitly renders **Library not downloaded yet** until it is complete, never **No results**.
+- The local-read repository refuses an incomplete section, a partial category, an evicted snapshot, or an unavailable database as cache-unavailable rather than treating any of those states as an empty authoritative result.
+- This is a narrow two-section local-read cutover. It does not approve a provider-backed metadata/details redesign, global Phase 2B acceptance, or any additional VOD provider request.
+
+### Automated verification
+
+| Command | Result | Notes |
+| --- | --- | --- |
+| `rtk npx tsc --noEmit` | Passed | No TypeScript diagnostics after the local-read and publication changes. |
+| `rtk npm test -- --run src/library/catalog-repository.test.ts src/library/catalog-sync.test.ts src/local-first-regression.test.ts` | Passed | 39 tests; includes durable partial publication, incomplete-section resume, authoritative local reads, and no-provider browse/search routing. |
+| Further package/device verification | Pending | Required after the final normal package is built; no additional provider acquisition is authorized for that verification. |
+
+### Decision
+
+- The VOD measurement is **accepted**: the prior failure was solely the self-imposed 64 MiB limit, not a provider refusal, timeout, parser failure, or rate limit.
+- The 96 MiB production VOD bound is **accepted** for the measured provider response.
+- Incremental partial publication is **implemented and fixture-verified**, pending final normal-package physical verification.
+- Live/Series local-read cutover is **implemented and fixture-verified**, pending final normal-package physical verification.
+- VOD is now complete from the one authorized measurement run; no further same-day VOD request is authorized by this entry.
+- Gate 1 all-section completeness is now physically demonstrated, but the Gate/Phase 2A final decision remains **pending** until the final normal package verifies the local browse/search paths on the physical target without provider traffic.
+
+## 2026-08-03 — Local-search compatibility diagnosis and corrective package
+
+### Local-only physical diagnosis
+
+- Normal package `1.0.21` was installed and inspected on the physical target. It exposed no library-probe API.
+- A non-matching local global-search request made **zero** provider/network trace events, but incorrectly rendered every section as unavailable.
+- Sanitized repository outcome tracing isolated the result to `snapshot-invalid`, not missing manifests, incomplete section coverage, absent snapshots, provider traffic, or response-size limits:
+  - Live: expected `825` snapshot records; parsing stopped after `60` accepted records.
+  - VOD: expected `430` snapshot records; parsing stopped before an accepted record.
+  - Series: expected `231` snapshot records; parsing stopped after `52` accepted records.
+- Independent device-side storage validation confirmed all current manifest-referenced snapshot records were present with matching active generations. No catalog titles, queries, payloads, credentials, or URLs were retained in this report.
+
+### Root cause and correction
+
+- Prior URL sanitization recursively removed any URL-like string from cached stream records. Some valid provider display names matched that broad URL-like pattern, causing legacy durable records to lack `name`.
+- The strict local reader then treated any such record as a corrupt shard, which incorrectly made an otherwise complete section unavailable.
+- The corrected repository behavior:
+  - preserves required stream identity and display/search fields when producing new cached snapshots;
+  - safely reads legacy records with missing display names as an `Untitled` local item while retaining the validated identity, section, and category fields;
+  - continues to reject records lacking required identity/section/category invariants;
+  - keeps direct playback URLs and nested URL-bearing optional metadata out of durable catalog snapshots.
+- A regression test mutates a durable snapshot into this legacy sanitized shape and verifies both bounded category read and local search remain complete. This test does not weaken detection of malformed identity records.
+
+### Verification and remaining physical step
+
+| Command | Result | Notes |
+| --- | --- | --- |
+| `rtk npx tsc --noEmit` | Passed | No TypeScript diagnostics. |
+| `rtk npm test -- --run src/library/catalog-repository.test.ts src/local-first-regression.test.ts` | Passed | 25 tests, including the new legacy-snapshot compatibility regression. |
+| `rtk npm test` | Passed | 32 files, 249 tests. Existing mocked metadata-upstream `503` messages remain expected test diagnostics. |
+| `rtk git diff --check` | Passed | No whitespace errors. |
+| `rtk npm run package:webos` | Passed | Normal package `1.0.22` produced; TypeScript, import-cycle, webOS compatibility, and standalone-media checks passed. |
+
+- `1.0.22` is the normal corrective package; it has not been physically installed because the physical target became unreachable after the preceding local-only diagnostic. Two install attempts and ICMP reachability checks timed out.
+- No provider request, provider retry, provider reset, category refresh, section scan, or provider-backed search was performed after the successful VOD measurement.
+- Required remaining verification once the target is reachable:
+  1. install and launch normal package `1.0.22`;
+  2. confirm the probe API remains absent;
+  3. run a non-match local search and confirm each complete section reports authoritative availability and no-match state, with zero provider/network trace events;
+  4. confirm one sanitized aggregate positive-result count locally, without recording title/query content;
+  5. rerun category browse checks with zero provider/network trace events.
+
+### Decision
+
+- Local-search availability defect: **diagnosed and corrected**.
+- Automated verification: **accepted**.
+- Physical `1.0.22` local browse/search verification: **pending** because the target is currently unreachable.
+- Gate 1 / Phase 2A acceptance remains **pending**. No additional provider acquisition is authorized.

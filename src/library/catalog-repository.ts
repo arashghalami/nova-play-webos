@@ -1,8 +1,8 @@
 import { LruTtlCache } from '../lru-ttl-cache'
-import { matchesQuery, queryTokens } from '../search'
+import { performanceTrace } from '../performance-trace'
+import { foldText, matchesQuery, queryTokens } from '../search'
 import {
   favoriteKey,
-  isStreamItem,
   toStoredStream,
   type ProviderAccessState,
 } from '../storage'
@@ -174,6 +174,48 @@ export type CategoryShardReadResult =
       updatedAt: number
     }
 
+export type LocalLibraryUnavailableReason =
+  | 'database-unavailable'
+  | 'manifest-missing'
+  | 'section-incomplete'
+  | 'category-unavailable'
+  | 'snapshot-missing'
+  | 'snapshot-invalid'
+
+export type CompleteSectionCategoriesResult =
+  | {
+      coverage: 'complete'
+      categories: Category[]
+    }
+  | {
+      coverage: 'none'
+      categories: []
+      reason: 'database-unavailable' | 'manifest-missing' | 'section-incomplete'
+    }
+
+export type CompleteCategoryReadResult =
+  | {
+      coverage: 'complete'
+      items: StreamItem[]
+    }
+  | {
+      coverage: 'none'
+      items: []
+      reason: LocalLibraryUnavailableReason
+    }
+
+export type SectionSearchResult =
+  | {
+      coverage: 'complete'
+      matches: StreamItem[]
+      limited: boolean
+    }
+  | {
+      coverage: 'none'
+      matches: []
+      reason: LocalLibraryUnavailableReason
+    }
+
 export type SearchQueryResult =
   | {
       coverage: 'none'
@@ -196,6 +238,15 @@ export type CategorySnapshotWriteInput = {
    * Optional Phase 1B ownership token. When supplied, a stale or superseded
    * sync cannot keep publishing cooperative snapshot units.
    */
+  runId?: string
+}
+
+export type PartialCategorySnapshotAppendInput = {
+  profileId: string
+  section: LibrarySection
+  category: Category
+  categoryKey?: string
+  items: readonly StreamItem[]
   runId?: string
 }
 
@@ -972,11 +1023,185 @@ export class IndexedDbCatalogRepository {
   }
 
   /**
-   * Publishes all snapshots from one successfully parsed provider section at one
-   * manifest boundary. New shard generations remain unreachable until every
-   * cooperative write succeeds; an aborted write therefore leaves the prior
-   * section entirely active.
+   * Starts a replacement pass for a section that has no authoritative complete
+   * categories. Existing partial pointers are detached before parsing restarts,
+   * so a restarted non-paginated response cannot append duplicate records.
    */
+  async preparePartialSectionSnapshotRun(
+    profileId: string,
+    section: LibrarySection,
+    runId?: string,
+  ): Promise<SectionManifestRecord> {
+    assertProfileId(profileId)
+    selectMemoryCacheScope(this.databaseName, profileId)
+    const current = await this.getManifest(profileId, section)
+
+    if (!current) {
+      throw new Error('Cannot prepare partial snapshots without a category manifest.')
+    }
+
+    if (current.categories.some((category) => category.coverage === 'complete')) {
+      throw new Error('Partial publication cannot replace authoritative category snapshots.')
+    }
+
+    const database = await this.database()
+    await assertSyncOwnership(database, profileId, runId)
+    const manifest = createManifest(
+      profileId,
+      section,
+      current.categories.map((category) => ({
+        ...category,
+        coverage: 'none',
+        shardCount: 0,
+        shardBase: 0,
+        itemCount: 0,
+        byteEstimate: 0,
+        updatedAt: this.now(),
+      })),
+      this.now(),
+    )
+    await putRecord(database, 'manifests', manifest)
+    snapshotMemoryCache.clear()
+    return manifest
+  }
+
+  /**
+   * Appends one bounded, parser-confirmed batch to a category that has no
+   * currently authoritative complete snapshot. Each manifest update makes the
+   * accumulated shards durable but explicitly partial. A later closed-array
+   * promotion is the only transition to complete coverage.
+   */
+  async appendPartialCategorySnapshot(
+    input: PartialCategorySnapshotAppendInput,
+    options: CooperativeWriteOptions = {},
+  ): Promise<CategoryManifestEntry> {
+    assertProfileId(input.profileId)
+    selectMemoryCacheScope(this.databaseName, input.profileId)
+
+    for (const item of input.items) {
+      if (item.section !== input.section) {
+        throw new Error('A category snapshot cannot contain items from another section.')
+      }
+    }
+
+    options.onPublishStage?.('snapshot-plan')
+    const categoryKey = input.categoryKey ?? input.category.id
+    const shards = buildCategorySnapshotShards(input.items)
+    const currentManifest = await this.getManifest(input.profileId, input.section)
+    const currentCategory = currentManifest?.categories.find(
+      (category) => category.categoryKey === categoryKey,
+    )
+
+    if (currentCategory?.coverage === 'complete') {
+      throw new Error('Partial publication cannot replace an authoritative category snapshot.')
+    }
+
+    const generation = currentCategory?.updatedAt ?? this.now()
+    const currentShardCount = currentCategory?.shardCount ?? 0
+    const shardBase = currentCategory?.shardBase ?? 0
+    const writeEpoch = playbackEpoch
+    const database = await this.database()
+
+    options.onPublishStage?.('snapshot-write')
+    for (let shardIndex = 0; shardIndex < shards.length; shardIndex += 1) {
+      assertCooperativeWriteAllowed(writeEpoch, options.signal)
+      await assertSyncOwnership(database, input.profileId, input.runId)
+      const shard = shards[shardIndex]
+      const eventLoopTurn = nextEventLoopTurn()
+      const startedAt = monotonicNow()
+
+      await putCooperativeRecord(
+        database,
+        'snapshots',
+        {
+          schemaVersion: LIBRARY_SCHEMA_VERSION,
+          profileId: input.profileId,
+          section: input.section,
+          categoryKey,
+          shardIndex: shardBase + currentShardCount + shardIndex,
+          payload: shard.payload,
+          updatedAt: generation,
+          itemCount: shard.itemCount,
+          byteEstimate: shard.byteEstimate,
+        } satisfies SnapshotRecord,
+        options.signal,
+      )
+
+      const durationMs = monotonicNow() - startedAt
+      const eventLoopTurnMs = await eventLoopTurn
+      options.onSnapshotPut?.({
+        durationMs,
+        eventLoopTurnMs,
+        byteEstimate: shard.byteEstimate,
+        itemCount: shard.itemCount,
+      })
+      await (options.yieldControl ?? defaultYield)()
+    }
+
+    assertCooperativeWriteAllowed(writeEpoch, options.signal)
+    await assertSyncOwnership(database, input.profileId, input.runId)
+    options.onPublishStage?.('manifest-build')
+    const categoryEntry: CategoryManifestEntry = {
+      categoryKey,
+      categoryId: input.category.id,
+      name: input.category.name,
+      coverage: 'partial',
+      shardCount: currentShardCount + shards.length,
+      shardBase,
+      itemCount: (currentCategory?.itemCount ?? 0) + input.items.length,
+      byteEstimate:
+        (currentCategory?.byteEstimate ?? 0) +
+        shards.reduce((total, shard) => total + shard.byteEstimate, 0),
+      updatedAt: generation,
+    }
+    const manifest = createManifest(
+      input.profileId,
+      input.section,
+      upsertCategoryManifest(currentManifest?.categories ?? [], categoryEntry),
+      this.now(),
+    )
+
+    options.onPublishStage?.('manifest-put')
+    await putRecord(database, 'manifests', manifest)
+    snapshotMemoryCache.clear()
+    options.onPublishStage?.('complete')
+    return categoryEntry
+  }
+
+  /**
+   * A successful, fully closed whole-section stream promotes its already
+   * persisted partial category generations in one manifest operation.
+   */
+  async promotePartialSectionSnapshots(
+    profileId: string,
+    section: LibrarySection,
+    runId?: string,
+  ): Promise<SectionManifestRecord> {
+    assertProfileId(profileId)
+    selectMemoryCacheScope(this.databaseName, profileId)
+    const current = await this.getManifest(profileId, section)
+
+    if (!current || current.categories.some((category) => category.coverage === 'none')) {
+      throw new Error('Cannot promote a section with unavailable category coverage.')
+    }
+
+    const database = await this.database()
+    await assertSyncOwnership(database, profileId, runId)
+    const manifest = createManifest(
+      profileId,
+      section,
+      current.categories.map((category) => (
+        category.coverage === 'partial'
+          ? { ...category, coverage: 'complete' }
+          : category
+      )),
+      this.now(),
+    )
+    await putRecord(database, 'manifests', manifest)
+    snapshotMemoryCache.clear()
+    return manifest
+  }
+
   async replaceSectionSnapshots(
     input: SectionSnapshotWriteInput,
     options: CooperativeWriteOptions = {},
@@ -1214,6 +1439,264 @@ export class IndexedDbCatalogRepository {
         reason: 'database-unavailable',
       }
     }
+  }
+
+  async readCompleteSectionCategories(
+    profileId: string,
+    section: LibrarySection,
+  ): Promise<CompleteSectionCategoriesResult> {
+    const manifest = await this.getManifest(profileId, section)
+
+    if (!manifest) {
+      return {
+        coverage: 'none',
+        categories: [],
+        reason: await this.isDatabaseAvailable()
+          ? 'manifest-missing'
+          : 'database-unavailable',
+      }
+    }
+
+    if (
+      manifest.coverage.state !== 'complete' ||
+      manifest.categories.some((category) => category.coverage !== 'complete')
+    ) {
+      return { coverage: 'none', categories: [], reason: 'section-incomplete' }
+    }
+
+    return {
+      coverage: 'complete',
+      categories: manifest.categories.map((category) => ({
+        id: category.categoryId,
+        name: category.name,
+      })),
+    }
+  }
+
+  async readCompleteCategory(
+    profileId: string,
+    section: LibrarySection,
+    categoryId: string,
+  ): Promise<CompleteCategoryReadResult> {
+    const sectionCategories = await this.readCompleteSectionCategories(profileId, section)
+
+    if (sectionCategories.coverage === 'none') {
+      return { coverage: 'none', items: [], reason: sectionCategories.reason }
+    }
+
+    const manifest = await this.getManifest(profileId, section)
+    const category = manifest?.categories.find((entry) => entry.categoryKey === categoryId)
+
+    if (!category || category.coverage !== 'complete') {
+      return { coverage: 'none', items: [], reason: 'category-unavailable' }
+    }
+
+    const items: StreamItem[] = []
+
+    for (let shardIndex = 0; shardIndex < category.shardCount; shardIndex += 1) {
+      const shard = await this.readCategoryShard(profileId, section, categoryId, shardIndex)
+
+      if (shard.coverage === 'none') {
+        return shard
+      }
+
+      items.push(...shard.items)
+    }
+
+    return { coverage: 'complete', items }
+  }
+
+  async searchCompleteSection(
+    profileId: string,
+    section: LibrarySection,
+    query: string,
+    resultLimit: number,
+  ): Promise<SectionSearchResult> {
+    const startedAt = monotonicNow()
+    const reportOutcome = (
+      result: SectionSearchResult,
+      expectedSnapshotCount = 0,
+      seenSnapshotCount = 0,
+      invalid = false,
+    ): SectionSearchResult => {
+      performanceTrace.event('library', 'local-section-search-result', {
+        section,
+        coverage: result.coverage,
+        reason: result.coverage === 'none' ? result.reason : null,
+        expectedSnapshotCount,
+        seenSnapshotCount,
+        invalid,
+        elapsedMs: monotonicNow() - startedAt,
+      })
+      return result
+    }
+    const manifest = await this.getManifest(profileId, section)
+
+    if (!manifest) {
+      return reportOutcome({
+        coverage: 'none',
+        matches: [],
+        reason: await this.isDatabaseAvailable()
+          ? 'manifest-missing'
+          : 'database-unavailable',
+      })
+    }
+
+    if (
+      manifest.coverage.state !== 'complete' ||
+      manifest.categories.some((category) => category.coverage !== 'complete')
+    ) {
+      return reportOutcome({
+        coverage: 'none',
+        matches: [],
+        reason: 'section-incomplete',
+      })
+    }
+
+    const expected = new Map<string, CategoryManifestEntry>()
+    for (const category of manifest.categories) {
+      for (let shardIndex = 0; shardIndex < category.shardCount; shardIndex += 1) {
+        expected.set(
+          snapshotReadKey(
+            category.categoryKey,
+            (category.shardBase ?? 0) + shardIndex,
+          ),
+          category,
+        )
+      }
+    }
+
+    const tokens = queryTokens(query)
+    const safeLimit = positiveInteger(resultLimit, 60)
+    const matches: StreamItem[] = []
+    const seen = new Set<string>()
+    let afterKey: IDBValidKey | undefined
+    let exhausted = false
+    let invalid = false
+    let limited = false
+
+    while (!exhausted) {
+      const database = await this.database()
+      const batch = await new Promise<{
+        exhausted: boolean
+        lastKey?: IDBValidKey
+      }>((resolve, reject) => {
+        const transaction = database.transaction('snapshots', 'readonly')
+        const store = transaction.objectStore('snapshots')
+        const request = store.openCursor(
+          afterKey === undefined ? undefined : IDBKeyRange.lowerBound(afterKey, true),
+        )
+        let processed = 0
+        let lastKey: IDBValidKey | undefined
+        let resolved = false
+
+        const resolveOnce = (value: { exhausted: boolean; lastKey?: IDBValidKey }): void => {
+          if (!resolved) {
+            resolved = true
+            resolve(value)
+          }
+        }
+
+        request.onerror = () =>
+          reject(request.error ?? new Error('Unable to scan local library snapshots.'))
+        transaction.onerror = () =>
+          reject(transaction.error ?? new Error('Local library scan failed.'))
+        transaction.onabort = () =>
+          reject(transaction.error ?? new Error('Local library scan was aborted.'))
+        request.onsuccess = () => {
+          const cursor = request.result
+
+          if (!cursor) {
+            resolveOnce({ exhausted: true, lastKey })
+            return
+          }
+
+          lastKey = cursor.key
+          const value = cursor.value as unknown
+          const record = isRecord(value) ? value : null
+          const categoryKey =
+            record && typeof record.categoryKey === 'string' ? record.categoryKey : null
+          const shardIndex =
+            record && typeof record.shardIndex === 'number' ? record.shardIndex : null
+          const key =
+            categoryKey !== null && shardIndex !== null
+              ? snapshotReadKey(categoryKey, shardIndex)
+              : null
+          const category = key ? expected.get(key) : undefined
+
+          if (
+            category &&
+            key &&
+            isSnapshotRecord(value, profileId, section, category.categoryKey, shardIndex!) &&
+            value.updatedAt === category.updatedAt
+          ) {
+            if (expected.has(key)) {
+              const items = parseSnapshotItems(value)
+
+              if (!items) {
+                invalid = true
+                resolveOnce({ exhausted: true, lastKey })
+                return
+              }
+
+              seen.add(key)
+
+              for (const item of items) {
+                if (!matchesQuery(item.searchName ?? foldText(item.name), tokens)) {
+                  continue
+                }
+
+                if (matches.length < safeLimit) {
+                  matches.push(item)
+                } else {
+                  limited = true
+                }
+              }
+            }
+          }
+
+          processed += 1
+
+          if (processed >= 12) {
+            resolveOnce({ exhausted: false, lastKey })
+            return
+          }
+
+          cursor.continue()
+        }
+      })
+
+      exhausted = batch.exhausted
+      afterKey = batch.lastKey
+      await defaultYield()
+    }
+
+    if (invalid) {
+      return reportOutcome(
+        { coverage: 'none', matches: [], reason: 'snapshot-invalid' },
+        expected.size,
+        seen.size,
+        true,
+      )
+    }
+
+    if (seen.size !== expected.size) {
+      return reportOutcome(
+        { coverage: 'none', matches: [], reason: 'snapshot-missing' },
+        expected.size,
+        seen.size,
+      )
+    }
+
+    return reportOutcome(
+      {
+        coverage: 'complete',
+        matches,
+        limited,
+      },
+      expected.size,
+      seen.size,
+    )
   }
 
   async replaceSearchShards(
@@ -1565,6 +2048,10 @@ function memoryCacheScope(databaseName: string, profileId: string): string {
   return `${databaseName}\u0000${profileId}`
 }
 
+function snapshotReadKey(categoryKey: string, shardIndex: number): string {
+  return `${categoryKey}\u0000${shardIndex}`
+}
+
 function snapshotCacheKey(
   profileId: string,
   section: LibrarySection,
@@ -1643,10 +2130,13 @@ function coverageSummary(categories: readonly CategoryManifestEntry[]): Coverage
   const completeCategoryCount = categories.filter(
     (category) => category.coverage === 'complete',
   ).length
+  const hasPublishedCategory = categories.some(
+    (category) => category.coverage === 'partial' || category.coverage === 'complete',
+  )
 
   return {
     state:
-      categories.length === 0 || completeCategoryCount === 0
+      categories.length === 0 || !hasPublishedCategory
         ? 'none'
         : completeCategoryCount === categories.length
           ? 'complete'
@@ -1924,7 +2414,22 @@ async function assertSyncOwnership(
 function toCachedStream(stream: StreamItem): StreamItem {
   const stored = toStoredStream(stream)
   const { directSource: _directSource, ...cached } = stored
-  return stripCachedUrls(cached)
+  const sanitized = stripCachedUrls(cached)
+
+  /*
+   * URL-like provider titles are legitimate display data, not transport
+   * endpoints. Preserve the identity and search fields after recursively
+   * removing URL-bearing optional metadata so a title cannot make an otherwise
+   * complete local shard unreadable.
+   */
+  return {
+    ...sanitized,
+    id: stored.id,
+    name: stored.name,
+    section: stored.section,
+    categoryId: stored.categoryId,
+    searchName: stored.searchName,
+  }
 }
 
 function toCachedDetails<T extends LibraryDetails>(value: T): T {
@@ -1987,17 +2492,53 @@ function parseSnapshotItems(record: SnapshotRecord): StreamItem[] | null {
     const items: StreamItem[] = []
 
     for (const item of parsed) {
-      if (!isStreamItem(item)) {
+      const normalized = normalizeSnapshotStream(item)
+
+      if (!normalized) {
         return null
       }
 
-      items.push(toCachedStream(item))
+      items.push(normalized)
     }
 
     return items
   } catch {
     return null
   }
+}
+
+function normalizeSnapshotStream(value: unknown): StreamItem | null {
+  if (!isRecord(value)) {
+    return null
+  }
+
+  const id = value.id
+  const section = value.section
+  const categoryId = value.categoryId
+
+  if (
+    typeof id !== 'string' ||
+    !isLibrarySection(section) ||
+    typeof categoryId !== 'string'
+  ) {
+    return null
+  }
+
+  /*
+   * Legacy cache writes stripped every URL-like string recursively, including
+   * a legitimate provider title. The identity fields remain intact, so recover
+   * such entries as an untitled local item rather than treating the entire
+   * otherwise validated authoritative shard as corrupt.
+   */
+  const name = typeof value.name === 'string' ? value.name : 'Untitled'
+
+  return toCachedStream({
+    ...value,
+    id,
+    name,
+    section,
+    categoryId,
+  } as StreamItem)
 }
 
 function parseSearchTuples(record: SearchShardRecord): SearchTuple[] | null {

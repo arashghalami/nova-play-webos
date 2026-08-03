@@ -91,10 +91,6 @@ import {
 } from './playback-fallback'
 import { ProviderBroker } from './provider-broker'
 import {
-  isProviderError,
-  isProviderRefusal,
-} from './provider-error'
-import {
   dedupeRatingCandidates,
   ratingSourceSummary,
   resolveContentRating,
@@ -128,6 +124,8 @@ import {
 import {
   CATALOG_SYNC_SECTIONS,
   CatalogSyncCoordinator,
+  VOD_SYNC_MEASUREMENT_MAX_RESPONSE_BYTES,
+  type CatalogSyncRunOptions,
 } from './library/catalog-sync'
 import { catalogSyncRearmDelay } from './library/catalog-sync-scheduler'
 import {
@@ -152,6 +150,7 @@ type CatalogState = {
   page: number
   isFavorites: boolean
   sort: CatalogSort
+  availabilityMessage?: string
   results?: CatalogResults
 }
 
@@ -412,6 +411,8 @@ let guideStreams: StreamItem[] = []
 let globalSearchResults: StreamItem[] = []
 let globalSearchQuery = ''
 let globalSearchStatus = ''
+let globalSearchSequence = 0
+const globalSearchSectionAvailability = new Map<LibrarySection, boolean>()
 let searchReturnView: AppView = 'home'
 let pendingFocus: FocusSnapshot | null = null
 let detailReturnPoint: ViewReturnPoint | null = null
@@ -845,37 +846,6 @@ function cacheStreams(section: LibrarySection, categoryId: string | undefined, s
 
     streamCache.delete(oldestKey)
   }
-}
-
-function cachedStreamsForSection(section: LibrarySection): StreamItem[] {
-  const prefix = `${section}:`
-  const streams = new Map<string, StreamItem>()
-
-  streamCache.forEach((entry, key) => {
-    if (key.startsWith(prefix) && Date.now() - entry.updatedAt <= STREAM_CACHE_TTL_MS) {
-      entry.streams.forEach((stream) => streams.set(streamLookupKey(stream), stream))
-    }
-  })
-
-  knownStreams.forEach((stream, key) => {
-    if (stream.section === section) {
-      streams.set(key, stream)
-    }
-  })
-
-  favorites.forEach((favorite) => {
-    if (favorite.stream?.section === section) {
-      streams.set(streamLookupKey(favorite.stream), favorite.stream)
-    }
-  })
-
-  resumeEntries.forEach((resume) => {
-    if (resume.stream?.section === section) {
-      streams.set(streamLookupKey(resume.stream), resume.stream)
-    }
-  })
-
-  return [...streams.values()]
 }
 
 function isAppHistoryState(value: unknown): value is AppHistoryState {
@@ -1458,7 +1428,9 @@ function renderCatalog(): void {
             ${
               pageCategories.length
                 ? pageCategories.map((category) => categoryCard(category)).join('')
-                : '<div class="empty-state"><h2>No categories found</h2><p>Try a different search term or change parental controls in Settings.</p></div>'
+                : catalog.availabilityMessage
+                  ? `<div class="empty-state"><h2>Library not downloaded yet</h2><p>${escape(catalog.availabilityMessage)}</p></div>`
+                  : '<div class="empty-state"><h2>No categories found</h2><p>Try a different search term or change parental controls in Settings.</p></div>'
             }
           </section>`
         : catalog.isFavorites
@@ -2357,6 +2329,10 @@ function globalSearchSectionContent(section: LibrarySection): string {
   const hiddenCount = Math.max(0, results.length - visibleResults.length)
   const hasMore = results.length > GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT
   const noun = globalSearchResultNoun(section, results.length)
+  const sectionAvailable = globalSearchSectionAvailability.get(section) === true
+  const emptyState = sectionAvailable
+    ? '<div class="empty-state"><h3>No matching titles</h3><p>Try another search in your downloaded library.</p></div>'
+    : '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Refresh library before searching this section.</p></div>'
 
   return `
     <div class="global-search-group-heading">
@@ -2374,7 +2350,7 @@ function globalSearchSectionContent(section: LibrarySection): string {
       ${
         visibleResults.length
           ? visibleResults.map(globalSearchCard).join('')
-          : '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Refresh library before searching this section.</p></div>'
+          : emptyState
       }
     </div>
   `
@@ -2431,6 +2407,7 @@ function updateGlobalSearchSection(section: LibrarySection): void {
   const noun = globalSearchResultNoun(section, results.length)
   const hasMore = results.length > GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT
   const expanded = expandedGlobalSearchSections.has(section)
+  const sectionAvailable = globalSearchSectionAvailability.get(section) === true
 
   if (count) {
     count.setAttribute('aria-label', `${results.length} ${noun} found`)
@@ -2452,8 +2429,9 @@ function updateGlobalSearchSection(section: LibrarySection): void {
 
   if (!visibleResults.length) {
     content.className = 'global-search-empty'
-    content.innerHTML =
-      '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Refresh library before searching this section.</p></div>'
+    content.innerHTML = sectionAvailable
+      ? '<div class="empty-state"><h3>No matching titles</h3><p>Try another search in your downloaded library.</p></div>'
+      : '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Refresh library before searching this section.</p></div>'
     return
   }
 
@@ -2540,6 +2518,8 @@ function clearGlobalSearch(): void {
   globalSearchQuery = ''
   globalSearchResults = []
   globalSearchStatus = ''
+  globalSearchSequence += 1
+  globalSearchSectionAvailability.clear()
   expandedGlobalSearchSections.clear()
   updateGlobalSearchView({ controls: true, fullResults: true })
   input?.focus({ preventScroll: true })
@@ -2553,6 +2533,8 @@ function leaveGlobalSearch(): void {
   globalSearchQuery = ''
   globalSearchResults = []
   globalSearchStatus = ''
+  globalSearchSequence += 1
+  globalSearchSectionAvailability.clear()
   expandedGlobalSearchSections.clear()
   view =
     searchReturnView === 'catalog' && catalog
@@ -2567,56 +2549,90 @@ function leaveGlobalSearch(): void {
   render()
 }
 
-function localGlobalSearchMatches(query: string): StreamItem[] {
+async function localGlobalSearchMatches(
+  query: string,
+  sequence: number,
+): Promise<StreamItem[]> {
+  const activeProfile = profile
+
+  if (!activeProfile) {
+    return []
+  }
+
   const results: StreamItem[] = []
   const knownKeys = new Set<string>()
-  const tokens = queryTokens(query)
 
   for (const section of GLOBAL_SEARCH_SECTIONS) {
-    for (const stream of cachedStreamsForSection(section)) {
-      if (globalSearchResultCount(results, section) >= GLOBAL_SEARCH_SECTION_RESULT_LIMIT) {
-        break
-      }
+    const sectionResult = await catalogRepository.searchCompleteSection(
+      activeProfile.id,
+      section,
+      query,
+      GLOBAL_SEARCH_SECTION_RESULT_LIMIT,
+    )
 
+    if (sequence !== globalSearchSequence) {
+      return []
+    }
+
+    globalSearchSectionAvailability.set(section, sectionResult.coverage === 'complete')
+
+    if (sectionResult.coverage === 'none') {
+      continue
+    }
+
+    for (const stream of sectionResult.matches) {
       const key = streamLookupKey(stream)
 
-      if (
-        stream.streamType !== 'episode' &&
-        !knownKeys.has(key) &&
-        visibleStream(stream) &&
-        matchesQuery(searchText(stream), tokens)
-      ) {
+      if (stream.streamType !== 'episode' && !knownKeys.has(key) && visibleStream(stream)) {
         knownKeys.add(key)
         results.push(stream)
       }
     }
   }
 
+  rememberStreams(results)
   return results
 }
 
-function scheduleGlobalSearch(query: string): void {
+async function updateGlobalSearchFromLibrary(query: string): Promise<void> {
   const normalizedQuery = query.trim()
-
+  const sequence = globalSearchSequence += 1
   globalSearchQuery = query
+  globalSearchResults = []
+  globalSearchSectionAvailability.clear()
   expandedGlobalSearchSections.clear()
-  globalSearchResults =
-    normalizedQuery.length >= MIN_GLOBAL_SEARCH_LENGTH
-      ? localGlobalSearchMatches(normalizedQuery)
-      : []
 
   if (!normalizedQuery) {
     globalSearchStatus = ''
-  } else if (normalizedQuery.length < MIN_GLOBAL_SEARCH_LENGTH) {
-    globalSearchStatus = `Type at least ${MIN_GLOBAL_SEARCH_LENGTH} characters to search your downloaded library.`
-  } else {
-    const localCount = globalSearchResults.length
-    globalSearchStatus = localCount
-      ? `${localCount} local result${localCount === 1 ? '' : 's'}`
-      : 'Library not downloaded yet — Refresh library.'
+    updateGlobalSearchView({ controls: true, fullResults: true })
+    return
   }
 
+  if (normalizedQuery.length < MIN_GLOBAL_SEARCH_LENGTH) {
+    globalSearchStatus =
+      `Type at least ${MIN_GLOBAL_SEARCH_LENGTH} characters to search your downloaded library.`
+    updateGlobalSearchView({ controls: true, fullResults: true })
+    return
+  }
+
+  globalSearchStatus = 'Searching downloaded library…'
   updateGlobalSearchView({ controls: true, fullResults: true })
+
+  const results = await localGlobalSearchMatches(normalizedQuery, sequence)
+
+  if (sequence !== globalSearchSequence || view !== 'search') {
+    return
+  }
+
+  globalSearchResults = results
+  globalSearchStatus = results.length
+    ? `${results.length} local result${results.length === 1 ? '' : 's'}`
+    : 'No matching titles in the downloaded library.'
+  updateGlobalSearchView({ controls: true, fullResults: true })
+}
+
+function scheduleGlobalSearch(query: string): void {
+  void updateGlobalSearchFromLibrary(query)
 }
 
 function renderGlobalSearch(): void {
@@ -2670,6 +2686,8 @@ function renderSettings(): void {
         <h2>Downloaded library</h2>
         <p class="hint">Refresh is manual so it can be observed and controlled. It never starts automatically when the app launches.</p>
         <button class="secondary-button" data-action="refresh-library" data-focus-id="settings-refresh-library">Refresh downloaded library</button>
+        <button class="secondary-button" data-action="measure-vod-library" data-focus-id="settings-measure-vod-library">Measure VOD download</button>
+        <p class="hint">Uses one VOD-only sync request with a temporary 192 MiB discovery limit. It never refreshes Live TV or Series.</p>
       </section>
       <section class="settings-panel">
         <p class="panel-kicker">Library</p>
@@ -4514,6 +4532,26 @@ async function handleAction(element: HTMLElement): Promise<void> {
     return
   }
 
+  if (action === 'measure-vod-library') {
+    const result = await runCatalogSync({
+      section: 'vod',
+      maxResponseBytes: VOD_SYNC_MEASUREMENT_MAX_RESPONSE_BYTES,
+    })
+
+    if (!result) {
+      showToast('VOD measurement is unavailable right now.')
+    } else if (result.status === 'completed') {
+      showToast('VOD download measurement completed.')
+    } else if (result.status === 'deferred') {
+      showToast('VOD measurement is deferred until the next provider sync window.')
+    } else if (result.status === 'busy') {
+      showToast('A library refresh is already running.')
+    } else {
+      showToast('VOD download measurement did not complete.')
+    }
+    return
+  }
+
   if (action === 'settings') {
     if (view !== 'settings') {
       pushRouteHistory()
@@ -4594,74 +4632,64 @@ async function handleAction(element: HTMLElement): Promise<void> {
 }
 
 async function openSection(section: LibrarySection): Promise<void> {
-  const activeClient = client
+  const activeProfile = profile
 
-  if (!activeClient) {
+  if (!activeProfile) {
     return
   }
 
   catalogReturnPoint = null
   pushRouteHistory()
-  const { token, signal } = startNavigation()
-  renderLoading(`Loading ${labels[section].toLowerCase()}…`)
+  const { token } = startNavigation()
+  renderLoading(`Opening downloaded ${labels[section].toLowerCase()}…`)
 
-  try {
-    const categories =
-      sectionCategories.get(section) ?? await activeClient.categories(section, signal)
+  const local = await catalogRepository.readCompleteSectionCategories(
+    activeProfile.id,
+    section,
+  )
 
-    if (!isCurrentNavigation(token)) {
-      return
-    }
+  if (!isCurrentNavigation(token)) {
+    return
+  }
 
-    rememberCategories(section, categories)
+  if (local.coverage === 'complete') {
+    rememberCategories(section, local.categories)
     catalog = {
       section,
       category: null,
-      categories,
+      categories: local.categories,
       streams: [],
       query: '',
       page: 0,
       isFavorites: false,
       sort: 'default',
     }
-    view = 'catalog'
-    render()
-  } catch (reason) {
-    if (!isCurrentNavigation(token)) {
-      return
+  } else {
+    catalog = {
+      section,
+      category: null,
+      categories: [],
+      streams: [],
+      query: '',
+      page: 0,
+      isFavorites: false,
+      sort: 'default',
+      availabilityMessage:
+        section === 'vod'
+          ? 'Movies have not been downloaded yet. Refresh library from Settings.'
+          : 'This library section is not available on this TV yet. Refresh library from Settings.',
     }
-
-    /*
-     * This previously issued an extra validate() request to decide whether the
-     * login or the provider was at fault, which doubled traffic exactly when the
-     * provider was already refusing it. The failure now carries its own
-     * classification, so the same distinction costs no additional request.
-     */
-    renderError(categoryFailureReason(reason), () => void openSection(section))
-  }
-}
-
-/*
- * Refusals already carry an accurate user-facing message: a rejected login, or
- * an explicit rate limit. Everything else is reported as a provider/network
- * fault rather than a confirmed login rejection, because a stalled category
- * endpoint proves nothing about the credentials.
- */
-function categoryFailureReason(reason: unknown): Error {
-  if (isProviderError(reason) && isProviderRefusal(reason)) {
-    return reason
   }
 
-  return new Error(
-    'The IPTV provider is currently unreachable or too slow. This is a provider/network failure, not a confirmed login rejection.',
-  )
+  view = 'catalog'
+  render()
 }
 
 async function loadCategory(category: Category | null): Promise<void> {
-  const activeClient = client
+  const activeProfile = profile
   const activeCatalog = catalog
 
-  if (!activeClient || !activeCatalog) {
+  if (!activeProfile || !activeCatalog) {
     return
   }
 
@@ -4684,46 +4712,59 @@ async function loadCategory(category: Category | null): Promise<void> {
     focus: snapshotFocus(),
   }
   pushRouteHistory()
-  const { token, signal } = startNavigation()
-  renderLoading(`Loading ${category.name}…`)
+  const { token } = startNavigation()
+  renderLoading(`Opening ${category.name}…`)
 
-  try {
-    const streams =
-      cachedStreams(activeCatalog.section, category.id) ??
-      await activeClient.streams(activeCatalog.section, category.id, signal)
+  const local = await catalogRepository.readCompleteCategory(
+    activeProfile.id,
+    activeCatalog.section,
+    category.id,
+  )
 
-    if (!isCurrentNavigation(token)) {
-      return
-    }
+  if (!isCurrentNavigation(token)) {
+    return
+  }
 
-    rememberStreams(streams)
-    cacheStreams(activeCatalog.section, category.id, streams)
-
-    if (activeCatalog.section === 'live') {
-      liveQueue = streams
-    }
-
-    const favoritesChanged = hydrateFavorites(favorites, streams)
-
-    if (favoritesChanged && profile && !saveFavorites(profile.id, favorites)) {
-      showToast(STORAGE_FAILURE_MESSAGE)
-    }
-
+  if (local.coverage === 'none') {
     catalog = {
       ...activeCatalog,
       category,
-      streams,
+      streams: [],
       query: '',
       page: 0,
       isFavorites: false,
+      availabilityMessage: 'This category is not available in the downloaded library.',
       results: undefined,
     }
     renderCatalog()
-  } catch (reason) {
-    if (isCurrentNavigation(token)) {
-      renderError(reason, () => void loadCategory(category))
-    }
+    return
   }
+
+  const streams = local.items
+  rememberStreams(streams)
+  cacheStreams(activeCatalog.section, category.id, streams)
+
+  if (activeCatalog.section === 'live') {
+    liveQueue = streams
+  }
+
+  const favoritesChanged = hydrateFavorites(favorites, streams)
+
+  if (favoritesChanged && !saveFavorites(activeProfile.id, favorites)) {
+    showToast(STORAGE_FAILURE_MESSAGE)
+  }
+
+  catalog = {
+    ...activeCatalog,
+    category,
+    streams,
+    query: '',
+    page: 0,
+    isFavorites: false,
+    availabilityMessage: undefined,
+    results: undefined,
+  }
+  renderCatalog()
 }
 
 async function beginResumePlayback(stream: StreamItem): Promise<void> {
@@ -5028,13 +5069,6 @@ async function openGuide(refresh = false): Promise<void> {
   render()
 }
 
-function globalSearchResultCount(results: StreamItem[], section: LibrarySection): number {
-  return results.reduce(
-    (count, stream) => count + (stream.section === section ? 1 : 0),
-    0,
-  )
-}
-
 async function runGlobalSearch(): Promise<void> {
   const searchInput = document.querySelector<HTMLInputElement>('#global-search-input')
   const requestedQuery = (searchInput?.value ?? globalSearchQuery).trim()
@@ -5047,18 +5081,12 @@ async function runGlobalSearch(): Promise<void> {
     return
   }
 
-  globalSearchQuery = requestedQuery
-  globalSearchResults = localGlobalSearchMatches(requestedQuery)
-  expandedGlobalSearchSections.clear()
-  const resultCount = globalSearchResults.length
-  globalSearchStatus = resultCount
-    ? `${resultCount} local result${resultCount === 1 ? '' : 's'}`
-    : 'Library not downloaded yet — Refresh library.'
+  await updateGlobalSearchFromLibrary(requestedQuery)
+
   performanceTrace.event('search', 'global-search-local-complete', {
     queryLength: requestedQuery.length,
-    resultCount,
+    resultCount: globalSearchResults.length,
   })
-  updateGlobalSearchView({ controls: true, fullResults: true })
 }
 
 async function loadLiveDetails(stream: StreamItem): Promise<void> {
@@ -5701,7 +5729,7 @@ async function inspectCatalogSyncStorage(): Promise<CatalogSyncStorageInspection
   }
 }
 
-async function runCatalogSync() {
+async function runCatalogSync(runOptions: CatalogSyncRunOptions = {}) {
   const activeProfile = profile
   const activeSync = catalogSync
 
@@ -5711,15 +5739,19 @@ async function runCatalogSync() {
 
   performanceTrace.event('library', 'catalog-sync-start', {
     profileId: activeProfile.id,
+    section: runOptions.section ?? null,
+    maxResponseBytes: runOptions.maxResponseBytes ?? null,
   })
 
   try {
-    const result = await activeSync.sync(activeProfile.id)
+    const result = await activeSync.sync(activeProfile.id, runOptions)
     performanceTrace.event('library', 'catalog-sync-complete', {
       profileId: activeProfile.id,
       status: result.status,
       attemptedRequestCount: result.requestCount,
       issuedRequestCount: result.issuedRequestCount,
+      section: runOptions.section ?? null,
+      maxResponseBytes: runOptions.maxResponseBytes ?? null,
     })
 
     result.sections.forEach((section) => {

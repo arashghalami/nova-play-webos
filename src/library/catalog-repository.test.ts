@@ -162,6 +162,159 @@ describe('flat catalog repository', () => {
     expect((await repository.getMeta('profile-b'))?.nextDueAt).toBe(222)
   })
 
+  it('keeps parser-confirmed category snapshots durable but unavailable until a closed section is promoted', async () => {
+    const repository = createRepository()
+    const categories = [
+      { id: 'vod-a', name: 'VOD A' },
+      { id: 'vod-b', name: 'VOD B' },
+    ]
+
+    await repository.putSectionManifest('profile-a', 'vod', categories)
+    await repository.preparePartialSectionSnapshotRun('profile-a', 'vod')
+    await repository.appendPartialCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'vod',
+      category: categories[0],
+      items: [stream('vod-a-1', 'VOD A One', 'vod', categories[0].id)],
+    })
+
+    expect((await repository.getManifest('profile-a', 'vod'))?.coverage).toMatchObject({
+      state: 'partial',
+      completeCategoryCount: 0,
+      itemCount: 1,
+    })
+    await expect(
+      repository.readCategoryShard('profile-a', 'vod', categories[0].id, 0),
+    ).resolves.toMatchObject({
+      coverage: 'none',
+      reason: 'category-unavailable',
+    })
+
+    await repository.appendPartialCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'vod',
+      category: categories[1],
+      items: [stream('vod-b-1', 'VOD B One', 'vod', categories[1].id)],
+    })
+    await repository.promotePartialSectionSnapshots('profile-a', 'vod')
+
+    expect((await repository.getManifest('profile-a', 'vod'))?.coverage).toMatchObject({
+      state: 'complete',
+      completeCategoryCount: 2,
+      itemCount: 2,
+    })
+    await expect(
+      repository.readCategoryShard('profile-a', 'vod', categories[0].id, 0),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'vod-a-1' })],
+    })
+    await expect(
+      repository.readCategoryShard('profile-a', 'vod', categories[1].id, 0),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'vod-b-1' })],
+    })
+  })
+
+  it('serves only a complete section through bounded local category and search reads', async () => {
+    const repository = createRepository()
+    const categories = [
+      { id: 'live-a', name: 'Live A' },
+      { id: 'live-b', name: 'Live B' },
+    ]
+
+    await repository.putSectionManifest('profile-a', 'live', categories)
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'live',
+      category: categories[0],
+      items: [stream('live-a-1', 'Morning News', 'live', categories[0].id)],
+    })
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'live',
+      category: categories[1],
+      items: [stream('live-b-1', 'Evening News', 'live', categories[1].id)],
+    })
+
+    await expect(
+      repository.readCompleteSectionCategories('profile-a', 'live'),
+    ).resolves.toEqual({ coverage: 'complete', categories })
+    await expect(
+      repository.readCompleteCategory('profile-a', 'live', categories[0].id),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'live-a-1' })],
+    })
+    await expect(
+      repository.searchCompleteSection('profile-a', 'live', 'news', 10),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      limited: false,
+      matches: [
+        expect.objectContaining({ id: 'live-a-1' }),
+        expect.objectContaining({ id: 'live-b-1' }),
+      ],
+    })
+
+    await repository.putSectionManifest('profile-a', 'live', [
+      ...categories,
+      { id: 'live-c', name: 'Live C' },
+    ])
+
+    await expect(
+      repository.readCompleteSectionCategories('profile-a', 'live'),
+    ).resolves.toEqual({
+      coverage: 'none',
+      categories: [],
+      reason: 'section-incomplete',
+    })
+  })
+
+  it('keeps legacy sanitized URL-like titles readable in complete local shards', async () => {
+    const repository = createRepository()
+    const category = { id: 'legacy-live', name: 'Legacy Live' }
+
+    await repository.putSectionManifest('profile-a', 'live', [category])
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'live',
+      category,
+      items: [stream('legacy-title', 'Original title', 'live', category.id)],
+    })
+
+    const record = await readStoreRecord(
+      databaseNames[0],
+      'snapshots',
+      ['profile-a', 'live', category.id, 0],
+    ) as { payload: string; byteEstimate: number }
+    const payload = JSON.parse(record.payload) as Array<Record<string, unknown>>
+    delete payload[0].name
+    delete payload[0].searchName
+    const serialized = JSON.stringify(payload)
+
+    await overwriteSnapshotRecord(databaseNames[0], {
+      ...record,
+      payload: serialized,
+      byteEstimate: serialized.length,
+    })
+    clearLibraryMemoryCaches()
+
+    await expect(
+      repository.readCompleteCategory('profile-a', 'live', category.id),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'legacy-title', name: 'Untitled' })],
+    })
+    await expect(
+      repository.searchCompleteSection('profile-a', 'live', 'untitled', 10),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      matches: [expect.objectContaining({ id: 'legacy-title', name: 'Untitled' })],
+    })
+  })
+
   it('round-trips a category larger than 6,000 items through bounded shards', async () => {
     const repository = createRepository()
     const category = { id: 'all-live', name: 'All Live' }
@@ -1155,6 +1308,18 @@ async function deleteStoreRecord(
       reject(transaction.error ?? new Error('Test transaction aborted.'))
   })
   transaction.objectStore(storeName).delete(key)
+  await completed
+  database.close()
+}
+
+async function overwriteSnapshotRecord(
+  databaseName: string,
+  value: unknown,
+): Promise<void> {
+  const database = await openLibraryDatabase(databaseName)
+  const transaction = database.transaction('snapshots', 'readwrite')
+  const completed = transactionCompleteForTest(transaction)
+  transaction.objectStore('snapshots').put(value)
   await completed
   database.close()
 }

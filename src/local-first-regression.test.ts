@@ -11,14 +11,21 @@ describe('local-first catalog regressions', () => {
 
   it('keeps global search local and avoids startup account validation', () => {
     expect(mainSource).toMatch(/function localGlobalSearchMatches\(/)
-    expect(mainSource).toMatch(/Library not downloaded yet — Refresh library\./)
+    expect(mainSource).toMatch(/Movies have not been downloaded yet\. Refresh library from Settings\./)
     expect(mainSource).not.toMatch(/searchStreams\s*\(/)
     expect(mainSource).not.toMatch(/void refreshAccount\(true\)/)
   })
 
-  it('reuses cached section categories before requesting them again', () => {
+  it('reads browse categories and category contents only from authoritative local snapshots', () => {
     expect(mainSource).toMatch(
-      /sectionCategories\.get\(section\)\s*\?\?\s*await activeClient\.categories\(section, signal\)/,
+      /await catalogRepository\.readCompleteSectionCategories\(\s*activeProfile\.id,\s*section,\s*\)/,
+    )
+    expect(mainSource).toMatch(
+      /await catalogRepository\.readCompleteCategory\(\s*activeProfile\.id,\s*activeCatalog\.section,\s*category\.id,\s*\)/,
+    )
+    expect(mainSource).not.toMatch(/await activeClient\.categories\(section, signal\)/)
+    expect(mainSource).not.toMatch(
+      /await activeClient\.streams\(activeCatalog\.section, category\.id, signal\)/,
     )
   })
 
@@ -28,12 +35,13 @@ describe('local-first catalog regressions', () => {
     expect(mainSource).toMatch(/await activeClient\.nowNext\(stream\.id, signal\)/)
   })
 
-  it('keeps Phase 1B acquisition outside every UI catalog read route', () => {
+  it('keeps provider acquisition explicit while browse and search read the local catalog', () => {
     expect(mainSource).toMatch(
       /new CatalogSyncCoordinator\(\s*client,\s*catalogRepository(?:,\s*\{[\s\S]*?internalFaultDiagnostics:[\s\S]*?\})?\s*\)/,
     )
-    expect(mainSource).not.toMatch(/catalogRepository\.readCategoryShard\(/)
-    expect(mainSource).not.toMatch(/catalogRepository\.search\(/)
+    expect(mainSource).toMatch(/catalogRepository\.readCompleteCategory\(/)
+    expect(mainSource).toMatch(/catalogRepository\.searchCompleteSection\(/)
+    expect(mainSource).not.toMatch(/searchStreams\s*\(/)
     expect(mainSource).toMatch(/function scheduleCatalogSync\(/)
     expect(mainSource).toMatch(/data-action="refresh-library"/)
     expect(mainSource).toMatch(/if \(action === 'refresh-library'\)/)

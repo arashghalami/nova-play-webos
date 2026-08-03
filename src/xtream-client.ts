@@ -67,6 +67,11 @@ export type StreamScanOptions = RequestOptions & {
    */
   maxResponseBytes?: number
   categoryId?: string
+  /**
+   * Consumers may return a promise for parser backpressure. The `void` callback
+   * type deliberately also preserves compatibility with existing synchronous
+   * callbacks whose expression body returns an incidental value.
+   */
   onMatches?: (matches: StreamItem[]) => void
 }
 
@@ -1081,7 +1086,7 @@ export class XtreamClient {
       options.signal?.addEventListener('abort', abortFromCaller, { once: true })
     }
 
-    const flushMatches = (): void => {
+    const flushMatches = async (): Promise<void> => {
       if (!pendingMatches.length) {
         return
       }
@@ -1091,12 +1096,14 @@ export class XtreamClient {
 
       // Publish incrementally so cancellation requested by a consumer takes
       // effect before any later match from the same network chunk is exposed.
+      // Awaiting a consumer keeps cache publication bounded and applies
+      // backpressure to the network parser on older webOS runtimes.
       for (const match of batch) {
         if (controller.signal.aborted) {
           break
         }
 
-        options.onMatches?.([match])
+        await options.onMatches?.([match])
       }
     }
 
@@ -1251,7 +1258,7 @@ export class XtreamClient {
             }
 
             if (processRecord(recordSource)) {
-              flushMatches()
+              await flushMatches()
               return true
             }
           }
@@ -1264,7 +1271,7 @@ export class XtreamClient {
           (index & 2047) === 2047 &&
           Date.now() - sliceStartedAt >= SEARCH_WORK_SLICE_MS
         ) {
-          flushMatches()
+          await flushMatches()
           await yieldToBrowser()
           sliceStartedAt = Date.now()
         }
@@ -1276,7 +1283,7 @@ export class XtreamClient {
         objectLength += part.length
       }
 
-      flushMatches()
+      await flushMatches()
 
       if (controller.signal.aborted) {
         throw new ProviderError('cancelled', 'Request cancelled.', false)
@@ -1427,10 +1434,10 @@ export class XtreamClient {
       }
 
       scanSucceeded = true
-      flushMatches()
+      await flushMatches()
       return matches
     } catch (reason) {
-      flushMatches()
+      await flushMatches()
 
       if (options.signal?.aborted) {
         terminalFailureKind = 'cancelled'

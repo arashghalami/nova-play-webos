@@ -8,6 +8,7 @@ import type { Category, LibrarySection, StreamItem, XtreamProfile } from '../typ
 import type { StreamScanOptions } from '../xtream-client'
 import {
   CatalogSyncCoordinator,
+  VOD_SYNC_MEASUREMENT_MAX_RESPONSE_BYTES,
   type CatalogSyncProvider,
 } from './catalog-sync'
 import {
@@ -153,6 +154,102 @@ describe('CatalogSyncCoordinator', () => {
     expect(broker.inspectBudget()).toMatchObject({
       interactive: { used: 0 },
       sync: { used: 5, remaining: 1 },
+    })
+  })
+
+  it('runs an explicit VOD-only measurement from the persisted manifest in one request', async () => {
+    let now = 1_000
+    const repository = createRepository(() => now)
+    const provider = new FixtureCatalogProvider()
+    const coordinator = new CatalogSyncCoordinator(provider, repository, { now: () => now })
+
+    provider.failScans.add('vod')
+    const initial = await coordinator.sync('profile-a')
+    expect(initial).toMatchObject({ status: 'failed', requestCount: 6 })
+
+    provider.failScans.delete('vod')
+    provider.calls.length = 0
+    provider.scanOptions.length = 0
+
+    const result = await coordinator.sync('profile-a', {
+      section: 'vod',
+      maxResponseBytes: VOD_SYNC_MEASUREMENT_MAX_RESPONSE_BYTES,
+    })
+
+    expect(result).toMatchObject({
+      status: 'completed',
+      requestCount: 1,
+      sections: [
+        {
+          section: 'vod',
+          mode: 'whole-section',
+          success: true,
+          attemptedRequestCount: 1,
+        },
+      ],
+    })
+    expect(provider.calls).toEqual(['scan:vod'])
+    expect(provider.scanOptions).toHaveLength(1)
+    expect(provider.scanOptions[0]).toMatchObject({
+      maxResponseBytes: VOD_SYNC_MEASUREMENT_MAX_RESPONSE_BYTES,
+    })
+    expect((await repository.getMeta('profile-a'))?.sync.sections?.vod).toMatchObject({
+      coverage: 'complete',
+      wholeSectionFailureCount: 0,
+      nextCategoryCursor: 0,
+    })
+  })
+
+  it('allows one targeted VOD request when exactly one sync debit remains', async () => {
+    vi.stubGlobal('localStorage', new MemoryStorage())
+    const repository = createRepository()
+    const transport = new FixtureProviderTransport({
+      [fixtureUrl('get_live_categories')]: jsonResponse([]),
+      [fixtureUrl('get_vod_streams')]: jsonResponse([
+        { stream_id: 'vod-1', name: 'Fixture VOD', category_id: 'vod-a' },
+      ]),
+    })
+    const broker = new ProviderBroker(fixtureProfile, {
+      transport,
+      syncDailyRequestBudget: 6,
+    })
+
+    for (let index = 0; index < 5; index += 1) {
+      await broker.backgroundCategories('live')
+    }
+
+    await repository.putSectionManifest(fixtureProfile.id, 'vod', [
+      { id: 'vod-a', name: 'VOD A' },
+    ])
+
+    const result = await new CatalogSyncCoordinator(broker, repository).sync(
+      fixtureProfile.id,
+      {
+        section: 'vod',
+        maxResponseBytes: VOD_SYNC_MEASUREMENT_MAX_RESPONSE_BYTES,
+      },
+    )
+
+    expect(result).toMatchObject({
+      status: 'completed',
+      requestCount: 1,
+      issuedRequestCount: 1,
+      sections: [
+        {
+          section: 'vod',
+          attemptedRequestCount: 1,
+          issuedRequestCount: 1,
+        },
+      ],
+    })
+    expect(broker.inspectBudget()).toMatchObject({
+      sync: { used: 6, remaining: 0 },
+    })
+    await expect(
+      repository.readCategoryShard(fixtureProfile.id, 'vod', 'vod-a', 0),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'vod-1' })],
     })
   })
 
@@ -377,9 +474,9 @@ describe('CatalogSyncCoordinator', () => {
   it('records bounded probe-only detail for an internal snapshot publication fault', async () => {
     const repository = createRepository()
     const provider = new FixtureCatalogProvider()
-    const originalReplace = repository.replaceSectionSnapshots.bind(repository)
-    const replaceSpy = vi
-      .spyOn(repository, 'replaceSectionSnapshots')
+    const originalAppend = repository.appendPartialCategorySnapshot.bind(repository)
+    const appendSpy = vi
+      .spyOn(repository, 'appendPartialCategorySnapshot')
       .mockImplementation(async (input, options) => {
         if (input.section === 'live') {
           options?.onPublishStage?.('manifest-put')
@@ -393,7 +490,7 @@ describe('CatalogSyncCoordinator', () => {
           throw error
         }
 
-        return originalReplace(input, options)
+        return originalAppend(input, options)
       })
     performanceTrace.enable()
     performanceTrace.clear()
@@ -426,8 +523,57 @@ describe('CatalogSyncCoordinator', () => {
         },
       })
     } finally {
-      replaceSpy.mockRestore()
+      appendSpy.mockRestore()
     }
+  })
+
+  it('persists a durable partial category snapshot after an interrupted first section scan and resumes the first incomplete category', async () => {
+    let now = 1_000
+    const repository = createRepository(() => now)
+    const provider = new FixtureCatalogProvider()
+    provider.partialBatchCount = 128
+    provider.partialFailures.add('vod')
+    const coordinator = new CatalogSyncCoordinator(provider, repository, { now: () => now })
+
+    const failed = await coordinator.sync('profile-a')
+
+    expect(failed).toMatchObject({ status: 'failed', requestCount: 6 })
+    expect((await repository.getManifest('profile-a', 'vod'))?.coverage).toMatchObject({
+      state: 'partial',
+      completeCategoryCount: 0,
+      itemCount: 128,
+    })
+    expect((await repository.getMeta('profile-a'))?.sync.sections?.vod).toMatchObject({
+      coverage: 'partial',
+      wholeSectionFailureCount: 1,
+      nextCategoryCursor: 0,
+    })
+    await expect(
+      repository.readCategoryShard('profile-a', 'vod', 'vod-a', 0),
+    ).resolves.toMatchObject({
+      coverage: 'none',
+      reason: 'category-unavailable',
+    })
+
+    now = requiredNextDueAt(failed)
+    provider.partialFailures.delete('vod')
+    provider.calls.length = 0
+    const resumed = await coordinator.sync('profile-a')
+
+    expect(resumed).toMatchObject({ status: 'completed', requestCount: 6 })
+    expect(provider.calls).toContain('scan:vod:vod-a')
+    expect(provider.calls).not.toContain('scan:vod')
+    expect((await repository.getMeta('profile-a'))?.sync.sections?.vod).toMatchObject({
+      coverage: 'partial',
+      wholeSectionFailureCount: 1,
+      nextCategoryCursor: 1,
+    })
+    await expect(
+      repository.readCategoryShard('profile-a', 'vod', 'vod-a', 0),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'vod-a-slice' })],
+    })
   })
 
   it('does not publish partial streamed data from a truncated section response', async () => {
@@ -478,9 +624,11 @@ describe('CatalogSyncCoordinator', () => {
 
 class FixtureCatalogProvider implements CatalogSyncProvider {
   readonly calls: string[] = []
+  readonly scanOptions: StreamScanOptions[] = []
   readonly failScans = new Set<string>()
   readonly partialFailures = new Set<string>()
   readonly refuseCategories = new Set<string>()
+  partialBatchCount = 1
   maxInFlight = 0
   private inFlight = 0
 
@@ -503,6 +651,7 @@ class FixtureCatalogProvider implements CatalogSyncProvider {
     options: StreamScanOptions = {},
   ): Promise<void> {
     const key = options.categoryId ? `${section}:${options.categoryId}` : section
+    this.scanOptions.push(options)
 
     await this.run(`scan:${key}`, async () => {
       const values = options.categoryId
@@ -510,7 +659,11 @@ class FixtureCatalogProvider implements CatalogSyncProvider {
         : catalogStreams(section)
 
       if (this.partialFailures.has(key)) {
-        options.onMatches?.([values[0]])
+        await options.onMatches?.(
+          Array.from({ length: this.partialBatchCount }, (_, index) =>
+            stream(`partial-${section}-${index}`, section, `${section}-a`),
+          ),
+        )
         throw new ProviderError('invalid-response', 'Fixture response was truncated.', false)
       }
 
@@ -518,7 +671,7 @@ class FixtureCatalogProvider implements CatalogSyncProvider {
         throw new ProviderError('server', 'Fixture server failure.', true)
       }
 
-      options.onMatches?.(values)
+      await options.onMatches?.(values)
     })
   }
 
