@@ -1514,3 +1514,45 @@ The run stopped after five serial provider requests because the VOD category-man
 - Automated verification: **accepted**.
 - Physical `1.0.22` local browse/search verification: **pending** because the target is currently unreachable.
 - Gate 1 / Phase 2A acceptance remains **pending**. No additional provider acquisition is authorized.
+
+## 2026-08-03 — Normal-package local-read verification on OLED55G1RLA
+
+### Deployment and normal-package boundary
+
+- After the physical target became reachable again, normal package `com.arash.novaplay` `1.0.22` was installed and launched on `OLED55G1RLA` through `lg-oled-g1`.
+- CDP verified `typeof window.__NOVA_LIBRARY_PROBE__ === "undefined"`. The production package exposes no probe API.
+- This verification used existing IndexedDB catalog state only. It did not invoke Refresh, Measure VOD download, category acquisition, a provider retry, a budget reset, or a provider-backed search.
+
+### Authoritative local global search
+
+- A deliberately non-matching local search completed with all three sections authoritative:
+  - Live: expected/seen snapshots `825/825`;
+  - VOD: expected/seen snapshots `430/430`;
+  - Series: expected/seen snapshots `231/231`.
+- The UI rendered each section as **No matching titles**, not **Library not downloaded yet**.
+- Sanitized local full-section scan elapsed measurements were:
+  - Live: `16,285.93 ms`;
+  - VOD: `37,712.35 ms`;
+  - Series: `13,753.96 ms`.
+- A positive local search was then verified as an aggregate only:
+  - `28` rendered local result cards;
+  - all three sections again reported complete expected/seen snapshot coverage;
+  - the unavailable copy was absent.
+- Across the non-match and positive-search checks, performance tracing recorded zero `network` events. No title or query content is retained in this record.
+
+### Local browse verification
+
+- Live browse rendered `24` category cards, then `24` stream cards after opening a local category; provider/network events: `0`.
+- Series browse rendered `24` category cards and `24` stream cards after opening a local category; provider/network events: `0`.
+- VOD browse rendered `24` category cards and `24` stream cards after opening a local category; provider/network events: `0`.
+- The VOD result confirms the completed measured VOD cache is now presented through the same authoritative local browse path. It does not perform a new provider VOD request.
+
+### Decision
+
+- Normal-package local browse and global search verification: **accepted**.
+- Local-read availability correction: **physically accepted**.
+- All three stored sections were physically read as complete with zero observed provider/network events during the verified local flows.
+- Gate 1: **accepted**. The authoritative acquisition evidence, measured VOD bound, incremental-publication/restart behavior, and normal-package local-read verification are complete.
+- Phase 2A local category browse cutover: **accepted** for Live, VOD, and Series.
+- The verified global-search route is local-only and authoritative for the three complete sections. This does not independently accept any later hybrid-search, metadata, identity, or service phase.
+- No additional provider acquisition is authorized by this verification.
