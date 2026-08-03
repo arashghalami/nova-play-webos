@@ -664,6 +664,36 @@ export class CatalogSyncCoordinator {
       }
       failureStage = 'manifest-read'
       const manifest = await this.repository.getManifest(profileId, section)
+
+      /*
+       * Search postings are derived only after the strict array has closed and
+       * the new manifest is authoritative. A failed index build never rolls
+       * back a valid catalog publish: search remains honestly unavailable until
+       * its next local rebuild instead.
+       */
+      try {
+        const [indexResult] = await this.repository.rebuildSearchIndexes(
+          profileId,
+          [section],
+          signal,
+        )
+        performanceTrace.event('library', 'catalog-search-index-published', {
+          section,
+          coverage: indexResult?.coverage ?? 'none',
+          itemCount: indexResult?.coverage === 'complete' ? indexResult.itemCount : 0,
+          postingCount: indexResult?.coverage === 'complete' ? indexResult.postingCount : 0,
+          elapsedMs: indexResult?.elapsedMs ?? null,
+        })
+      } catch {
+        performanceTrace.event('library', 'catalog-search-index-published', {
+          section,
+          coverage: 'none',
+          itemCount: 0,
+          postingCount: 0,
+          elapsedMs: null,
+        })
+      }
+
       failureStage = 'sync-state'
       await this.updateSectionState(profileId, runId, section, states, {
         coverage: manifest?.coverage.state ?? state.coverage,
@@ -793,6 +823,30 @@ export class CatalogSyncCoordinator {
       )
       failureStage = 'manifest-read'
       const manifest = await this.repository.getManifest(profileId, section)
+
+      try {
+        const [indexResult] = await this.repository.rebuildSearchIndexes(
+          profileId,
+          [section],
+          signal,
+        )
+        performanceTrace.event('library', 'catalog-search-index-published', {
+          section,
+          coverage: indexResult?.coverage ?? 'none',
+          itemCount: indexResult?.coverage === 'complete' ? indexResult.itemCount : 0,
+          postingCount: indexResult?.coverage === 'complete' ? indexResult.postingCount : 0,
+          elapsedMs: indexResult?.elapsedMs ?? null,
+        })
+      } catch {
+        performanceTrace.event('library', 'catalog-search-index-published', {
+          section,
+          coverage: 'none',
+          itemCount: 0,
+          postingCount: 0,
+          elapsedMs: null,
+        })
+      }
+
       const nextIncompleteCursor =
         state.coverage === 'partial'
           ? incompleteCategoryCursor(categories, manifest)

@@ -72,7 +72,7 @@ afterEach(async () => {
 })
 
 describe('flat catalog repository', () => {
-  it('creates exactly the six Phase 1A stores with the required key paths', async () => {
+  it('creates the catalog stores and indexed local-search layout with the required key paths', async () => {
     const repository = createRepository()
     const stores = await repository.initialize()
 
@@ -91,6 +91,17 @@ describe('flat catalog repository', () => {
     ])
     expect(transaction.objectStore('searchShards').keyPath).toEqual([
       'profileId',
+      'shardIndex',
+    ])
+    expect(transaction.objectStore('searchIndexMeta').keyPath).toEqual([
+      'profileId',
+      'section',
+    ])
+    expect(transaction.objectStore('searchIndexShards').keyPath).toEqual([
+      'profileId',
+      'section',
+      'generation',
+      'prefix',
       'shardIndex',
     ])
     expect(transaction.objectStore('details').keyPath).toEqual([
@@ -247,6 +258,8 @@ describe('flat catalog repository', () => {
       coverage: 'complete',
       items: [expect.objectContaining({ id: 'live-a-1' })],
     })
+    await repository.rebuildSearchIndexes('profile-a', ['live'])
+
     await expect(
       repository.searchCompleteSection('profile-a', 'live', 'news', 10),
     ).resolves.toMatchObject({
@@ -269,6 +282,106 @@ describe('flat catalog repository', () => {
       coverage: 'none',
       categories: [],
       reason: 'section-incomplete',
+    })
+  })
+
+  it('builds a generation-bound local prefix index, counts legacy untitled records, and streams result batches', async () => {
+    const repository = createRepository()
+    const category = { id: 'local-index', name: 'Local index' }
+
+    await repository.putSectionManifest('profile-a', 'vod', [category])
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'vod',
+      category,
+      items: [
+        stream('alpha', 'Alpha Archive', 'vod', category.id),
+        stream('alpha-two', 'Alpha Arrival', 'vod', category.id),
+        stream('legacy', 'Legacy title', 'vod', category.id),
+      ],
+    })
+
+    const snapshot = await readStoreRecord(
+      databaseNames[0],
+      'snapshots',
+      ['profile-a', 'vod', category.id, 0],
+    ) as { payload: string; byteEstimate: number }
+    const payload = JSON.parse(snapshot.payload) as Array<Record<string, unknown>>
+    delete payload[2].name
+    delete payload[2].searchName
+    const serialized = JSON.stringify(payload)
+    await overwriteSnapshotRecord(databaseNames[0], {
+      ...snapshot,
+      payload: serialized,
+      byteEstimate: serialized.length,
+    })
+    clearLibraryMemoryCaches()
+
+    const [build] = await repository.rebuildSearchIndexes('profile-a', ['vod'])
+
+    expect(build).toMatchObject({
+      coverage: 'complete',
+      itemCount: 3,
+      legacyUntitledCount: 1,
+    })
+
+    const progress: number[] = []
+    const result = await repository.searchCompleteSection(
+      'profile-a',
+      'vod',
+      'alpha',
+      60,
+      {
+        onMatches: ({ matches }) => {
+          progress.push(matches.length)
+        },
+      },
+    )
+
+    expect(result).toMatchObject({
+      coverage: 'complete',
+      limited: false,
+      matches: [
+        expect.objectContaining({ id: 'alpha' }),
+        expect.objectContaining({ id: 'alpha-two' }),
+      ],
+    })
+    expect(progress).toContain(2)
+
+    const metaBeforeReuse = await repository.getSearchIndexMeta('profile-a', 'vod')
+    const unreadableSnapshot = await readStoreRecord(
+      databaseNames[0],
+      'snapshots',
+      ['profile-a', 'vod', category.id, 0],
+    ) as { payload: string; byteEstimate: number }
+    await overwriteSnapshotRecord(databaseNames[0], {
+      ...unreadableSnapshot,
+      payload: '{}',
+      byteEstimate: 2,
+    })
+    clearLibraryMemoryCaches()
+
+    const [reused] = await repository.rebuildSearchIndexes('profile-a', ['vod'])
+
+    expect(reused).toMatchObject({
+      coverage: 'complete',
+      itemCount: 3,
+      legacyUntitledCount: 1,
+    })
+    await expect(repository.getSearchIndexMeta('profile-a', 'vod')).resolves.toEqual(metaBeforeReuse)
+
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'vod',
+      category,
+      items: [stream('replacement', 'Replacement title', 'vod', category.id)],
+    })
+
+    await expect(
+      repository.searchCompleteSection('profile-a', 'vod', 'alpha', 60),
+    ).resolves.toMatchObject({
+      coverage: 'none',
+      reason: 'index-unavailable',
     })
   })
 
@@ -307,6 +420,8 @@ describe('flat catalog repository', () => {
       coverage: 'complete',
       items: [expect.objectContaining({ id: 'legacy-title', name: 'Untitled' })],
     })
+    await repository.rebuildSearchIndexes('profile-a', ['live'])
+
     await expect(
       repository.searchCompleteSection('profile-a', 'live', 'untitled', 10),
     ).resolves.toMatchObject({
@@ -568,6 +683,9 @@ describe('flat catalog repository', () => {
     const legacyDatabaseName = uniqueDatabaseName()
     const legacyRepository = createRepository(undefined, legacyDatabaseName)
     await legacyRepository.initialize()
+    const legacyIndexBuildSpy = vi
+      .spyOn(legacyRepository, 'rebuildSearchIndexes')
+      .mockResolvedValue([])
     const restoreLegacyAutoCommitHarness = await installAutoCommitAfterGetHarness(
       legacyDatabaseName,
     )
@@ -627,6 +745,7 @@ describe('flat catalog repository', () => {
       })
     } finally {
       legacyUpdateSpy.mockRestore()
+      legacyIndexBuildSpy.mockRestore()
       restoreLegacyAutoCommitHarness()
     }
 
@@ -635,6 +754,9 @@ describe('flat catalog repository', () => {
     const correctedDatabaseName = uniqueDatabaseName()
     const correctedRepository = createRepository(undefined, correctedDatabaseName)
     await correctedRepository.initialize()
+    const correctedIndexBuildSpy = vi
+      .spyOn(correctedRepository, 'rebuildSearchIndexes')
+      .mockResolvedValue([])
     const restoreCorrectedAutoCommitHarness = await installAutoCommitAfterGetHarness(
       correctedDatabaseName,
     )
@@ -693,9 +815,10 @@ describe('flat catalog repository', () => {
         },
       })
     } finally {
+      correctedIndexBuildSpy.mockRestore()
       restoreCorrectedAutoCommitHarness()
     }
-  })
+  }, 90_000)
 
   it('keeps existing category routing when a successful manifest omits a previously cached category', async () => {
     const repository = createRepository()

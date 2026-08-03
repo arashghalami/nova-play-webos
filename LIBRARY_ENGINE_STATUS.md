@@ -1556,3 +1556,104 @@ The run stopped after five serial provider requests because the VOD category-man
 - Phase 2A local category browse cutover: **accepted** for Live, VOD, and Series.
 - The verified global-search route is local-only and authoritative for the three complete sections. This does not independently accept any later hybrid-search, metadata, identity, or service phase.
 - No additional provider acquisition is authorized by this verification.
+
+## 2026-08-03 — Post-cutover local-search defect correction and extended local-read verification
+
+### Settlement boundary
+
+- Gate 1 and the Phase 2A all-section local-read cutover remain **accepted and settled**. This entry records only post-cutover local defects and their local-only remediation; it does not reopen the successful VOD acquisition, the accepted 96 MiB production bound, or the prior zero-provider browse/search result.
+- No provider request, reset, acquisition, category refresh, or provider-backed search was issued during this work.
+
+### Defect and derived-index implementation
+
+- The accepted all-section local scan had a measured global-search baseline of `67,752 ms`. Its query path parsed all `1,486` current snapshot shards, so it was not shippable despite being provider-free.
+- Search is now a versioned, derived local artifact:
+  - `searchIndexMeta` requires `coverage=complete`, the current index format, and the exact active `SectionManifestRecord.updatedAt` generation before a section can be searched;
+  - compact `searchIndexShards` are keyed by profile, section, generation, folded token prefix, and shard index;
+  - each posting contains only the category/shard/item coordinates, snapshot generation, opaque stream key, and folded display value required for filtering/ranking;
+  - query reads the rarest applicable two- or three-character folded prefix posting shards, applies the shared `foldText`, `queryTokens`, and `matchesQuery` logic, and resolves full snapshot records lazily only for visible results;
+  - corrupted, missing, or stale derived data reports `index-unavailable`/`index-invalid`; a user query never starts a whole-catalog scan fallback;
+  - progressive result callbacks emit after bounded match batches, allowing the rendered section to paint while remaining sections resolve.
+- Ingestion rebuilds the affected section index only after strict snapshot publication. Startup/profile activation performs the local migration for legacy current snapshots.
+- An already complete generation-matched index now returns its existing metadata without rebuilding. A regression corrupts the source snapshot after a successful build and proves that the current derived index is reused rather than rescanned; a later snapshot-generation change still invalidates it.
+- The webOS migration was hardened after physical observation:
+  - packed prefix shards replaced the rejected per-item IndexedDB index-write design;
+  - up to 32 packed shard records are committed per transaction;
+  - stale generation records are inert by key design and are not cursor-deleted before a rebuild;
+  - empty pending-prefix buffers are excluded from forced draining.
+
+### Physical migration and Untitled audit
+
+- Normal package: `com.arash.novaplay` `1.0.22` on `OLED55G1RLA` / webOS `6.5.3`.
+- A fresh serial local migration over the existing authoritative snapshots completed before the final reuse-enabled package was installed. Its observed completion sequence was approximately `5m17s` from launch to final section publication: Live approximately `49s`, VOD approximately `3m29s`, and Series approximately `59s`. This is migration cost only; it used no provider transport.
+- The final package then relaunched against the same generation-matched metadata without rebuilding any index.
+- `Untitled` values below are the conservative legacy data-loss measure: raw stored records whose `name` field was absent before the compatibility reader substituted readable `Untitled` text. They are not a count of literal provider titles named `Untitled`.
+
+| Section | Authoritative items | Legacy missing-name / Untitled count | Share |
+| --- | ---: | ---: | ---: |
+| Live | 52,209 | 686 | 1.314% |
+| VOD | 194,302 | 107 | 0.055% |
+| Series | 44,684 | 4 | 0.009% |
+| Total | 291,195 | 797 | 0.274% |
+
+- All three index metadata records were physically complete and generation-matched to their active manifests. Aggregate posting counts were 266,810 (Live), 931,956 (VOD), and 182,012 (Series).
+- The Live percentage is material enough to be reported as a legacy snapshot-quality limitation. No corrected re-acquisition was performed or authorized.
+
+### Indexed local-search measurement
+
+- Five physical all-section indexed local searches were measured without retaining query text or titles.
+- The search result set was bounded to the existing 60-result per-section limit; progressive rendering displayed the initial visible cards while later section work continued.
+- Aggregate measurements:
+
+| Metric | Measurement | Comparison with 67,752 ms scan baseline |
+| --- | ---: | ---: |
+| Search completion p50 | 6,948 ms | 89.7% lower; 9.75× faster |
+| Search completion p95 | 7,320 ms | 89.2% lower; 9.26× faster |
+| First visible progressive result p50 | 504 ms | Below one second |
+| First visible progressive result p95 | 624 ms | Below one second |
+
+- CDP Network capture recorded zero network requests during each measured search. No search text, title, URL, provider payload, credential, or exported trace is retained here.
+
+### Extended local browse verification
+
+The final normal package was verified using only the existing local catalog, local favorites, and browser/device-local state. CDP Network capture recorded **zero network requests** throughout the final sequence.
+
+| Local interaction | Sanitized evidence | Latency |
+| --- | --- | ---: |
+| Open VOD category library | First local 24-category page rendered | 193 ms |
+| Page beyond the first VOD category page | Page 2 of 16 rendered | 194 ms |
+| Open largest VOD category | 6,423 local items across 6 bounded snapshots; first local 24-card page rendered | 2,716 ms |
+| Sort the large category | Sort transitioned to A–Z | 574 ms |
+| Toggle a favorite | Local favorite state updated | 167 ms |
+| Back navigation | Returned to the VOD category page | 302 ms |
+| Open Favorites | Local Favorites view rendered with saved cards | 373 ms |
+
+- A pre-final verification exposed one non-provider image request when Favorites rendered remote artwork. Local catalog/search/favorites presentation now suppresses remote artwork URLs and uses the existing text/monogram placeholder instead. The final repeated sequence above had zero CDP network events, including Favorites.
+- This guard affects only local library presentation (`catalog` and `search`); detail/playback flows retain their existing explicitly selected-media behavior.
+
+### Automated verification
+
+| Command | Result | Notes |
+| --- | --- | --- |
+| `rtk npx tsc --noEmit` | Passed | No TypeScript diagnostics. |
+| `rtk npx vitest run src/library/catalog-repository.test.ts src/library/catalog-sync.test.ts` | Passed | 37 tests, including current-generation index reuse. |
+| `rtk npm test` | Passed | 32 files, 250 tests. Mocked metadata-upstream 503 output remains expected test diagnostics. |
+| `rtk npm run package:webos` | Passed | Normal `1.0.22` package; import-cycle, ES2015, standalone-media, and webOS bundle checks passed. |
+| `rtk git diff --check` | Passed | No whitespace errors. |
+
+### Files changed
+
+- `src/library/catalog-repository.ts`
+- `src/library/catalog-repository.test.ts`
+- `src/library/catalog-sync.ts`
+- `src/main.ts`
+- `LIBRARY_ENGINE_STATUS.md`
+
+### Rollback and decision
+
+- The index is rebuildable from authoritative snapshots. Removing index metadata/shards, or rolling back to the prior package, never deletes catalog snapshots, profiles, favorites, or resume state. Until a valid current index exists, search truthfully reports unavailable rather than falling back to the rejected full scan.
+- The local artwork guard rolls back independently by restoring presentation of remote artwork; the final zero-network local-flow requirement is the reason it remains enabled.
+- Post-cutover search defect: **corrected and physically accepted**.
+- Untitled audit: **recorded**; no re-acquisition authorized.
+- Extended local browse verification: **accepted**.
+- Gate 1 and Phase 2A: **remain accepted**.

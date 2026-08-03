@@ -120,6 +120,7 @@ import {
   clearLibraryMemoryCaches,
   IndexedDbCatalogRepository,
   setLibraryPlaybackStarting,
+  type SearchIndexBuildResult,
 } from './library/catalog-repository'
 import {
   CATALOG_SYNC_SECTIONS,
@@ -413,6 +414,7 @@ let globalSearchQuery = ''
 let globalSearchStatus = ''
 let globalSearchSequence = 0
 const globalSearchSectionAvailability = new Map<LibrarySection, boolean>()
+let localSearchIndexMigrationProfileId: string | null = null
 let searchReturnView: AppView = 'home'
 let pendingFocus: FocusSnapshot | null = null
 let detailReturnPoint: ViewReturnPoint | null = null
@@ -1592,6 +1594,14 @@ function cardRating(stream: StreamItem): string {
   return `<span class="media-rating" aria-label="IMDb rating ${escape(displayRating)}">IMDb ${escape(displayRating)}</span>`
 }
 
+function suppressRemoteArtworkForLocalLibrary(): boolean {
+  return view === 'catalog' || view === 'search'
+}
+
+function isRemoteArtworkSource(source: string): boolean {
+  return /^(?:https?:)?\/\//i.test(source)
+}
+
 function liveArtwork(stream: StreamItem): string {
   const language =
     stream.name.match(/^\s*([a-z]{2,4})\s*[|:-]/i)?.[1]?.toLocaleUpperCase() ??
@@ -1608,9 +1618,14 @@ function liveArtwork(stream: StreamItem): string {
       .slice(0, 2)
       .map((word) => word.charAt(0).toLocaleUpperCase())
       .join('') || language
-  const providerLogo = stream.icon
-    ? `<span class="live-logo-frame"><img class="channel-logo live-channel-logo" src="${escape(stream.icon)}" alt="" loading="lazy" /></span>`
-    : ''
+  const providerLogo =
+    stream.icon &&
+    !(
+      suppressRemoteArtworkForLocalLibrary() &&
+      isRemoteArtworkSource(stream.icon)
+    )
+      ? `<span class="live-logo-frame"><img class="channel-logo live-channel-logo" src="${escape(stream.icon)}" alt="" loading="lazy" /></span>`
+      : ''
 
   return `
     <span class="live-channel-artwork ${providerLogo ? 'has-provider-logo' : ''}">
@@ -1656,7 +1671,10 @@ function posterArtwork(stream: StreamItem): string {
     source = stream.cover || stream.metadata?.cover || stream.seriesCover || stream.icon
   }
 
-  if (!source) {
+  if (
+    !source ||
+    (suppressRemoteArtworkForLocalLibrary() && isRemoteArtworkSource(source))
+  ) {
     return imageOrPlaceholder(undefined, stream.name, 'poster')
   }
 
@@ -2329,10 +2347,13 @@ function globalSearchSectionContent(section: LibrarySection): string {
   const hiddenCount = Math.max(0, results.length - visibleResults.length)
   const hasMore = results.length > GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT
   const noun = globalSearchResultNoun(section, results.length)
+  const sectionResolved = globalSearchSectionAvailability.has(section)
   const sectionAvailable = globalSearchSectionAvailability.get(section) === true
-  const emptyState = sectionAvailable
-    ? '<div class="empty-state"><h3>No matching titles</h3><p>Try another search in your downloaded library.</p></div>'
-    : '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Refresh library before searching this section.</p></div>'
+  const emptyState = !sectionResolved
+    ? '<div class="empty-state"><h3>Searching downloaded library</h3><p>Loading local results…</p></div>'
+    : sectionAvailable
+      ? '<div class="empty-state"><h3>No matching titles</h3><p>Try another search in your downloaded library.</p></div>'
+      : '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Refresh library before searching this section.</p></div>'
 
   return `
     <div class="global-search-group-heading">
@@ -2407,6 +2428,7 @@ function updateGlobalSearchSection(section: LibrarySection): void {
   const noun = globalSearchResultNoun(section, results.length)
   const hasMore = results.length > GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT
   const expanded = expandedGlobalSearchSections.has(section)
+  const sectionResolved = globalSearchSectionAvailability.has(section)
   const sectionAvailable = globalSearchSectionAvailability.get(section) === true
 
   if (count) {
@@ -2429,9 +2451,11 @@ function updateGlobalSearchSection(section: LibrarySection): void {
 
   if (!visibleResults.length) {
     content.className = 'global-search-empty'
-    content.innerHTML = sectionAvailable
-      ? '<div class="empty-state"><h3>No matching titles</h3><p>Try another search in your downloaded library.</p></div>'
-      : '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Refresh library before searching this section.</p></div>'
+    content.innerHTML = !sectionResolved
+      ? '<div class="empty-state"><h3>Searching downloaded library</h3><p>Loading local results…</p></div>'
+      : sectionAvailable
+        ? '<div class="empty-state"><h3>No matching titles</h3><p>Try another search in your downloaded library.</p></div>'
+        : '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Refresh library before searching this section.</p></div>'
     return
   }
 
@@ -2552,6 +2576,7 @@ function leaveGlobalSearch(): void {
 async function localGlobalSearchMatches(
   query: string,
   sequence: number,
+  onSectionResult?: (section: LibrarySection, matches: readonly StreamItem[]) => void,
 ): Promise<StreamItem[]> {
   const activeProfile = profile
 
@@ -2568,6 +2593,38 @@ async function localGlobalSearchMatches(
       section,
       query,
       GLOBAL_SEARCH_SECTION_RESULT_LIMIT,
+      {
+        onMatches: ({ matches }) => {
+          if (sequence !== globalSearchSequence) {
+            return
+          }
+
+          const sectionKeys = new Set(
+            results
+              .filter((stream) => stream.section === section)
+              .map(streamLookupKey),
+          )
+          const nextResults = results.filter((stream) => stream.section !== section)
+
+          for (const stream of matches) {
+            const key = streamLookupKey(stream)
+
+            if (
+              stream.streamType !== 'episode' &&
+              !sectionKeys.has(key) &&
+              visibleStream(stream)
+            ) {
+              sectionKeys.add(key)
+              nextResults.push(stream)
+            }
+          }
+
+          results.splice(0, results.length, ...nextResults)
+          knownKeys.clear()
+          results.forEach((stream) => knownKeys.add(streamLookupKey(stream)))
+          onSectionResult?.(section, results)
+        },
+      },
     )
 
     if (sequence !== globalSearchSequence) {
@@ -2588,6 +2645,8 @@ async function localGlobalSearchMatches(
         results.push(stream)
       }
     }
+
+    onSectionResult?.(section, results)
   }
 
   rememberStreams(results)
@@ -2618,7 +2677,19 @@ async function updateGlobalSearchFromLibrary(query: string): Promise<void> {
   globalSearchStatus = 'Searching downloaded library…'
   updateGlobalSearchView({ controls: true, fullResults: true })
 
-  const results = await localGlobalSearchMatches(normalizedQuery, sequence)
+  const results = await localGlobalSearchMatches(
+    normalizedQuery,
+    sequence,
+    (section, partialResults) => {
+      if (sequence !== globalSearchSequence || view !== 'search') {
+        return
+      }
+
+      globalSearchResults = partialResults.slice()
+      globalSearchStatus = `Searching downloaded library… ${globalSearchResults.length} local result${globalSearchResults.length === 1 ? '' : 's'}`
+      updateGlobalSearchView({ controls: false, fullResults: false, sections: [section] })
+    },
+  )
 
   if (sequence !== globalSearchSequence || view !== 'search') {
     return
@@ -5775,6 +5846,50 @@ async function runCatalogSync(runOptions: CatalogSyncRunOptions = {}) {
   }
 }
 
+function scheduleLocalSearchIndexMigration(profileId: string): void {
+  if (localSearchIndexMigrationProfileId === profileId) {
+    return
+  }
+
+  localSearchIndexMigrationProfileId = profileId
+
+  window.setTimeout(() => {
+    void catalogRepository.rebuildSearchIndexes(profileId).then(
+      (results) => {
+        const completed = results.filter(
+          (result): result is Extract<SearchIndexBuildResult, { coverage: 'complete' }> =>
+            result.coverage === 'complete',
+        )
+        performanceTrace.event('library', 'local-search-index-migration', {
+          profileStillActive: profile?.id === profileId,
+          completedSectionCount: completed.length,
+          itemCount: completed.reduce((total, result) => total + result.itemCount, 0),
+          postingCount: completed.reduce((total, result) => total + result.postingCount, 0),
+          legacyUntitledCount: completed.reduce(
+            (total, result) => total + result.legacyUntitledCount,
+            0,
+          ),
+          elapsedMs: completed.reduce((total, result) => total + result.elapsedMs, 0),
+        })
+      },
+      () => {
+        performanceTrace.event('library', 'local-search-index-migration', {
+          profileStillActive: profile?.id === profileId,
+          completedSectionCount: 0,
+          itemCount: 0,
+          postingCount: 0,
+          legacyUntitledCount: 0,
+          elapsedMs: null,
+        })
+      },
+    ).finally(() => {
+      if (localSearchIndexMigrationProfileId === profileId) {
+        localSearchIndexMigrationProfileId = null
+      }
+    })
+  }, 0)
+}
+
 function activateProfile(nextProfile: XtreamProfile, nextClient?: ProviderBroker): void {
   cancelScheduledCatalogSync()
   catalogSync?.cancel()
@@ -5810,6 +5925,7 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: ProviderBroker
   adultCategoryIds.clear()
   knownStreams.clear()
   nowNextCache.clear()
+  scheduleLocalSearchIndexMigration(nextProfile.id)
 }
 
 async function refreshAccount(silent = false): Promise<void> {
@@ -6966,3 +7082,7 @@ if (
 
 initializeAppHistory()
 render()
+
+if (profile) {
+  scheduleLocalSearchIndexMigration(profile.id)
+}

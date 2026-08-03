@@ -17,17 +17,28 @@ import type {
 } from '../types'
 
 export const LIBRARY_DATABASE_NAME = 'nova-play-library'
-export const LIBRARY_DATABASE_VERSION = 1
+export const LIBRARY_DATABASE_VERSION = 4
 export const LIBRARY_SCHEMA_VERSION = 1
 export const MAX_SNAPSHOT_ITEMS = 1_500
 export const MAX_SNAPSHOT_BYTES = 256 * 1024
 export const MAX_SEARCH_SHARD_ENTRIES = 5_000
+export const SEARCH_INDEX_FORMAT_VERSION = 1
+/*
+ * IndexedDB writes run synchronously inside each transaction. Larger batches
+ * keep the migration practical on webOS, while still committing frequently
+ * enough to yield between bounded units and avoid a long single transaction.
+ */
+export const SEARCH_INDEX_POSTINGS_PER_SHARD = 1_024
+export const SEARCH_INDEX_WRITE_RECORD_BATCH_SIZE = 32
+export const MAX_SEARCH_INDEX_BUFFERED_POSTINGS = 200_000
 
 export const LIBRARY_STORE_NAMES = [
   'meta',
   'manifests',
   'snapshots',
   'searchShards',
+  'searchIndexMeta',
+  'searchIndexShards',
   'details',
   'epg',
 ] as const
@@ -128,6 +139,49 @@ export type SearchShardRecord = {
   byteEstimate: number
 }
 
+/**
+ * A generation-bound, derived local prefix index. It is not authoritative on
+ * its own: readers require an exact match with the accepted section manifest.
+ */
+export type SearchIndexMetaRecord = {
+  schemaVersion: 1
+  profileId: string
+  section: LibrarySection
+  formatVersion: number
+  coverage: LibraryCoverage
+  generation?: number
+  updatedAt: number
+  itemCount: number
+  postingCount: number
+  legacyUntitledCount: number
+  prefixPostingCounts: Record<string, number>
+  prefixShardCounts: Record<string, number>
+}
+
+/**
+ * A packed prefix posting references the authoritative snapshot item. Full
+ * streams are resolved lazily only for the bounded visible result page.
+ */
+export type SearchIndexPosting = [
+  categoryKey: string,
+  snapshotShardIndex: number,
+  snapshotItemIndex: number,
+  snapshotUpdatedAt: number,
+  streamKey: string,
+  foldedName: string,
+]
+
+export type SearchIndexShardRecord = {
+  schemaVersion: 1
+  profileId: string
+  section: LibrarySection
+  generation: number
+  prefix: string
+  shardIndex: number
+  payload: string
+  entryCount: number
+}
+
 export type DetailRecord<T extends LibraryDetails = LibraryDetails> = {
   schemaVersion: 1
   profileId: string
@@ -213,8 +267,47 @@ export type SectionSearchResult =
   | {
       coverage: 'none'
       matches: []
-      reason: LocalLibraryUnavailableReason
+      reason: LocalLibraryUnavailableReason | 'index-unavailable' | 'index-invalid'
     }
+
+export type SectionSearchProgress = {
+  matches: StreamItem[]
+  matchedCount: number
+  postingCount: number
+}
+
+export type SectionSearchOptions = {
+  signal?: AbortSignal
+  onMatches?: (progress: SectionSearchProgress) => void | Promise<void>
+}
+
+type SearchIndexUnavailableReason =
+  | LocalLibraryUnavailableReason
+  | 'index-unavailable'
+  | 'index-invalid'
+
+export type SearchIndexBuildResult =
+  | {
+      coverage: 'complete'
+      generation: number
+      itemCount: number
+      postingCount: number
+      legacyUntitledCount: number
+      prefixPostingCounts: Record<string, number>
+      prefixShardCounts: Record<string, number>
+      elapsedMs: number
+    }
+  | {
+      coverage: 'none'
+      reason: SearchIndexUnavailableReason
+      elapsedMs: number
+    }
+
+export type LegacyUntitledSectionCount = {
+  section: LibrarySection
+  itemCount: number
+  legacyUntitledCount: number
+}
 
 export type SearchQueryResult =
   | {
@@ -463,6 +556,14 @@ export function openLibraryDatabase(
         'shardIndex',
       ])
       createStore(database, 'searchShards', ['profileId', 'shardIndex'])
+      createStore(database, 'searchIndexMeta', ['profileId', 'section'])
+      createStore(database, 'searchIndexShards', [
+        'profileId',
+        'section',
+        'generation',
+        'prefix',
+        'shardIndex',
+      ])
       createStore(database, 'details', ['profileId', 'kind', 'id'])
       createStore(database, 'epg', ['profileId', 'streamId'])
     }
@@ -511,6 +612,7 @@ export class IndexedDbCatalogRepository {
   private readonly databaseName: string
   private readonly now: () => number
   private databasePromise: Promise<IDBDatabase> | null = null
+  private readonly searchIndexBuilds = new Map<string, Promise<SearchIndexBuildResult>>()
 
   constructor(options: CatalogRepositoryOptions = {}) {
     this.databaseName = options.databaseName ?? LIBRARY_DATABASE_NAME
@@ -1506,7 +1608,574 @@ export class IndexedDbCatalogRepository {
     return { coverage: 'complete', items }
   }
 
+  async getSearchIndexMeta(
+    profileId: string,
+    section: LibrarySection,
+  ): Promise<SearchIndexMetaRecord | null> {
+    try {
+      const record = await getRecord<unknown>(
+        await this.database(),
+        'searchIndexMeta',
+        [profileId, section],
+      )
+      return isSearchIndexMetaRecord(record, profileId, section) ? record : null
+    } catch {
+      return null
+    }
+  }
+
+  async rebuildSearchIndexes(
+    profileId: string,
+    sections: readonly LibrarySection[] = ['live', 'vod', 'series'],
+    signal?: AbortSignal,
+  ): Promise<SearchIndexBuildResult[]> {
+    const results: SearchIndexBuildResult[] = []
+
+    for (const section of sections) {
+      if (signal?.aborted) {
+        break
+      }
+
+      const key = `${profileId}\u0000${section}`
+      let build = this.searchIndexBuilds.get(key)
+
+      if (!build) {
+        build = this.rebuildSearchIndex(profileId, section, signal)
+        this.searchIndexBuilds.set(key, build)
+        void build.then(
+          () => this.searchIndexBuilds.delete(key),
+          () => this.searchIndexBuilds.delete(key),
+        )
+      }
+
+      results.push(await build)
+      await defaultYield()
+    }
+
+    return results
+  }
+
   async searchCompleteSection(
+    profileId: string,
+    section: LibrarySection,
+    query: string,
+    resultLimit: number,
+    options: SectionSearchOptions = {},
+  ): Promise<SectionSearchResult> {
+    const startedAt = monotonicNow()
+    const report = (result: SectionSearchResult, postingCount = 0): SectionSearchResult => {
+      performanceTrace.event('library', 'local-section-index-search-result', {
+        section,
+        coverage: result.coverage,
+        reason: result.coverage === 'none' ? result.reason : null,
+        postingCount,
+        elapsedMs: monotonicNow() - startedAt,
+      })
+      return result
+    }
+    const manifest = await this.getManifest(profileId, section)
+
+    if (!manifest) {
+      return report({
+        coverage: 'none',
+        matches: [],
+        reason: await this.isDatabaseAvailable()
+          ? 'manifest-missing'
+          : 'database-unavailable',
+      })
+    }
+
+    if (
+      manifest.coverage.state !== 'complete' ||
+      manifest.categories.some((category) => category.coverage !== 'complete')
+    ) {
+      return report({ coverage: 'none', matches: [], reason: 'section-incomplete' })
+    }
+
+    const index = await this.ensureSearchIndex(profileId, section, manifest, options.signal)
+
+    if (index.coverage === 'none') {
+      return report({ coverage: 'none', matches: [], reason: index.reason })
+    }
+
+    const tokens = queryTokens(query)
+    const prefixes = tokens
+      .map(searchIndexPrefixForToken)
+      .filter((prefix): prefix is string => prefix !== null)
+
+    if (!prefixes.length) {
+      return report({ coverage: 'complete', matches: [], limited: false })
+    }
+
+    const candidatePrefix = prefixes.reduce((best, prefix) => {
+      const bestCount = index.prefixPostingCounts[best] ?? Number.MAX_SAFE_INTEGER
+      const prefixCount = index.prefixPostingCounts[prefix] ?? 0
+      return prefixCount < bestCount ? prefix : best
+    })
+
+    if (
+      (index.prefixPostingCounts[candidatePrefix] ?? 0) === 0 ||
+      (index.prefixShardCounts[candidatePrefix] ?? 0) === 0
+    ) {
+      return report({ coverage: 'complete', matches: [], limited: false })
+    }
+
+    let entries: SearchIndexPosting[]
+
+    try {
+      entries = await readSearchIndexPostings(
+        await this.database(),
+        profileId,
+        section,
+        index.generation,
+        candidatePrefix,
+        index.prefixShardCounts[candidatePrefix] ?? 0,
+      )
+    } catch {
+      return report({ coverage: 'none', matches: [], reason: 'database-unavailable' })
+    }
+
+    const safeLimit = positiveInteger(resultLimit, 60)
+    const matches: StreamItem[] = []
+    const seen = new Set<string>()
+    let matchedCount = 0
+
+    for (let entryIndex = 0; entryIndex < entries.length; entryIndex += 1) {
+      if (options.signal?.aborted) {
+        return report({ coverage: 'none', matches: [], reason: 'index-unavailable' }, entries.length)
+      }
+
+      const entry = entries[entryIndex]
+
+      if (
+        !isSearchIndexPosting(entry) ||
+        !matchesQuery(entry[5], tokens) ||
+        seen.has(entry[4])
+      ) {
+        continue
+      }
+
+      seen.add(entry[4])
+      matchedCount += 1
+
+      if (matches.length < safeLimit) {
+        const stream = await this.resolveSearchIndexPosting(
+          profileId,
+          section,
+          manifest,
+          entry,
+        )
+
+        if (!stream) {
+          return report({ coverage: 'none', matches: [], reason: 'index-invalid' }, entries.length)
+        }
+
+        matches.push(stream)
+
+        if (matches.length % 8 === 0 || matches.length === safeLimit) {
+          await options.onMatches?.({
+            matches: matches.slice(),
+            matchedCount,
+            postingCount: entries.length,
+          })
+        }
+      }
+
+      if (matches.length >= safeLimit && matchedCount > safeLimit) {
+        break
+      }
+
+      if (entryIndex % 64 === 63) {
+        await defaultYield()
+      }
+    }
+
+    if (matches.length) {
+      await options.onMatches?.({
+        matches: matches.slice(),
+        matchedCount,
+        postingCount: entries.length,
+      })
+    }
+
+    return report(
+      {
+        coverage: 'complete',
+        matches,
+        limited: matchedCount > safeLimit,
+      },
+      entries.length,
+    )
+  }
+
+  private async ensureSearchIndex(
+    profileId: string,
+    section: LibrarySection,
+    manifest: SectionManifestRecord,
+    _signal?: AbortSignal,
+  ): Promise<
+    | {
+        coverage: 'complete'
+        generation: number
+        prefixPostingCounts: Record<string, number>
+        prefixShardCounts: Record<string, number>
+      }
+    | {
+        coverage: 'none'
+        reason: SearchIndexUnavailableReason
+      }
+  > {
+    const current = await this.getSearchIndexMeta(profileId, section)
+
+    if (
+      current?.coverage === 'complete' &&
+      current.formatVersion === SEARCH_INDEX_FORMAT_VERSION &&
+      current.generation === manifest.updatedAt
+    ) {
+      return {
+        coverage: 'complete',
+        generation: current.generation,
+        prefixPostingCounts: current.prefixPostingCounts,
+        prefixShardCounts: current.prefixShardCounts,
+      }
+    }
+
+    /*
+     * A query must never initiate a whole-catalog scan. The coordinator builds
+     * indexes after accepted snapshot publication; startup runs the one-time
+     * migration for legacy snapshots. Until then the section is honestly
+     * unavailable instead of quietly falling back to the old full scan.
+     */
+    return { coverage: 'none', reason: 'index-unavailable' }
+  }
+
+  private async rebuildSearchIndex(
+    profileId: string,
+    section: LibrarySection,
+    signal?: AbortSignal,
+    knownManifest?: SectionManifestRecord,
+  ): Promise<SearchIndexBuildResult> {
+    const startedAt = monotonicNow()
+    const manifest = knownManifest ?? await this.getManifest(profileId, section)
+    const unavailable = (reason: SearchIndexUnavailableReason): SearchIndexBuildResult => {
+      const result = {
+        coverage: 'none' as const,
+        reason,
+        elapsedMs: monotonicNow() - startedAt,
+      }
+      performanceTrace.event('library', 'local-search-index-build', {
+        section,
+        coverage: result.coverage,
+        reason,
+        elapsedMs: result.elapsedMs,
+      })
+      return result
+    }
+
+    if (!manifest) {
+      return unavailable(
+        await this.isDatabaseAvailable() ? 'manifest-missing' : 'database-unavailable',
+      )
+    }
+
+    if (
+      manifest.coverage.state !== 'complete' ||
+      manifest.categories.some((category) => category.coverage !== 'complete')
+    ) {
+      return unavailable('section-incomplete')
+    }
+
+    const currentIndex = await this.getSearchIndexMeta(profileId, section)
+
+    if (
+      currentIndex?.coverage === 'complete' &&
+      currentIndex.formatVersion === SEARCH_INDEX_FORMAT_VERSION &&
+      currentIndex.generation === manifest.updatedAt
+    ) {
+      const result: SearchIndexBuildResult = {
+        coverage: 'complete',
+        generation: currentIndex.generation,
+        itemCount: currentIndex.itemCount,
+        postingCount: currentIndex.postingCount,
+        legacyUntitledCount: currentIndex.legacyUntitledCount,
+        prefixPostingCounts: currentIndex.prefixPostingCounts,
+        prefixShardCounts: currentIndex.prefixShardCounts,
+        elapsedMs: monotonicNow() - startedAt,
+      }
+      performanceTrace.event('library', 'local-search-index-build', {
+        section,
+        coverage: result.coverage,
+        itemCount: result.itemCount,
+        postingCount: result.postingCount,
+        legacyUntitledCount: result.legacyUntitledCount,
+        reused: true,
+        elapsedMs: result.elapsedMs,
+      })
+      return result
+    }
+
+    const database = await this.database()
+    const generation = manifest.updatedAt
+    const pendingByPrefix = new Map<string, SearchIndexPosting[]>()
+    const nextShardByPrefix = new Map<string, number>()
+    const prefixPostingCounts: Record<string, number> = {}
+    const prefixShardCounts: Record<string, number> = {}
+    let bufferedPostingCount = 0
+    let itemCount = 0
+    let postingCount = 0
+    let legacyUntitledCount = 0
+
+    await putRecord(database, 'searchIndexMeta', {
+      schemaVersion: LIBRARY_SCHEMA_VERSION,
+      profileId,
+      section,
+      formatVersion: SEARCH_INDEX_FORMAT_VERSION,
+      coverage: 'none',
+      updatedAt: this.now(),
+      itemCount: 0,
+      postingCount: 0,
+      legacyUntitledCount: 0,
+      prefixPostingCounts: {},
+      prefixShardCounts: {},
+    } satisfies SearchIndexMetaRecord)
+
+    /*
+     * Index keys include the manifest generation, so stale postings are
+     * unreachable once the replacement meta is published. Do not cursor-delete
+     * every historic shard before a migration: on webOS that local cleanup can
+     * take longer than rebuilding the index itself. The current generation
+     * overwrites matching keys; any unmatched stale records remain inert.
+     */
+    const takePrefixShard = (prefix: string): SearchIndexShardRecord | null => {
+      const pending = pendingByPrefix.get(prefix)
+
+      if (!pending?.length) {
+        return null
+      }
+
+      if (signal?.aborted) {
+        throw new LibraryWriteAbortedError('Local search-index build was cancelled.')
+      }
+
+      const shardIndex = nextShardByPrefix.get(prefix) ?? 0
+      const postings = pending.splice(0, SEARCH_INDEX_POSTINGS_PER_SHARD)
+      bufferedPostingCount -= postings.length
+      nextShardByPrefix.set(prefix, shardIndex + 1)
+      prefixShardCounts[prefix] = shardIndex + 1
+
+      return {
+        schemaVersion: LIBRARY_SCHEMA_VERSION,
+        profileId,
+        section,
+        generation,
+        prefix,
+        shardIndex,
+        payload: JSON.stringify(postings),
+        entryCount: postings.length,
+      }
+    }
+
+    const flushReadyPrefixes = async (force = false): Promise<void> => {
+      let candidates = [...pendingByPrefix.entries()]
+        .filter(
+          ([, postings]) =>
+            postings.length > 0 &&
+            (force || postings.length >= SEARCH_INDEX_POSTINGS_PER_SHARD),
+        )
+        .sort((left, right) => right[1].length - left[1].length)
+
+      while (candidates.length) {
+        for (let start = 0; start < candidates.length; start += SEARCH_INDEX_WRITE_RECORD_BATCH_SIZE) {
+          const batch = candidates
+            .slice(start, start + SEARCH_INDEX_WRITE_RECORD_BATCH_SIZE)
+            .map(([prefix]) => takePrefixShard(prefix))
+            .filter((shard): shard is SearchIndexShardRecord => shard !== null)
+          await putSearchIndexShardBatch(database, batch)
+          await defaultYield()
+        }
+
+        candidates = [...pendingByPrefix.entries()]
+          .filter(
+            ([, postings]) =>
+              postings.length > 0 &&
+              (force || postings.length >= SEARCH_INDEX_POSTINGS_PER_SHARD),
+          )
+          .sort((left, right) => right[1].length - left[1].length)
+      }
+    }
+
+    try {
+      for (const category of manifest.categories) {
+        for (let shardOffset = 0; shardOffset < category.shardCount; shardOffset += 1) {
+          if (signal?.aborted) {
+            return unavailable('index-unavailable')
+          }
+
+          const snapshotShardIndex = (category.shardBase ?? 0) + shardOffset
+          const record = await getRecord<unknown>(
+            database,
+            'snapshots',
+            [profileId, section, category.categoryKey, snapshotShardIndex],
+          )
+
+          if (
+            !isSnapshotRecord(
+              record,
+              profileId,
+              section,
+              category.categoryKey,
+              snapshotShardIndex,
+            ) ||
+            record.updatedAt !== category.updatedAt
+          ) {
+            return unavailable('snapshot-missing')
+          }
+
+          const items = parseSnapshotItems(record)
+          const missingNameCount = countLegacyMissingNames(record)
+
+          if (!items || missingNameCount === null) {
+            return unavailable('snapshot-invalid')
+          }
+
+          legacyUntitledCount += missingNameCount
+
+          for (let snapshotItemIndex = 0; snapshotItemIndex < items.length; snapshotItemIndex += 1) {
+            const item = items[snapshotItemIndex]
+            const foldedName = item.searchName ?? foldText(item.name)
+            const prefixes = searchIndexPrefixes(foldedName)
+
+            itemCount += 1
+            postingCount += prefixes.length
+
+            for (const prefix of prefixes) {
+              prefixPostingCounts[prefix] = (prefixPostingCounts[prefix] ?? 0) + 1
+            }
+
+            for (const prefix of prefixes) {
+              const pending = pendingByPrefix.get(prefix) ?? []
+              pending.push([
+                category.categoryKey,
+                snapshotShardIndex,
+                snapshotItemIndex,
+                record.updatedAt,
+                favoriteKey(item),
+                foldedName,
+              ])
+              pendingByPrefix.set(prefix, pending)
+              bufferedPostingCount += 1
+            }
+
+          }
+
+          /*
+           * Prefix flushing is deliberately batched at the snapshot boundary.
+           * Evaluating every prefix after each individual item turns a VOD
+           * migration into an accidental quadratic main-thread workload.
+           */
+          if (bufferedPostingCount >= MAX_SEARCH_INDEX_BUFFERED_POSTINGS) {
+            await flushReadyPrefixes(true)
+          } else {
+            await flushReadyPrefixes()
+          }
+        }
+      }
+
+      await flushReadyPrefixes(true)
+      const currentManifest = await this.getManifest(profileId, section)
+
+      if (
+        !currentManifest ||
+        currentManifest.updatedAt !== generation ||
+        currentManifest.coverage.state !== 'complete' ||
+        currentManifest.categories.some((category) => category.coverage !== 'complete')
+      ) {
+        return unavailable('index-invalid')
+      }
+
+      const completedAt = this.now()
+      await putRecord(database, 'searchIndexMeta', {
+        schemaVersion: LIBRARY_SCHEMA_VERSION,
+        profileId,
+        section,
+        formatVersion: SEARCH_INDEX_FORMAT_VERSION,
+        coverage: 'complete',
+        generation,
+        updatedAt: completedAt,
+        itemCount,
+        postingCount,
+        legacyUntitledCount,
+        prefixPostingCounts,
+        prefixShardCounts,
+      } satisfies SearchIndexMetaRecord)
+
+      const result: SearchIndexBuildResult = {
+        coverage: 'complete',
+        generation,
+        itemCount,
+        postingCount,
+        legacyUntitledCount,
+        prefixPostingCounts,
+        prefixShardCounts,
+        elapsedMs: monotonicNow() - startedAt,
+      }
+      performanceTrace.event('library', 'local-search-index-build', {
+        section,
+        coverage: result.coverage,
+        itemCount,
+        postingCount,
+        legacyUntitledCount,
+        elapsedMs: result.elapsedMs,
+      })
+      return result
+    } catch (reason) {
+      if (reason instanceof LibraryWriteAbortedError) {
+        return unavailable('index-unavailable')
+      }
+
+      return unavailable('database-unavailable')
+    }
+  }
+
+  private async resolveSearchIndexPosting(
+    profileId: string,
+    section: LibrarySection,
+    manifest: SectionManifestRecord,
+    posting: SearchIndexPosting,
+  ): Promise<StreamItem | null> {
+    const [categoryKey, snapshotShardIndex, snapshotItemIndex, snapshotUpdatedAt, streamKey] =
+      posting
+    const category = manifest.categories.find(
+      (candidate) => candidate.categoryKey === categoryKey,
+    )
+    const shardOffset = snapshotShardIndex - (category?.shardBase ?? 0)
+
+    if (
+      !category ||
+      shardOffset < 0 ||
+      shardOffset >= category.shardCount ||
+      category.updatedAt !== snapshotUpdatedAt
+    ) {
+      return null
+    }
+
+    const shard = await this.readCategoryShard(
+      profileId,
+      section,
+      category.categoryKey,
+      shardOffset,
+    )
+
+    if (shard.coverage === 'none') {
+      return null
+    }
+
+    const item = shard.items[snapshotItemIndex]
+
+    return item && favoriteKey(item) === streamKey ? item : null
+  }
+
+  async searchCompleteSectionLegacy(
     profileId: string,
     section: LibrarySection,
     query: string,
@@ -2004,6 +2673,185 @@ function createStore(
   if (!database.objectStoreNames.contains(name)) {
     database.createObjectStore(name, { keyPath })
   }
+}
+
+function searchIndexPrefixes(value: string): string[] {
+  const prefixes = new Set<string>()
+  const words = foldText(value).match(/[a-z0-9]{2,}/g) ?? []
+
+  for (const word of words) {
+    const prefix = searchIndexPrefixForToken(word)
+
+    if (prefix) {
+      prefixes.add(prefix)
+    }
+  }
+
+  return [...prefixes]
+}
+
+function searchIndexPrefixForToken(token: string): string | null {
+  const folded = foldText(token)
+  const match = folded.match(/[a-z0-9]{2,}/)
+
+  if (!match) {
+    return null
+  }
+
+  return match[0].slice(0, Math.min(3, match[0].length))
+}
+
+async function putSearchIndexShardBatch(
+  database: IDBDatabase,
+  shards: readonly SearchIndexShardRecord[],
+): Promise<void> {
+  if (!shards.length) {
+    return
+  }
+
+  const transaction = database.transaction('searchIndexShards', 'readwrite')
+  const complete = transactionComplete(transaction)
+  const store = transaction.objectStore('searchIndexShards')
+
+  for (const shard of shards) {
+    store.put(shard)
+  }
+
+  await complete
+}
+
+async function readSearchIndexPostings(
+  database: IDBDatabase,
+  profileId: string,
+  section: LibrarySection,
+  generation: number,
+  prefix: string,
+  shardCount: number,
+): Promise<SearchIndexPosting[]> {
+  const postings: SearchIndexPosting[] = []
+
+  for (let shardIndex = 0; shardIndex < shardCount; shardIndex += 1) {
+    const record = await getRecord<unknown>(
+      database,
+      'searchIndexShards',
+      [profileId, section, generation, prefix, shardIndex],
+    )
+
+    if (!isSearchIndexShardRecord(record, profileId, section, generation, prefix, shardIndex)) {
+      throw new Error('Local search index shard is unavailable.')
+    }
+
+    const parsed = parseSearchIndexPostings(record)
+
+    if (!parsed) {
+      throw new Error('Local search index shard is invalid.')
+    }
+
+    postings.push(...parsed)
+  }
+
+  return postings
+}
+
+function countLegacyMissingNames(record: SnapshotRecord): number | null {
+  try {
+    const parsed = JSON.parse(record.payload) as unknown
+
+    if (!Array.isArray(parsed) || parsed.length !== record.itemCount) {
+      return null
+    }
+
+    let count = 0
+
+    for (const value of parsed) {
+      if (!isRecord(value)) {
+        return null
+      }
+
+      if (typeof value.name !== 'string') {
+        count += 1
+      }
+    }
+
+    return count
+  } catch {
+    return null
+  }
+}
+
+function isSearchIndexMetaRecord(
+  value: unknown,
+  profileId: string,
+  section: LibrarySection,
+): value is SearchIndexMetaRecord {
+  if (!isRecord(value)) {
+    return false
+  }
+
+  return (
+    value.schemaVersion === LIBRARY_SCHEMA_VERSION &&
+    value.profileId === profileId &&
+    value.section === section &&
+    isNonNegativeInteger(value.formatVersion) &&
+    isCoverage(value.coverage) &&
+    (value.generation === undefined || isFiniteNumber(value.generation)) &&
+    isFiniteNumber(value.updatedAt) &&
+    isNonNegativeInteger(value.itemCount) &&
+    isNonNegativeInteger(value.postingCount) &&
+    isNonNegativeInteger(value.legacyUntitledCount) &&
+    isRecord(value.prefixPostingCounts) &&
+    Object.values(value.prefixPostingCounts).every(isNonNegativeInteger) &&
+    isRecord(value.prefixShardCounts) &&
+    Object.values(value.prefixShardCounts).every(isNonNegativeInteger)
+  )
+}
+
+function isSearchIndexShardRecord(
+  value: unknown,
+  profileId: string,
+  section: LibrarySection,
+  generation: number,
+  prefix: string,
+  shardIndex: number,
+): value is SearchIndexShardRecord {
+  return (
+    isRecord(value) &&
+    value.schemaVersion === LIBRARY_SCHEMA_VERSION &&
+    value.profileId === profileId &&
+    value.section === section &&
+    value.generation === generation &&
+    value.prefix === prefix &&
+    value.shardIndex === shardIndex &&
+    typeof value.payload === 'string' &&
+    isNonNegativeInteger(value.entryCount)
+  )
+}
+
+function parseSearchIndexPostings(record: SearchIndexShardRecord): SearchIndexPosting[] | null {
+  try {
+    const parsed = JSON.parse(record.payload) as unknown
+
+    if (!Array.isArray(parsed) || parsed.length !== record.entryCount) {
+      return null
+    }
+
+    return parsed.every(isSearchIndexPosting) ? parsed as SearchIndexPosting[] : null
+  } catch {
+    return null
+  }
+}
+
+function isSearchIndexPosting(value: unknown): value is SearchIndexPosting {
+  return (
+    Array.isArray(value) &&
+    value.length === 6 &&
+    typeof value[0] === 'string' &&
+    isNonNegativeInteger(value[1]) &&
+    isNonNegativeInteger(value[2]) &&
+    isFiniteNumber(value[3]) &&
+    typeof value[4] === 'string' &&
+    typeof value[5] === 'string'
+  )
 }
 
 function isLibraryStoreName(value: string): value is LibraryStoreName {
