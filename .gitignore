@@ -12,10 +12,15 @@ dist
 dist-ssr
 webos-app
 packages
+# Packaged webOS build artifacts must never land in the repo root.
+/*.ipk
 *.local
 .env
 .env.*
 !.env.example
+
+# Agent tooling: keep the shareable settings, ignore machine-local overrides.
+.claude/settings.local.json
 
 # Recorded provider payloads can contain private catalog data and credentials.
 fixtures/
