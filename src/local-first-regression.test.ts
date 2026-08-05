@@ -76,6 +76,17 @@ describe('local-first catalog regressions', () => {
     expect(mainSource).toMatch(/resolveSchedule as resolveScheduleData/)
   })
 
+  it('restores persisted EPG capability on cold start, not only on in-session profile switch', () => {
+    // A guide-serving host must read as available immediately after relaunch,
+    // without re-probing, so the durable cache path and UI messaging are correct
+    // from the first render. The bootstrap and activateProfile must both load it.
+    expect(mainSource).toMatch(/async function loadPersistedEpgCapability\(profileId: string\)/)
+    expect(mainSource).toMatch(
+      /if \(profile\) \{[\s\S]*?void loadPersistedEpgCapability\(profile\.id\)[\s\S]*?void initializeLibrarySync\(profile\.id\)/,
+    )
+    expect(mainSource).toMatch(/void loadPersistedEpgCapability\(nextProfile\.id\)/)
+  })
+
   it('does not prefetch EPG during catalog or guide rendering', () => {
     // The banned fan-out (prefetchNowNext) must never return in any form.
     expect(mainSource).not.toMatch(/prefetchNowNext/)

@@ -8821,6 +8821,7 @@ render()
 
 if (profile) {
   void loadPersistedAccountSummary(profile.id)
+  void loadPersistedEpgCapability(profile.id)
   scheduleLocalSearchIndexMigration(profile.id)
   void initializeLibrarySync(profile.id)
 }
