@@ -617,6 +617,165 @@ function externalLinks(person: JsonRecord, ids: JsonRecord): JsonRecord[] {
   return links
 }
 
+// ---------------------------------------------------------------------------
+// Public-source EPG fallback.
+//
+// This route exists for one situation: the user's provider host serves no guide
+// data, but its channels carry populated EPG identifiers. Public XMLTV sources
+// are reachable from the Worker's egress even when the provider hosts block it.
+//
+// The Worker fetches a per-region source file SERVER-SIDE, filters it down to
+// the identifiers the client asks about, caches the whole file at the edge for
+// a few hours, and returns compact JSON. A whole region file is never sent to
+// the TV. No credential, playlist URL, or stream URL is ever involved.
+// ---------------------------------------------------------------------------
+
+const EPG_SOURCE_BASE = 'https://epgshare01.online/epgshare01/epg_ripper_'
+const EPG_SOURCE_CACHE_SECONDS = 60 * 60 * 3
+const EPG_MAX_IDENTIFIERS = 40
+const EPG_MAX_PROGRAMMES_PER_CHANNEL = 32
+const EPG_SOURCE_TIMEOUT_MS = 12_000
+
+type PublicProgramme = { start: number; stop: number; title: string; description?: string }
+
+function regionFileName(region: string): string | null {
+  // Region tokens are short alphanumerics like "UK1", "NL1", "US2". Reject
+  // anything else so the path cannot be manipulated.
+  return /^[A-Za-z]{2,3}[0-9]{0,2}$/.test(region) ? region.toUpperCase() : null
+}
+
+function parseXmltvTimestamp(value: string | undefined): number | null {
+  if (!value) {
+    return null
+  }
+  // "20260805114500 +0000" (offset optional).
+  const match = value.match(/^(\d{14})(?:\s*([+-]\d{4}))?/)
+  if (!match) {
+    return null
+  }
+  const [, digits, offset] = match
+  const iso =
+    `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}T` +
+    `${digits.slice(8, 10)}:${digits.slice(10, 12)}:${digits.slice(12, 14)}` +
+    (offset ? `${offset.slice(0, 3)}:${offset.slice(3)}` : 'Z')
+  const ms = Date.parse(iso)
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null
+}
+
+function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+async function publicEpg(url: URL, env: Env): Promise<Response> {
+  void env
+  const region = regionFileName(url.searchParams.get('region') ?? '')
+  const wanted = (url.searchParams.get('ids') ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .slice(0, EPG_MAX_IDENTIFIERS)
+  const limit = Math.min(
+    EPG_MAX_PROGRAMMES_PER_CHANNEL,
+    Math.max(1, Number(url.searchParams.get('limit') ?? '8') || 8),
+  )
+
+  if (!region || !wanted.length) {
+    return json({ error: 'A region and at least one identifier are required.' }, 400)
+  }
+
+  const sourceUrl = `${EPG_SOURCE_BASE}${region}.xml.gz`
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), EPG_SOURCE_TIMEOUT_MS)
+
+  let xml: string
+  try {
+    // `cf.cacheTtl` caches the upstream file at the edge so repeated channel
+    // requests within the window reuse one download.
+    const response = await fetch(sourceUrl, {
+      signal: controller.signal,
+      cf: { cacheTtl: EPG_SOURCE_CACHE_SECONDS, cacheEverything: true },
+    } as RequestInit)
+    if (!response.ok) {
+      return json({ error: 'Public guide source is unavailable.' }, 502)
+    }
+    // The source is gzipped; the Workers runtime transparently decompresses a
+    // gzip Content-Encoding, and DecompressionStream covers explicit .gz bodies.
+    xml = await decodeGuideBody(response)
+  } catch {
+    return json({ error: 'Public guide source is unavailable.' }, 502)
+  } finally {
+    clearTimeout(timeout)
+  }
+
+  const wantedSet = new Set(wanted)
+  const wantedLower = new Set(wanted.map((value) => value.toLowerCase()))
+  const channels: Record<string, PublicProgramme[]> = {}
+
+  const programmeRegex = /<programme\b([^>]*)>([\s\S]*?)<\/programme>/g
+  let match: RegExpExecArray | null
+  while ((match = programmeRegex.exec(xml))) {
+    const attributes = match[1]
+    const channelMatch = attributes.match(/channel="([^"]+)"/)
+    if (!channelMatch) {
+      continue
+    }
+    const channelId = decodeXmlEntities(channelMatch[1])
+    if (!wantedSet.has(channelId) && !wantedLower.has(channelId.toLowerCase())) {
+      continue
+    }
+    const bucketKey = wantedSet.has(channelId)
+      ? channelId
+      : wanted.find((value) => value.toLowerCase() === channelId.toLowerCase()) ?? channelId
+    const bucket = (channels[bucketKey] ??= [])
+    if (bucket.length >= limit) {
+      continue
+    }
+    const start = parseXmltvTimestamp(attributes.match(/start="([^"]+)"/)?.[1])
+    const stop = parseXmltvTimestamp(attributes.match(/stop="([^"]+)"/)?.[1])
+    if (start === null || stop === null || stop <= start) {
+      continue
+    }
+    const body = match[2]
+    const title = decodeXmlEntities((body.match(/<title[^>]*>([\s\S]*?)<\/title>/)?.[1] ?? '').trim())
+    const description = decodeXmlEntities(
+      (body.match(/<desc[^>]*>([\s\S]*?)<\/desc>/)?.[1] ?? '').trim(),
+    )
+    bucket.push(description ? { start, stop, title, description } : { start, stop, title })
+  }
+
+  for (const key of Object.keys(channels)) {
+    channels[key].sort((left, right) => left.start - right.start)
+  }
+
+  return json({ source: 'public', region, channels })
+}
+
+async function decodeGuideBody(response: Response): Promise<string> {
+  const contentType = response.headers.get('content-type') ?? ''
+  const contentEncoding = response.headers.get('content-encoding') ?? ''
+
+  // If the runtime already decompressed (gzip transfer-encoding), text() is XML.
+  if (contentEncoding.includes('gzip') || contentType.includes('xml')) {
+    const text = await response.text()
+    if (text.trimStart().startsWith('<')) {
+      return text
+    }
+  }
+
+  // Otherwise treat the body as an explicit gzip stream.
+  if (response.body && typeof DecompressionStream === 'function') {
+    const stream = response.body.pipeThrough(new DecompressionStream('gzip'))
+    return await new Response(stream).text()
+  }
+
+  return await response.text()
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const cors = corsHeaders(request, env)
@@ -641,6 +800,10 @@ export default {
       const personMatch = url.pathname.match(/^\/v1\/person\/(\d{1,16})$/)
       if (request.method === 'GET' && personMatch) {
         return withCors(await personDetails(personMatch[1], env), cors)
+      }
+
+      if (request.method === 'GET' && url.pathname === '/v1/epg') {
+        return withCors(await publicEpg(url, env), cors)
       }
 
       return json({ error: 'Not found.' }, 404, cors)

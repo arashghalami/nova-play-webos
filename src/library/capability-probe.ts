@@ -153,14 +153,21 @@ export type LibraryCapabilityProbeApi = {
      * channel so now/next and the schedule render through the production path,
      * without a downloaded live catalog. Returns whether the panels rendered.
      */
-    epgDemo(input: { id: string; name?: string; showSchedule?: boolean }): Promise<{
+    epgDemo(input: {
+      id: string
+      name?: string
+      showSchedule?: boolean
+      epgChannelId?: string
+    }): Promise<{
       view: string
+      capability: string
       selectedIsLive: boolean
       nowNextRendered: boolean
       nowNextRowCount: number
       scheduleRendered: boolean
       scheduleRowCount: number
     }>
+    detectCapability(input: { id: string; epgChannelId: string }): Promise<{ capability: string }>
   }
 }
 

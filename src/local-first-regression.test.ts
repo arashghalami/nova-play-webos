@@ -65,15 +65,27 @@ describe('local-first catalog regressions', () => {
     expect(mainSource).toMatch(/catalogRepository\.getDetails<SeriesDetails>\(/)
     expect(mainSource).toMatch(/catalogRepository\.getDetails<VodDetails>\(/)
     expect(mainSource).toMatch(/catalogRepository\.putDetails\(/)
-    expect(mainSource).toMatch(/catalogRepository\.getEpg<NowNext>\(/)
-    expect(mainSource).toMatch(/catalogRepository\.getEpg<Program\[\]>\(/)
-    expect(mainSource).toMatch(/catalogRepository\.putEpg\(/)
+    // Programme reads now flow through the EPG service, which consults the
+    // durable cache (getEpg) before any provider request and persists with
+    // putEpg. The service is the single owner of that ordering.
+    const epgServiceSource = sources['./epg-service.ts']
+    expect(epgServiceSource).toMatch(/config\.cache\.getEpg<NowNext>\(/)
+    expect(epgServiceSource).toMatch(/config\.cache\.getEpg<Program\[\]>\(/)
+    expect(epgServiceSource).toMatch(/config\.cache\.putEpg\(/)
+    expect(mainSource).toMatch(/resolveNowNext as resolveNowNextData/)
+    expect(mainSource).toMatch(/resolveSchedule as resolveScheduleData/)
   })
 
   it('does not prefetch EPG during catalog or guide rendering', () => {
+    // The banned fan-out (prefetchNowNext) must never return in any form.
     expect(mainSource).not.toMatch(/prefetchNowNext/)
     expect(mainSource).toMatch(/new LruTtlCache<NowNext>\(\s*MAX_NOW_NEXT_ENTRIES,\s*NOW_NEXT_CACHE_TTL_MS,/)
-    expect(mainSource).toMatch(/await activeClient\.nowNext\(stream\.id, signal\)/)
+    // Guide list hydration is bounded to the visible page and skips unmapped
+    // channels before any request is formed.
+    expect(mainSource).toMatch(/streams\.slice\(0, GUIDE_VISIBLE_NOW_NEXT_LIMIT\)/)
+    expect(mainSource).toMatch(/visible\.filter\(\(stream\) => hasEpgIdentifier\(stream\)\)/)
+    // A blank identifier is an authoritative negative: no request is issued.
+    expect(mainSource).toMatch(/if \(!hasEpgIdentifier\(stream\)\) \{/)
   })
 
   it('starts incomplete background acquisition, reports truthful cooldown state, and gates production diagnostics', () => {

@@ -203,6 +203,56 @@ export function saveProfile(profile: XtreamProfile): boolean {
   return saveProfiles(nextProfiles) && writeJson(ACTIVE_PROFILE_KEY, profile)
 }
 
+/**
+ * Edits an existing profile's connection fields in place, preserving its `id`.
+ * The local catalog, favorites, resume history, and provider-access state are
+ * all keyed to the profile id, so an in-place edit keeps a fully populated
+ * library intact. This is the correct way to move an account to a new host:
+ * adding a new profile would orphan the library and force a full re-download.
+ *
+ * Returns the updated profile, or `null` when the id does not exist so callers
+ * cannot accidentally create a fresh, catalog-less profile through this path.
+ */
+export function updateProfileConnection(
+  profileId: string,
+  connection: Pick<XtreamProfile, 'serverUrl' | 'username' | 'password'> &
+    Partial<Pick<XtreamProfile, 'name'>>,
+): XtreamProfile | null {
+  const profiles = loadProfiles()
+  const existing = profiles.find((candidate) => candidate.id === profileId)
+
+  if (!existing) {
+    return null
+  }
+
+  const updated: XtreamProfile = {
+    ...existing,
+    // id is deliberately taken from the existing record and never from input,
+    // so the catalog binding cannot be broken by an edit.
+    id: existing.id,
+    name: connection.name?.trim() || existing.name,
+    serverUrl: connection.serverUrl.trim(),
+    username: connection.username.trim(),
+    password: connection.password,
+  }
+
+  const nextProfiles = profiles.map((candidate) =>
+    candidate.id === profileId ? updated : candidate,
+  )
+
+  if (!saveProfiles(nextProfiles)) {
+    return null
+  }
+
+  const active = readJson<XtreamProfile | null>(ACTIVE_PROFILE_KEY, null)
+
+  if (active?.id === profileId && !writeJson(ACTIVE_PROFILE_KEY, updated)) {
+    return null
+  }
+
+  return updated
+}
+
 export function selectProfile(profileId: string): XtreamProfile | null {
   const profile = loadProfiles().find((candidate) => candidate.id === profileId) ?? null
 

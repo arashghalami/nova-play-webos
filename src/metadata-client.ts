@@ -589,3 +589,111 @@ export async function loadPersonMetadata(
   cacheWrite(personCache, personId, person, PERSON_CACHE_TTL_MS)
   return person
 }
+
+// ---------------------------------------------------------------------------
+// Public-source EPG (Worker `/v1/epg`).
+//
+// Used only as a fallback when the provider host serves no guide but channels
+// carry an identifier. The identifier is the join key; its trailing country
+// code selects the region source file. Results are labelled as public.
+// ---------------------------------------------------------------------------
+
+export type PublicProgram = {
+  title: string
+  description?: string
+  start: Date
+  end: Date
+}
+
+export type PublicNowNext = { now?: PublicProgram; next?: PublicProgram }
+
+/**
+ * Region token for a guide identifier, e.g. "NPO.1.nl" -> "NL1". Public sources
+ * shard by country; the numeric "1" is the primary shard. Returns null when the
+ * identifier has no recognizable trailing country code.
+ */
+export function regionForIdentifier(identifier: string): string | null {
+  const match = identifier.trim().match(/\.([A-Za-z]{2,3})$/)
+  if (!match) {
+    return null
+  }
+  return `${match[1].toUpperCase()}1`
+}
+
+function readPublicProgram(value: unknown): PublicProgram | null {
+  const source = readRecord(value)
+  const start = Number(source.start)
+  const stop = Number(source.stop)
+  if (!Number.isFinite(start) || !Number.isFinite(stop) || stop <= start) {
+    return null
+  }
+  return {
+    title: readString(source.title) ?? '',
+    description: readString(source.description),
+    start: new Date(start * 1000),
+    end: new Date(stop * 1000),
+  }
+}
+
+async function requestPublicEpg(
+  region: string,
+  identifiers: string[],
+  limit: number,
+  signal?: AbortSignal,
+): Promise<Map<string, PublicProgram[]>> {
+  const query =
+    `/v1/epg?region=${encodeURIComponent(region)}` +
+    `&ids=${encodeURIComponent(identifiers.join(','))}` +
+    `&limit=${encodeURIComponent(String(limit))}`
+  const payload = readRecord(await requestJson(query, { method: 'GET' }, signal))
+  const channels = readRecord(payload.channels)
+  const result = new Map<string, PublicProgram[]>()
+
+  for (const [id, listings] of Object.entries(channels)) {
+    const programs = readArray(listings)
+      .map(readPublicProgram)
+      .filter((program): program is PublicProgram => program !== null)
+    result.set(id, programs)
+  }
+
+  return result
+}
+
+/** Full public schedule for one identifier, or null when the route can't serve it. */
+export async function loadPublicSchedule(
+  identifier: string,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<PublicProgram[] | null> {
+  if (!metadataServiceConfigured()) {
+    return null
+  }
+  const region = regionForIdentifier(identifier)
+  if (!region) {
+    return null
+  }
+  try {
+    const channels = await requestPublicEpg(region, [identifier], limit, signal)
+    return channels.get(identifier) ?? null
+  } catch {
+    return null
+  }
+}
+
+/** Public now/next for one identifier, derived from the schedule around now. */
+export async function loadPublicNowNext(
+  identifier: string,
+  signal?: AbortSignal,
+): Promise<PublicNowNext | null> {
+  const programs = await loadPublicSchedule(identifier, 8, signal)
+  if (!programs || !programs.length) {
+    return null
+  }
+  const now = Date.now()
+  const sorted = [...programs].sort((left, right) => left.start.getTime() - right.start.getTime())
+  const current = sorted.find(
+    (program) => program.start.getTime() <= now && program.end.getTime() > now,
+  )
+  const next = sorted.find((program) => program.start.getTime() > now)
+  return { now: current, next }
+}

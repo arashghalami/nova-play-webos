@@ -21,6 +21,7 @@ import {
   selectProfile,
   STORAGE_FAILURE_MESSAGE,
   toggleFavorite as toggleStoredFavorite,
+  updateProfileConnection,
 } from './storage'
 import type {
   AccountSummary,
@@ -123,8 +124,20 @@ import {
   clearLibraryMemoryCaches,
   IndexedDbCatalogRepository,
   setLibraryPlaybackStarting,
+  type EpgCapabilityState,
   type SearchIndexBuildResult,
 } from './library/catalog-repository'
+import {
+  capabilityIsFresh,
+  hasEpgIdentifier,
+  normalizedEpgIdentifier,
+  resolveNowNext as resolveNowNextData,
+  resolveSchedule as resolveScheduleData,
+  type EpgProvider,
+  type EpgPublicSource,
+  type EpgServiceConfig,
+} from './epg-service'
+import { loadPublicNowNext, loadPublicSchedule } from './metadata-client'
 import {
   CATALOG_SYNC_SECTIONS,
   CATALOG_SYNC_STALE_RUN_MS,
@@ -249,6 +262,11 @@ const MIN_GLOBAL_SEARCH_LENGTH = 2
 const MAX_NOW_NEXT_ENTRIES = 600
 const NOW_NEXT_CACHE_TTL_MS = 5 * 60_000
 const EPG_CACHE_TTL_MS = 15 * 60_000
+// Bounds how many visible guide rows may trigger a now/next request per page.
+// This is a hard ceiling on the interactive lane, never a prefetch: only rows
+// actually rendered on the current page are eligible, and unmapped channels are
+// excluded before the request is ever formed.
+const GUIDE_VISIBLE_NOW_NEXT_LIMIT = WEBOS_CATALOG_PAGE_SIZE
 const DETAIL_CACHE_TTL_MS = 12 * 60 * 60_000
 const PLAYBACK_ATTEMPT_TIMEOUT_MS = 12_000
 // Older webOS Chromium eagerly decodes every image in a 60-card DOM grid even
@@ -546,6 +564,11 @@ const nowNextCache = new LruTtlCache<NowNext>(
   NOW_NEXT_CACHE_TTL_MS,
 )
 const nowNextLoading = new Map<string, AbortController>()
+// Per-profile EPG capability of the currently active host. Detected once on
+// activation and persisted in the library meta record. 'unknown' until probed.
+let epgCapability: EpgCapabilityState = 'unknown'
+// Guards against issuing more than one capability probe at a time per profile.
+let epgCapabilityProbeInFlight = false
 if (profile && repairResumeEpisodeContexts()) {
   saveResume(profile.id, resumeEntries)
 }
@@ -2667,8 +2690,8 @@ function renderGuide(): void {
                       'channel-logo',
                     )}</span>
                     <span class="guide-channel">${escape(stream.name)}</span>
-                    <span class="guide-program"><strong>Now</strong><span data-guide-now-key="${escape(streamLookupKey(stream))}">${escape(nowNext?.now?.title ?? 'Loading schedule…')}</span></span>
-                    <span class="guide-program"><strong>Next</strong><span data-guide-next-key="${escape(streamLookupKey(stream))}">${escape(nowNext?.next?.title ?? 'Schedule unavailable')}</span></span>
+                    <span class="guide-program"><strong>Now</strong><span data-guide-now-key="${escape(streamLookupKey(stream))}">${escape(nowNext?.now?.title ?? guideRowPlaceholder(stream))}</span></span>
+                    <span class="guide-program"><strong>Next</strong><span data-guide-next-key="${escape(streamLookupKey(stream))}">${escape(nowNext?.next?.title ?? '')}</span></span>
                   </button>`
               })
               .join('')
@@ -2685,6 +2708,131 @@ function renderGuide(): void {
         : ''
     }
   `)
+
+  // Bounded, cache-first now/next for the rows actually on this page. This is the
+  // only place guide data is fetched for the list, and it never fans out beyond
+  // the visible page or requests anything for an unmapped channel.
+  void hydrateVisibleGuideRows(guide.streams)
+}
+
+/**
+ * Placeholder shown in a guide row before (or instead of) a now/next load.
+ * Unmapped channels get a definitive label rather than a spinner, because no
+ * request will ever be made for them.
+ */
+function guideRowPlaceholder(stream: StreamItem): string {
+  if (!hasEpgIdentifier(stream)) {
+    return 'No guide for this channel'
+  }
+  if (epgCapability === 'unavailable') {
+    return 'No guide on this server'
+  }
+  return 'Loading schedule…'
+}
+
+/**
+ * Fills now/next for the visible guide rows, at most one provider request per
+ * mapped visible row, zero for unmapped rows, serially through the interactive
+ * lane. Uses the durable/in-memory cache first. Detection of host capability is
+ * folded in: the first mapped row doubles as the capability probe.
+ */
+async function hydrateVisibleGuideRows(streams: StreamItem[]): Promise<void> {
+  const activeProfile = profile
+  if (!activeProfile || view !== 'guide') {
+    return
+  }
+
+  const token = navigationToken
+  const visible = streams.slice(0, GUIDE_VISIBLE_NOW_NEXT_LIMIT)
+  const mapped = visible.filter((stream) => hasEpgIdentifier(stream))
+
+  // Mark unmapped rows definitively; they will never be requested.
+  for (const stream of visible) {
+    if (!hasEpgIdentifier(stream)) {
+      writeGuideRow(stream, null, 'unmapped')
+    }
+  }
+
+  if (!mapped.length) {
+    return
+  }
+
+  // Fold capability detection into the first mapped row when still unknown.
+  if (epgCapability === 'unknown') {
+    await detectEpgCapability(activeProfile.id, mapped[0])
+    if (!isCurrentNavigation(token) || view !== 'guide' || profile?.id !== activeProfile.id) {
+      return
+    }
+  }
+
+  if (epgCapability === 'unavailable' && !metadataServiceConfigured()) {
+    // No provider guide and no public fallback: label the rows, issue nothing.
+    for (const stream of mapped) {
+      writeGuideRow(stream, null, 'unavailable')
+    }
+    return
+  }
+
+  for (const stream of mapped) {
+    if (!isCurrentNavigation(token) || view !== 'guide' || profile?.id !== activeProfile.id) {
+      return
+    }
+
+    const cacheKey = streamLookupKey(stream)
+    const cached = nowNextCache.get(cacheKey)
+    if (cached) {
+      writeGuideRow(stream, cached, 'ok')
+      continue
+    }
+
+    try {
+      const result = await resolveNowNextData(
+        epgServiceConfig(),
+        activeProfile.id,
+        stream,
+        epgCapability,
+        epgProviderAdapter(),
+      )
+      if (!isCurrentNavigation(token) || view !== 'guide') {
+        return
+      }
+      if (result) {
+        cacheNowNext(cacheKey, result.nowNext)
+        writeGuideRow(stream, result.nowNext, 'ok')
+      } else {
+        writeGuideRow(stream, null, 'unavailable')
+      }
+    } catch {
+      return
+    }
+  }
+}
+
+/** Updates a single guide row's now/next spans in place, without re-rendering. */
+function writeGuideRow(
+  stream: StreamItem,
+  nowNext: NowNext | null,
+  status: 'ok' | 'unmapped' | 'unavailable',
+): void {
+  const key = streamLookupKey(stream)
+  const nowEl = document.querySelector<HTMLElement>(`[data-guide-now-key="${cssEscape(key)}"]`)
+  const nextEl = document.querySelector<HTMLElement>(`[data-guide-next-key="${cssEscape(key)}"]`)
+  if (!nowEl && !nextEl) {
+    return
+  }
+  if (status === 'ok' && nowNext) {
+    if (nowEl) nowEl.textContent = nowNext.now?.title ?? 'Nothing scheduled'
+    if (nextEl) nextEl.textContent = nowNext.next?.title ?? ''
+    return
+  }
+  const label =
+    status === 'unmapped'
+      ? 'No guide for this channel'
+      : epgCapability === 'unavailable'
+        ? 'No guide on this server'
+        : 'Guide unavailable'
+  if (nowEl) nowEl.textContent = label
+  if (nextEl) nextEl.textContent = ''
 }
 
 function globalSearchResultsForSection(section: LibrarySection): StreamItem[] {
@@ -3283,7 +3431,7 @@ function renderSettings(): void {
       <section class="settings-panel">
         <p class="panel-kicker">Library</p>
         <h2>Playlists</h2>
-        <p class="hint">Favorites and watch history stay separate for every playlist.</p>
+        <p class="hint">Favorites and watch history stay separate for every playlist. Use “Change server” to move a playlist to a new host address without re-downloading its library.</p>
         <div class="profile-list">
           ${profiles
             .map(
@@ -3293,6 +3441,7 @@ function renderSettings(): void {
                   <div>
                     <span class="profile-state">${savedProfile.id === profile?.id ? 'Active' : 'Saved'}</span>
                     <button class="secondary-button" data-action="switch-profile" data-profile-id="${escape(savedProfile.id)}" data-focus-id="settings-profile-${escape(savedProfile.id)}">${savedProfile.id === profile?.id ? 'Selected' : 'Use'}</button>
+                    <button class="secondary-button" data-action="edit-host" data-profile-id="${escape(savedProfile.id)}" data-focus-id="settings-edit-${escape(savedProfile.id)}">Change server</button>
                     <button class="secondary-button danger-button" data-action="remove-profile" data-profile-id="${escape(savedProfile.id)}" data-focus-id="settings-remove-${escape(savedProfile.id)}">Remove</button>
                   </div>
                 </div>`,
@@ -5261,6 +5410,14 @@ async function handleAction(element: HTMLElement): Promise<void> {
     return
   }
 
+  if (action === 'edit-host') {
+    const profileId = element.dataset.profileId
+    if (profileId) {
+      openHostEditor(profileId)
+    }
+    return
+  }
+
   if (action === 'remove-profile') {
     const profileId = element.dataset.profileId
 
@@ -5271,6 +5428,145 @@ async function handleAction(element: HTMLElement): Promise<void> {
     removeProfile(profileId)
     renderSettings()
   }
+}
+
+/**
+ * Renders the in-place host editor for one saved playlist. Saving preserves the
+ * profile id, so the fully downloaded local catalog, favorites, and history stay
+ * intact — this is the safe way to move an account to a new host after the old
+ * one dies or stops serving. The password field starts empty and is only
+ * changed when the user types a new value.
+ */
+function openHostEditor(profileId: string): void {
+  const target = loadProfiles().find((candidate) => candidate.id === profileId)
+  if (!target) {
+    showToast(STORAGE_FAILURE_MESSAGE)
+    return
+  }
+
+  const existing = document.querySelector('#host-editor')
+  existing?.remove()
+
+  const overlay = document.createElement('div')
+  overlay.id = 'host-editor'
+  overlay.className = 'modal-overlay'
+  overlay.innerHTML = `
+    <form id="host-editor-form" class="modal-card login-form" aria-label="Change server">
+      <h2>Change server</h2>
+      <p class="hint">Your downloaded library, favorites, and history are kept. Only the connection changes.</p>
+      <label>Playlist name<input name="name" maxlength="60" value="${escape(target.name)}" readonly aria-label="Playlist name. Press OK to type." /></label>
+      <label>Server URL<input name="serverUrl" inputmode="url" value="${escape(target.serverUrl)}" readonly required aria-label="Server URL. Press OK to type." /></label>
+      <div class="form-grid">
+        <label>Username<input name="username" value="${escape(target.username)}" readonly required aria-label="Username. Press OK to type." /></label>
+        <label>Password<input name="password" type="password" placeholder="Unchanged" readonly aria-label="Password. Press OK to type to change." /></label>
+      </div>
+      <p id="host-editor-error" class="form-error" role="alert"></p>
+      <div class="modal-actions">
+        <button type="button" class="secondary-button" data-action="close-host-editor" data-focus-id="host-editor-cancel">Cancel</button>
+        <button type="submit" class="primary-button" data-focus-id="host-editor-save">Verify &amp; save</button>
+      </div>
+    </form>
+  `
+  document.body.appendChild(overlay)
+
+  const form = overlay.querySelector<HTMLFormElement>('#host-editor-form')
+  const error = overlay.querySelector<HTMLElement>('#host-editor-error')
+
+  overlay.addEventListener('click', (event) => {
+    const actionEl = (event.target as HTMLElement)?.closest<HTMLElement>('[data-action="close-host-editor"]')
+    if (actionEl || event.target === overlay) {
+      overlay.remove()
+      renderSettings()
+    }
+  })
+
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault()
+    const data = new FormData(form)
+    const serverUrl = String(data.get('serverUrl') ?? '').trim()
+    const username = String(data.get('username') ?? '').trim()
+    const typedPassword = String(data.get('password') ?? '')
+    const password = typedPassword.length ? typedPassword : target.password
+    const button = form.querySelector<HTMLButtonElement>('button[type="submit"]')
+
+    if (!serverUrl || !username) {
+      if (error) error.textContent = 'Server URL and username are required.'
+      return
+    }
+
+    if (button) {
+      button.disabled = true
+      button.textContent = 'Verifying…'
+    }
+    if (error) error.textContent = ''
+
+    // Validate the new connection BEFORE persisting, using a throwaway broker so
+    // a bad edit cannot replace a working host with an unreachable one silently.
+    const candidate: XtreamProfile = { ...target, serverUrl, username, password }
+    try {
+      const probeClient = new ProviderBroker(candidate)
+      await probeClient.validate()
+    } catch (reason) {
+      if (error) {
+        error.textContent = describeHostEditFailure(reason)
+      }
+      if (button) {
+        button.disabled = false
+        button.textContent = 'Verify & save'
+      }
+      return
+    }
+
+    const updated = updateProfileConnection(profileId, { serverUrl, username, password })
+    if (!updated) {
+      if (error) error.textContent = STORAGE_FAILURE_MESSAGE
+      if (button) {
+        button.disabled = false
+        button.textContent = 'Verify & save'
+      }
+      return
+    }
+
+    overlay.remove()
+
+    // If the edited profile is active, re-bind the client to the new host and
+    // re-probe EPG capability, but leave the local catalog untouched.
+    if (profile?.id === profileId) {
+      profile = updated
+      client = new ProviderBroker(updated)
+      epgCapability = 'unknown'
+      await catalogRepository.putMeta(profileId, {
+        epgCapability: { state: 'unknown', checkedAt: Date.now() },
+      })
+    }
+
+    showToast('Server updated. Your downloaded library was kept.')
+    renderSettings()
+  })
+
+  overlay.querySelector<HTMLElement>('[data-focus-id="host-editor-save"]')?.focus()
+}
+
+/**
+ * Distinguishes an unreachable/retired host from a provider refusal so a dead
+ * host reads as a fixable configuration problem, not a broken app.
+ */
+function describeHostEditFailure(reason: unknown): string {
+  const kind =
+    typeof reason === 'object' && reason !== null && 'kind' in reason
+      ? (reason as { kind?: unknown }).kind
+      : undefined
+
+  if (kind === 'auth') {
+    return 'That server rejected the username or password.'
+  }
+  if (kind === 'rate-limited' || kind === 'forbidden') {
+    return 'That server refused the request (rate limit or block), rather than being unreachable.'
+  }
+  if (kind === 'network' || kind === 'timeout' || kind === undefined) {
+    return 'That server did not respond. Check the address, or the host may be retired.'
+  }
+  return 'Could not verify that server. Check the details and try again.'
 }
 
 async function openSection(section: LibrarySection): Promise<void> {
@@ -5992,8 +6288,144 @@ async function runGlobalSearch(): Promise<void> {
   })
 }
 
-async function loadLiveDetails(stream: StreamItem): Promise<void> {
+/**
+ * Loads the persisted per-profile EPG capability into module state. Called on
+ * profile activation so the guide and details views know, before any request,
+ * whether this host serves guide data.
+ */
+async function loadPersistedEpgCapability(profileId: string): Promise<void> {
+  try {
+    const meta = await catalogRepository.getMeta(profileId)
+    if (profile?.id !== profileId) {
+      return
+    }
+    epgCapability = meta?.epgCapability?.state ?? 'unknown'
+  } catch {
+    epgCapability = 'unknown'
+  }
+}
+
+/**
+ * Detects whether the active host serves guide data and persists the result per
+ * profile. Detection is a SINGLE request against one channel that carries a
+ * populated identifier — never a fan-out. `sampleStream` should be a channel
+ * already known to the caller (e.g. the first mapped guide row); when none is
+ * supplied or none is mapped, capability stays 'unknown' and is retried later.
+ *
+ * A populated schedule => available. A clean empty answer from a reachable host
+ * => unavailable. A network failure leaves capability 'unknown' so a transient
+ * error is never mistaken for a host that lacks guide data.
+ */
+async function detectEpgCapability(
+  profileId: string,
+  sampleStream: StreamItem | undefined,
+  options: { force?: boolean } = {},
+): Promise<EpgCapabilityState> {
   const activeClient = client
+  if (!activeClient || profile?.id !== profileId) {
+    return epgCapability
+  }
+
+  if (epgCapabilityProbeInFlight) {
+    return epgCapability
+  }
+
+  if (!options.force) {
+    const meta = await catalogRepository.getMeta(profileId)
+    if (profile?.id !== profileId) {
+      return epgCapability
+    }
+    if (capabilityIsFresh(meta?.epgCapability, Date.now())) {
+      epgCapability = meta!.epgCapability!.state
+      return epgCapability
+    }
+  }
+
+  const identifier = sampleStream ? normalizedEpgIdentifier(sampleStream) : null
+  if (!sampleStream || !identifier) {
+    // Cannot probe without a mapped channel; leave undetermined for a later try.
+    return epgCapability
+  }
+
+  epgCapabilityProbeInFlight = true
+  try {
+    const nowNext = await activeClient.nowNext(sampleStream.id)
+    const detected: EpgCapabilityState = nowNext.now || nowNext.next ? 'available' : 'unavailable'
+    if (profile?.id === profileId) {
+      epgCapability = detected
+      await catalogRepository.putMeta(profileId, {
+        epgCapability: { state: detected, checkedAt: Date.now() },
+      })
+      // A positive probe already fetched this channel's now/next; keep it.
+      if (detected === 'available' && (nowNext.now || nowNext.next)) {
+        cacheNowNext(streamLookupKey(sampleStream), nowNext)
+        void catalogRepository.putEpg(
+          profileId,
+          sampleStream.id,
+          'now-next',
+          nowNext,
+          NOW_NEXT_CACHE_TTL_MS,
+        )
+      }
+    }
+    return detected
+  } catch (error) {
+    // Distinguish a host that DEFINITIVELY lacks the guide endpoint (a 404/403
+    // for a mapped channel — the measured signature of a non-serving host) from
+    // a transient network/timeout error. Only the former is a durable negative;
+    // a transient error stays 'unknown' so it is retried and never mistaken for
+    // a host without guide data.
+    const kind =
+      typeof error === 'object' && error !== null && 'kind' in error
+        ? (error as { kind?: unknown }).kind
+        : undefined
+    if ((kind === 'not-found' || kind === 'forbidden') && profile?.id === profileId) {
+      epgCapability = 'unavailable'
+      await catalogRepository.putMeta(profileId, {
+        epgCapability: { state: 'unavailable', checkedAt: Date.now() },
+      })
+      return 'unavailable'
+    }
+    return epgCapability
+  } finally {
+    epgCapabilityProbeInFlight = false
+  }
+}
+
+/**
+ * Public-source adapter for the EPG service. Present only when the metadata
+ * Worker is configured; it is keyed on the guide identifier, never a channel id.
+ */
+const epgPublicSource: EpgPublicSource = {
+  async nowNext(identifier, signal) {
+    return loadPublicNowNext(identifier, signal)
+  },
+  async schedule(identifier, limit, signal) {
+    return loadPublicSchedule(identifier, limit, signal)
+  },
+}
+
+function epgServiceConfig(): EpgServiceConfig {
+  return {
+    cache: catalogRepository,
+    nowNextTtlMs: NOW_NEXT_CACHE_TTL_MS,
+    scheduleTtlMs: EPG_CACHE_TTL_MS,
+    publicSource: metadataServiceConfigured() ? epgPublicSource : undefined,
+  }
+}
+
+function epgProviderAdapter(): EpgProvider | null {
+  const activeClient = client
+  if (!activeClient) {
+    return null
+  }
+  return {
+    nowNext: (streamId, signal) => activeClient.nowNext(streamId, signal),
+    epg: (streamId, limit, signal) => activeClient.epg(streamId, limit, signal),
+  }
+}
+
+async function loadLiveDetails(stream: StreamItem): Promise<void> {
   const activeProfile = profile
   const token = navigationToken
   const signal = navigationController?.signal
@@ -6016,35 +6448,32 @@ async function loadLiveDetails(stream: StreamItem): Promise<void> {
     return
   }
 
-  const durable = await catalogRepository.getEpg<NowNext>(
-    activeProfile.id,
-    stream.id,
-    'now-next',
-  )
-
-  if (durable && isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
-    cacheNowNext(cacheKey, durable)
-    panel.innerHTML = renderNowNext(durable)
-    return
-  }
-
-  if (!activeClient) {
+  // Authoritative negative: a channel with no guide identifier has no schedule
+  // anywhere, so no provider request is issued and the UI says so plainly.
+  if (!hasEpgIdentifier(stream)) {
+    panel.innerHTML = renderNowNextUnavailable(stream)
     return
   }
 
   try {
-    const nowNext = await activeClient.nowNext(stream.id, signal)
+    const result = await resolveNowNextData(
+      epgServiceConfig(),
+      activeProfile.id,
+      stream,
+      epgCapability,
+      epgProviderAdapter(),
+      signal,
+    )
 
-    if (isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
-      cacheNowNext(cacheKey, nowNext)
-      void catalogRepository.putEpg(
-        activeProfile.id,
-        stream.id,
-        'now-next',
-        nowNext,
-        NOW_NEXT_CACHE_TTL_MS,
-      )
-      panel.innerHTML = renderNowNext(nowNext)
+    if (!isCurrentNavigation(token) || selectedItem !== stream || !panel.isConnected) {
+      return
+    }
+
+    if (result) {
+      cacheNowNext(cacheKey, result.nowNext)
+      panel.innerHTML = renderNowNext(result.nowNext, result.source)
+    } else {
+      panel.innerHTML = renderNowNextUnavailable(stream)
     }
   } catch {
     if (isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
@@ -6053,16 +6482,37 @@ async function loadLiveDetails(stream: StreamItem): Promise<void> {
   }
 }
 
-function renderNowNext(nowNext: NowNext): string {
+/**
+ * The now/next placeholder when no schedule is available. When the host itself
+ * serves no guide, the message names that so an empty schedule is never shown as
+ * though the channel simply has nothing on.
+ */
+function renderNowNextUnavailable(stream: StreamItem): string {
+  const reason =
+    epgCapability === 'unavailable'
+      ? 'This account’s current server provides no guide data.'
+      : hasEpgIdentifier(stream)
+        ? 'No guide is available for this channel right now.'
+        : 'This channel has no guide mapping from your provider.'
+  return `<section class="now-next"><h2>Now &amp; Next</h2><p class="hint">${escape(reason)}</p></section>`
+}
+
+function renderNowNext(nowNext: NowNext, source?: 'provider' | 'public' | 'cache'): string {
   if (!nowNext.now && !nowNext.next) {
     return ''
   }
+
+  const attribution =
+    source === 'public'
+      ? '<p class="hint epg-source">Guide from a public source</p>'
+      : ''
 
   return `
     <section class="now-next">
       <h2>Now & Next</h2>
       ${nowNext.now ? `<div><strong>Now · ${formatTime(nowNext.now.start)}</strong><span>${escape(nowNext.now.title)}</span></div>` : ''}
       ${nowNext.next ? `<div><strong>Next · ${formatTime(nowNext.next.start)}</strong><span>${escape(nowNext.next.title)}</span></div>` : ''}
+      ${attribution}
     </section>
   `
 }
@@ -6073,7 +6523,6 @@ async function showEpg(
   token = navigationToken,
   signal = navigationController?.signal,
 ): Promise<void> {
-  const activeClient = client
   const activeProfile = profile
   const panel = document.querySelector<HTMLElement>('#epg-panel')
 
@@ -6081,60 +6530,82 @@ async function showEpg(
     return
   }
 
+  // No identifier => no schedule anywhere; never issue a request.
+  if (!hasEpgIdentifier(stream)) {
+    panel.innerHTML = renderEpgUnavailable(stream, showCatchupActions)
+    return
+  }
+
   panel.innerHTML = '<div class="epg"><h2>Schedule</h2><p>Loading schedule…</p></div>'
-  const kind = showCatchupActions ? 'catchup' : 'schedule'
-  const durable = await catalogRepository.getEpg<Program[]>(
-    activeProfile.id,
-    stream.id,
-    kind,
-  )
-
-  if (durable && isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
-    panel.innerHTML = renderEpg(stream, durable, showCatchupActions)
-    bindEvents()
-    return
-  }
-
-  if (!activeClient) {
-    panel.innerHTML = '<div class="epg"><h2>Schedule</h2><p>Schedule information is unavailable for this channel.</p></div>'
-    return
-  }
+  const kind: 'schedule' | 'catchup' = showCatchupActions ? 'catchup' : 'schedule'
 
   try {
-    const programs = await activeClient.epg(stream.id, showCatchupActions ? 24 : 8, signal)
+    const result = await resolveScheduleData(
+      epgServiceConfig(),
+      activeProfile.id,
+      stream,
+      epgCapability,
+      epgProviderAdapter(),
+      { limit: showCatchupActions ? 24 : 8, kind },
+      signal,
+    )
 
-    if (isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
-      void catalogRepository.putEpg(
-        activeProfile.id,
-        stream.id,
-        kind,
-        programs,
-        EPG_CACHE_TTL_MS,
-      )
-      panel.innerHTML = renderEpg(stream, programs, showCatchupActions)
+    if (!isCurrentNavigation(token) || selectedItem !== stream || !panel.isConnected) {
+      return
+    }
+
+    if (result && result.programs.length) {
+      panel.innerHTML = renderEpg(stream, result.programs, showCatchupActions, result.source)
       bindEvents()
+    } else {
+      panel.innerHTML = renderEpgUnavailable(stream, showCatchupActions)
     }
   } catch (reason) {
-    console.warn('EPG schedule load failed', stream.id, reason)
+    console.warn('EPG schedule load failed', reason)
     if (isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
-      panel.innerHTML = '<div class="epg"><h2>Schedule</h2><p>Schedule information is unavailable for this channel.</p></div>'
+      panel.innerHTML = renderEpgUnavailable(stream, showCatchupActions)
     }
   }
 }
 
-function renderEpg(stream: StreamItem, programs: Program[], showCatchupActions: boolean): string {
+function renderEpgUnavailable(stream: StreamItem, showCatchupActions: boolean): string {
+  const heading = showCatchupActions ? 'Catch-up programmes' : 'Schedule'
+  const reason =
+    epgCapability === 'unavailable'
+      ? 'This account’s current server provides no guide data. You can add a server that does in Settings.'
+      : hasEpgIdentifier(stream)
+        ? 'Schedule information is unavailable for this channel right now.'
+        : 'Your provider supplies no guide mapping for this channel.'
+  return `<div class="epg"><h2>${heading}</h2><p>${escape(reason)}</p></div>`
+}
+
+function renderEpg(
+  stream: StreamItem,
+  programs: Program[],
+  showCatchupActions: boolean,
+  source?: 'provider' | 'public' | 'cache',
+): string {
   if (!programs.length) {
-    return '<div class="epg"><h2>Schedule</h2><p>Schedule information is unavailable for this channel.</p></div>'
+    return renderEpgUnavailable(stream, showCatchupActions)
   }
+
+  // Catch-up is offered only where the channel actually advertises archive
+  // support. A public-source schedule carries no archive rights, so catch-up is
+  // never offered against public data even when the row is in the past.
+  const archiveAdvertised = stream.catchup?.available === true
+  const attribution =
+    source === 'public' ? '<p class="hint epg-source">Guide from a public source</p>' : ''
 
   return `
     <div class="epg"><h2>${showCatchupActions ? 'Catch-up programmes' : 'Schedule'}</h2>
+      ${attribution}
       ${programs
         .slice(0, showCatchupActions ? 24 : 8)
         .map((program) => {
           const canPlayCatchup =
             showCatchupActions &&
-            stream.catchup?.available &&
+            archiveAdvertised &&
+            source !== 'public' &&
             program.start.getTime() < Date.now()
           const durationMinutes = Math.max(1, (program.end.getTime() - program.start.getTime()) / 60_000)
 
@@ -6952,9 +7423,12 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: ProviderBroker
   adultCategoryIds.clear()
   knownStreams.clear()
   nowNextCache.clear()
+  epgCapability = 'unknown'
+  epgCapabilityProbeInFlight = false
   account = null
   accountCapturedAt = null
   void loadPersistedAccountSummary(nextProfile.id)
+  void loadPersistedEpgCapability(nextProfile.id)
   scheduleLocalSearchIndexMigration(nextProfile.id)
   void initializeLibrarySync(nextProfile.id)
 }
@@ -8212,12 +8686,18 @@ if (
        * back so a caller can confirm programme rows appeared. No catalog sync is
        * involved.
        */
-      async epgDemo(input: { id: string; name?: string; showSchedule?: boolean }) {
+      async epgDemo(input: {
+        id: string
+        name?: string
+        showSchedule?: boolean
+        epgChannelId?: string
+      }) {
         const stream: StreamItem = {
           id: String(input.id),
           name: input.name ?? 'EPG demo channel',
           section: 'live',
           categoryId: '',
+          epgChannelId: input.epgChannelId,
         }
         await openDetails(stream)
         if (input.showSchedule) {
@@ -8227,12 +8707,27 @@ if (
         const epgPanel = document.querySelector('#epg-panel')?.textContent ?? ''
         return {
           view,
+          capability: epgCapability,
           selectedIsLive: selectedItem?.section === 'live' && selectedItem.id === stream.id,
           nowNextRendered: nowNextPanel.trim().length > 0,
           nowNextRowCount: (document.querySelectorAll('#now-next-panel .now-next div') || []).length,
           scheduleRendered: epgPanel.trim().length > 0,
           scheduleRowCount: document.querySelectorAll('#epg-panel .epg .program').length,
         }
+      },
+      async detectCapability(input: { id: string; epgChannelId: string }) {
+        if (!profile) {
+          return { capability: epgCapability }
+        }
+        const stream: StreamItem = {
+          id: String(input.id),
+          name: 'capability probe',
+          section: 'live',
+          categoryId: '',
+          epgChannelId: input.epgChannelId,
+        }
+        const detected = await detectEpgCapability(profile.id, stream, { force: true })
+        return { capability: detected }
       },
     },
     publication: {

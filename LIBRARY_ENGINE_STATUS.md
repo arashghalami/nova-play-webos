@@ -4445,3 +4445,87 @@ working host)** (Test B overturns it).
 - Probe/build note: reused the `VITE_DISABLE_CATALOG_SYNC` build plus the probe-only
   `epgDemo` hook from the prior session; both inert/absent in normal builds. No new
   production code in this task.
+
+## 2026-08-05 (later) - EPG implemented as a general capability (no channel-specific handling)
+
+General, provider-agnostic EPG capability. No channel names, titles, credentials,
+or full URLs recorded here.
+
+### What was built
+
+- **New `src/epg-service.ts`** owns the retrieval policy, DOM-free and unit-tested:
+  cache-first `resolveNowNext` / `resolveSchedule`, the blank-identifier
+  authoritative negative, capability gating, and the public-source fallback. It is
+  the single owner of "durable cache before any provider request".
+- **No request fan-out.** The guide list hydrates only the visible page
+  (`streams.slice(0, GUIDE_VISIBLE_NOW_NEXT_LIMIT)`), serially, at most one
+  interactive request per mapped visible row, and **zero for unmapped rows**
+  (skipped before a request is formed). `prefetchNowNext` remains absent; a
+  regression test asserts it never returns.
+- **Per-profile capability detection.** A single probe against one mapped channel
+  classifies the host: a populated schedule => `available`; a definitive 404/403
+  for a mapped channel (the measured non-serving signature) => `unavailable`; a
+  transient network/timeout stays `unknown` (retried, never a false negative).
+  Persisted on the library meta record with a timestamp; 24 h freshness.
+- **Durable guide cache.** now/next and schedule persist per profile+channel with
+  TTLs in the existing `epg` store, which `evictRebuildableData` already deletes
+  first (before details and search index). Reads are served from it before any
+  request, so a relaunch inside TTL issues zero provider requests.
+- **Host management (the durability gap).** New `storage.updateProfileConnection`
+  edits a profile's host/credentials in place, preserving the id the catalog is
+  keyed to, so moving to a new host keeps the fully downloaded library instead of
+  orphaning it and forcing a ~150 MB re-download. A "Change server" action in
+  Settings validates the new host before saving and distinguishes an unreachable
+  host from a refusal (retired host reads as a fixable config problem). Editing
+  never adopts an id from input.
+- **Public-source fallback** (`/v1/epg` on the Worker + `loadPublicSchedule` /
+  `loadPublicNowNext` in `metadata-client.ts`). Used only when the host is
+  `unavailable` but a channel has an identifier. The Worker fetches a per-region
+  source file server-side, filters to the requested identifiers, edge-caches a few
+  hours, and returns compact JSON — never a whole region file to the TV. Results
+  are labelled "Guide from a public source". A blank identifier has no key and no
+  fallback (accepted gap; no name matching).
+- **Catch-up** offered only where the channel advertises archive (`tv_archive`),
+  and never against public-source data (no archive rights), wired from the
+  programme start/stop timestamps.
+- **Unavailable-host UX.** When the host serves no guide, the UI states "This
+  account's current server provides no guide data" rather than rendering an empty
+  schedule as though the channel has nothing on.
+
+### Verification
+
+- `npx tsc --noEmit` clean; **full suite 333 passed** (37 files), including new
+  `src/epg-service.test.ts` (fan-out discipline: at most one request per mapped
+  visible row, zero for unmapped; relaunch/re-render within TTL issues zero new
+  requests; capability freshness) and new host-edit preservation tests in
+  `storage.test.ts` (id stable, active pointer updated, unknown id refused, id
+  never adopted from input). `npm run build` passes ES2015/bundle/CSS baseline
+  guards. Worker tests green.
+- **Emulator (home connection, non-guide host 185.243.7.192 reachable):**
+  capability detection returned **`unavailable`** from the host's 404 and
+  persisted it; the details view rendered the "current server provides no guide
+  data" message rather than an empty schedule; an unmapped synthetic channel
+  issued **0 provider requests**. The `VITE_DISABLE_CATALOG_SYNC` kill switch was
+  verified folded (`scheduleCatalogSync` -> `return false`) and no catalog sync
+  ran (`schedule()` false, `isRunning()` false).
+- **Emulator caveat:** the working EPG host is blocked from the home connection,
+  so the live *available*-host path (populated now/next + schedule rendering)
+  could not be re-exercised this session; it was proven end-to-end in the prior
+  session and is covered here by the service unit tests. Emulator results attest
+  logic, not TV performance, though kilobyte per-channel payloads make that a low
+  risk for this route.
+
+### Acceptance criteria status
+
+- Guide page issues at most one request per visible row, none for unmapped:
+  **met** (unit-proven + guide hydration bounded to the visible page; 0 requests
+  for unmapped verified on device).
+- Relaunch serves cached guide data with zero provider requests inside TTL:
+  **met** (durable `epg` store read-before-request; unit-proven).
+- Non-guide host shows a clear message, not an empty schedule: **met** (verified on
+  device).
+- Editing a profile's host preserves the local catalog: **met** (id-preserving
+  `updateProfileConnection`; verified by test).
+- Catch-up present only where advertised: **met** (gated on `tv_archive`, excluded
+  for public-source data).
+- tsc/suite/build/boundary checks: **met** (333 tests, build guards pass).

@@ -35,3 +35,4 @@ metadata-proxy/.wrangler/
 *.njsproj
 *.sln
 *.sw?
+.gstack/
