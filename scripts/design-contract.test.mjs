@@ -256,6 +256,20 @@ describe('Cinema design contract: colour', () => {
   })
 })
 
+describe('Cinema design contract: pre-paint', () => {
+  it('paints the webOS launch background in the same canvas colour', () => {
+    /*
+     * `bgColor` in appinfo.json is what webOS shows between launch and the app's
+     * first paint. It sat at the old blue #06101f, so a retuned canvas would have
+     * produced a blue flash on every cold start that no browser test could see.
+     */
+    const appinfo = JSON.parse(readFileSync(resolve('public', 'appinfo.json'), 'utf8'))
+    const canvas = customProperties().get('--canvas')
+
+    expect(appinfo.bgColor?.toLowerCase()).toBe(canvas?.trim().toLowerCase())
+  })
+})
+
 describe('Cinema design contract: semantic state', () => {
   /*
    * Reducing the palette to one accent is a mechanical sweep, and the first run
