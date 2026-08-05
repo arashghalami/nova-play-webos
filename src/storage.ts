@@ -491,6 +491,7 @@ export function toStoredStream(stream: StreamItem): StreamItem {
     streamType: stream.streamType,
     seriesId: stream.seriesId,
     channelNumber: stream.channelNumber,
+    epgChannelId: stream.epgChannelId,
     catchup: stream.catchup,
     directSource: stream.directSource,
     season: stream.season,

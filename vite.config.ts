@@ -1,11 +1,12 @@
 import { copyFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 
 export default defineConfig(({ mode }) => {
-  const metadataProxyConfigured = Boolean(process.env.VITE_METADATA_PROXY_URL?.trim())
+  const env = loadEnv(mode, __dirname, 'VITE_')
+  const metadataProxyConfigured = Boolean(env.VITE_METADATA_PROXY_URL?.trim())
   const libraryCapabilityProbeAvailable =
-    mode !== 'production' || process.env.VITE_ENABLE_LIBRARY_PROBE === 'true'
+    mode !== 'production' || env.VITE_ENABLE_LIBRARY_PROBE === 'true'
 
   let bundledMediaEngineIds: string[] = []
 

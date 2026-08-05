@@ -1,6 +1,6 @@
 {
   "id": "com.arash.novaplay",
-  "version": "1.0.22",
+  "version": "1.0.40",
   "vendor": "Arash",
   "type": "web",
   "main": "index.html",
@@ -10,3 +10,5 @@
   "bgColor": "#06101f",
   "resolution": "1920x1080"
 }
+
+

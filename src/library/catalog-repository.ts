@@ -1,6 +1,6 @@
 import { LruTtlCache } from '../lru-ttl-cache'
 import { performanceTrace } from '../performance-trace'
-import { foldText, matchesQuery, queryTokens } from '../search'
+import { foldText, matchesQuery, queryTokens, searchTokens } from '../search'
 import {
   favoriteKey,
   toStoredStream,
@@ -11,18 +11,19 @@ import type {
   Category,
   LibrarySection,
   NowNext,
+  Program,
   SeriesDetails,
   StreamItem,
   VodDetails,
 } from '../types'
 
 export const LIBRARY_DATABASE_NAME = 'nova-play-library'
-export const LIBRARY_DATABASE_VERSION = 4
+export const LIBRARY_DATABASE_VERSION = 5
 export const LIBRARY_SCHEMA_VERSION = 1
 export const MAX_SNAPSHOT_ITEMS = 1_500
 export const MAX_SNAPSHOT_BYTES = 256 * 1024
 export const MAX_SEARCH_SHARD_ENTRIES = 5_000
-export const SEARCH_INDEX_FORMAT_VERSION = 1
+export const SEARCH_INDEX_FORMAT_VERSION = 3
 /*
  * IndexedDB writes run synchronously inside each transaction. Larger batches
  * keep the migration practical on webOS, while still committing frequently
@@ -31,6 +32,14 @@ export const SEARCH_INDEX_FORMAT_VERSION = 1
 export const SEARCH_INDEX_POSTINGS_PER_SHARD = 1_024
 export const SEARCH_INDEX_WRITE_RECORD_BATCH_SIZE = 32
 export const MAX_SEARCH_INDEX_BUFFERED_POSTINGS = 200_000
+/**
+ * The index rebuild's per-item posting loop (payload parse, posting generation,
+ * and prefix bucketing) previously ran unyielded across an entire snapshot
+ * shard, producing a multi-hundred-millisecond main-thread span at section
+ * scale. It now yields whenever a slice exceeds this budget, keeping each
+ * uninterrupted run short without paying a clock read per item.
+ */
+export const SEARCH_INDEX_WORK_SLICE_MS = 12
 
 export const LIBRARY_STORE_NAMES = [
   'meta',
@@ -46,8 +55,39 @@ export const LIBRARY_STORE_NAMES = [
 export type LibraryStoreName = (typeof LIBRARY_STORE_NAMES)[number]
 export type LibraryCoverage = 'none' | 'partial' | 'complete'
 export type LibraryDetailKind = 'vod' | 'series'
+export type LibraryEpgKind = 'now-next' | 'schedule' | 'catchup'
 export type LibraryDetails = VodDetails | SeriesDetails
+export type LibraryEpgValue = NowNext | Program[]
 export type SearchTuple = [key: string, foldedName: string, section: LibrarySection, categoryId: string]
+
+/**
+ * Payload-free diagnostics for one section's most recent whole-section failure.
+ * Persisted per section in the sync meta record, so a later section succeeding in
+ * the same run cannot overwrite it the way the single global breadcrumb does. It
+ * carries only counts, bytes, timing, and classification - never titles, URLs, or
+ * provider payload.
+ */
+export type LibrarySyncSectionFailureDetail = {
+  /** Coordinator failure stage reached (provider-scan, snapshot-publish, ...). */
+  failureStage: string
+  /** Failure classification: provider kind, empty-validation, or exception name. */
+  failureKind: string
+  /** Records the parser confirmed as top-level array members, if known. */
+  rawItemCount?: number
+  /** Records accepted with a usable identity, if known. */
+  acceptedItemCount?: number
+  /** Records streamed to the publisher before the failure. */
+  streamedRecordCount?: number
+  /** Response bytes read before the failure, if known. */
+  bytesReceived?: number
+  /** Whether the strict top-level array closed cleanly, if known. */
+  arrayClosed?: boolean
+  /** Wall-clock from scan start to failure, milliseconds. */
+  elapsedMs?: number
+  /** Whether the failure was a refusal (401/403/429/Retry-After). */
+  refused?: boolean
+  updatedAt: number
+}
 
 export type LibrarySyncSectionState = {
   coverage: LibraryCoverage
@@ -56,6 +96,8 @@ export type LibrarySyncSectionState = {
   lastAttemptAt?: number
   lastSuccessAt?: number
   lastFailureAt?: number
+  /** Survives later sections in the same run; see the type doc. */
+  lastFailureDetail?: LibrarySyncSectionFailureDetail
 }
 
 export type LibrarySyncState = {
@@ -65,6 +107,18 @@ export type LibrarySyncState = {
   updatedAt?: number
   failureCount?: number
   sections?: Partial<Record<LibrarySection, LibrarySyncSectionState>>
+}
+
+/**
+ * Per-profile EPG capability. A host either serves guide data or it does not;
+ * this is a property of the account's current server, detected once rather than
+ * rediscovered per channel. `unknown` means not yet probed.
+ */
+export type EpgCapabilityState = 'available' | 'unavailable' | 'unknown'
+
+export type EpgCapabilityRecord = {
+  state: EpgCapabilityState
+  checkedAt: number
 }
 
 export type LibraryMetaRecord = {
@@ -78,6 +132,7 @@ export type LibraryMetaRecord = {
     summary: AccountSummary
     capturedAt: number
   }
+  epgCapability?: EpgCapabilityRecord
   sync: LibrarySyncState
   searchCoverage: LibraryCoverage
   searchShardCount: number
@@ -154,6 +209,12 @@ export type SearchIndexMetaRecord = {
   itemCount: number
   postingCount: number
   legacyUntitledCount: number
+  /**
+   * Items that the replaced ASCII-only prefix tokenizer would have omitted.
+   * This is captured during the local format migration before new postings are
+   * written, allowing device audits without provider reacquisition.
+   */
+  preMigrationZeroPrefixCount: number
   prefixPostingCounts: Record<string, number>
   prefixShardCounts: Record<string, number>
 }
@@ -192,13 +253,25 @@ export type DetailRecord<T extends LibraryDetails = LibraryDetails> = {
   expiresAt: number
 }
 
-export type EpgRecord = {
+export type EpgRecord<T extends LibraryEpgValue = LibraryEpgValue> = {
   schemaVersion: 1
   profileId: string
   streamId: string
-  value: NowNext
+  kind: LibraryEpgKind
+  value: T
   updatedAt: number
   expiresAt: number
+}
+
+export type RebuildableCacheEvictionResult = {
+  epgRecordsDeleted: number
+  detailRecordsDeleted: number
+  searchIndexRecordsDeleted: number
+  supersededSnapshotRecordsDeleted: number
+}
+
+export type ProfileLibraryStorageEstimate = {
+  byteEstimate: number
 }
 
 export type CategorySnapshotShard = {
@@ -258,6 +331,20 @@ export type CompleteCategoryReadResult =
       reason: LocalLibraryUnavailableReason
     }
 
+export type CompleteCategoryPageReadResult =
+  | {
+      coverage: 'complete'
+      items: StreamItem[]
+      itemCount: number
+      page: number
+      pageCount: number
+    }
+  | {
+      coverage: 'none'
+      items: []
+      reason: LocalLibraryUnavailableReason
+    }
+
 export type SectionSearchResult =
   | {
       coverage: 'complete'
@@ -293,6 +380,7 @@ export type SearchIndexBuildResult =
       itemCount: number
       postingCount: number
       legacyUntitledCount: number
+      preMigrationZeroPrefixCount: number
       prefixPostingCounts: Record<string, number>
       prefixShardCounts: Record<string, number>
       elapsedMs: number
@@ -334,13 +422,10 @@ export type CategorySnapshotWriteInput = {
   runId?: string
 }
 
-export type PartialCategorySnapshotAppendInput = {
-  profileId: string
-  section: LibrarySection
+export type PartialCategoryAppendInput = {
   category: Category
   categoryKey?: string
   items: readonly StreamItem[]
-  runId?: string
 }
 
 export type SectionSnapshotWriteInput = {
@@ -414,6 +499,28 @@ export class LibraryWriteAbortedError extends Error {
 }
 
 /**
+ * A closed top-level array that yielded zero identifiable records must never
+ * promote over an authoritative section that currently holds items. The scan
+ * completed cleanly at the transport layer, so this is not a provider fault and
+ * carries no payload: only the counts that justify the refusal. The previous
+ * manifest, snapshots, and derived index are left exactly as readers resolve
+ * them.
+ */
+export class EmptySectionPublicationError extends Error {
+  readonly code = 'empty-section-publication'
+  readonly priorItemCount: number
+
+  constructor(priorItemCount: number) {
+    super(
+      'A closed section scan emitted zero identifiable records while the ' +
+        `existing generation holds ${priorItemCount} item(s); promotion refused.`,
+    )
+    this.name = 'EmptySectionPublicationError'
+    this.priorItemCount = priorItemCount
+  }
+}
+
+/**
  * Player startup is a hard cancellation boundary for cooperative catalog writes.
  * Phase 1B can resume from its own source unit after playback startup completes.
  */
@@ -439,6 +546,16 @@ export function clearLibraryMemoryCaches(): void {
   snapshotMemoryCache.clear()
   searchMemoryCache.clear()
   activeCacheScope = null
+}
+
+/**
+ * Placeholder that replaces a shard once its record has committed, so a
+ * whole-section publication never holds more than one category's payloads.
+ */
+const EMPTY_SNAPSHOT_SHARD: CategorySnapshotShard = {
+  payload: '',
+  itemCount: 0,
+  byteEstimate: 0,
 }
 
 export function buildCategorySnapshotShards(
@@ -538,7 +655,7 @@ export function openLibraryDatabase(
   return new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(databaseName, LIBRARY_DATABASE_VERSION)
 
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       const database = request.result
 
       for (const existingName of objectStoreNames(database)) {
@@ -565,7 +682,17 @@ export function openLibraryDatabase(
         'shardIndex',
       ])
       createStore(database, 'details', ['profileId', 'kind', 'id'])
-      createStore(database, 'epg', ['profileId', 'streamId'])
+
+      /*
+       * EPG used to share one row between now/next and the full schedule.
+       * Recreate this disposable cache store so each short-lived programme
+       * projection has an independent key. Authoritative catalog records and
+       * user state are not part of this schema migration.
+       */
+      if (event.oldVersion < 5 && database.objectStoreNames.contains('epg')) {
+        database.deleteObjectStore('epg')
+      }
+      createStore(database, 'epg', ['profileId', 'streamId', 'kind'])
     }
 
     request.onerror = () =>
@@ -608,6 +735,322 @@ export function deleteLibraryDatabase(
   })
 }
 
+type PartialSectionPublicationInit = {
+  database: IDBDatabase
+  profileId: string
+  section: LibrarySection
+  runId?: string
+  now: () => number
+  categories: readonly CategoryManifestEntry[]
+}
+
+/**
+ * Buffered manifest state for one streamed partial-section publication.
+ *
+ * A section manifest is a single record listing every category, so rewriting it
+ * once per bounded item flush costs O(flushes x categories). VOD (~194,000
+ * items across 363 categories, flushed every 128 items) therefore read,
+ * rebuilt, and rewrote the whole manifest ~1,500 times while its ~80 MB
+ * streamed parse was still running, which reproducibly stalled the webOS
+ * Chromium 79 runtime a few thousand items into the scan. Live and Series never
+ * took this path, which is why only VOD hung.
+ *
+ * Snapshot shards are still written on every bounded flush - that is what keeps
+ * peak memory bounded - but manifest mutation accumulates here and is written
+ * exactly **once** per run, at the closed-array commit. Manifest cost is
+ * therefore O(1) per section rather than O(flushes).
+ *
+ * Because every whole-section scan now publishes this way, including a refresh of
+ * an already complete section, the run must not disturb what readers currently
+ * resolve. New shards are written to a fresh slot above the live generation
+ * (`shardBase + shardCount`) and the manifest is swapped in one write at commit,
+ * after which the superseded range is pruned. Consequences:
+ *
+ * - a reader sees the previous complete generation for the whole scan;
+ * - a crashed or cancelled run leaves that generation intact and authoritative,
+ *   which is the accepted rule that a failed refresh never erases a complete
+ *   section;
+ * - a restarted response recomputes the same fresh slot and overwrites it, so it
+ *   cannot append duplicates;
+ * - shards orphaned by an interrupted run are reclaimed by
+ *   `evictRebuildableData()`, which deletes every snapshot row the active manifest
+ *   does not reference.
+ */
+export class PartialSectionPublication {
+  readonly profileId: string
+  readonly section: LibrarySection
+  private readonly database: IDBDatabase
+  private readonly runId?: string
+  private readonly now: () => number
+  /**
+   * One generation stamp for every shard and manifest entry in this run.
+   * Bounded reads reject a shard whose `updatedAt` differs from its manifest
+   * entry, so the stamp cannot change between flushes of the same category.
+   */
+  private readonly generation: number
+  private readonly entries = new Map<string, CategoryManifestEntry>()
+  /** The shard range each category occupied before this run, pruned at commit. */
+  private readonly superseded = new Map<string, { shardBase: number; shardCount: number }>()
+  /**
+   * Item total the section held when this run opened. A run that closes with an
+   * empty scan checks this to refuse erasing an authoritative generation.
+   */
+  private readonly priorItemCount: number
+  private manifestWrites = 0
+  private committed = false
+
+  private constructor(init: PartialSectionPublicationInit) {
+    this.database = init.database
+    this.profileId = init.profileId
+    this.section = init.section
+    this.runId = init.runId
+    this.now = init.now
+    this.generation = init.now()
+    this.priorItemCount = init.categories.reduce(
+      (total, category) => total + (category.itemCount ?? 0),
+      0,
+    )
+
+    for (const category of init.categories) {
+      const liveShardBase = category.shardBase ?? 0
+      this.entries.set(category.categoryKey, {
+        ...category,
+        coverage: 'partial',
+        shardCount: 0,
+        // Start above the generation readers are currently resolving.
+        shardBase: liveShardBase + category.shardCount,
+        itemCount: 0,
+        byteEstimate: 0,
+        updatedAt: this.generation,
+      })
+      this.superseded.set(category.categoryKey, {
+        shardBase: liveShardBase,
+        shardCount: category.shardCount,
+      })
+    }
+  }
+
+  static open(init: PartialSectionPublicationInit): PartialSectionPublication {
+    /*
+     * No manifest write here: the live generation must stay exactly as readers
+     * resolve it until this run's array closes.
+     */
+    return new PartialSectionPublication(init)
+  }
+
+  /** `manifests` store writes performed by this publication so far. */
+  get manifestWriteCount(): number {
+    return this.manifestWrites
+  }
+
+  get categoryCount(): number {
+    return this.entries.size
+  }
+
+  /** Item total the section held when this publication opened. */
+  get priorAuthoritativeItemCount(): number {
+    return this.priorItemCount
+  }
+
+  /**
+   * Persists one bounded, parser-confirmed batch. The shards become durable
+   * immediately; the section manifest is not touched.
+   */
+  async appendCategoryItems(
+    input: PartialCategoryAppendInput,
+    options: CooperativeWriteOptions = {},
+  ): Promise<CategoryManifestEntry> {
+    if (this.committed) {
+      throw new Error('A committed partial section publication cannot accept more items.')
+    }
+
+    for (const item of input.items) {
+      if (item.section !== this.section) {
+        throw new Error('A category snapshot cannot contain items from another section.')
+      }
+    }
+
+    options.onPublishStage?.('snapshot-plan')
+    const entry = this.entryFor(input.categoryKey ?? input.category.id, input.category)
+
+    if (input.items.length) {
+      options.onPublishStage?.('snapshot-write')
+      await this.appendShards(entry, buildCategorySnapshotShards(input.items), options)
+    }
+
+    options.onPublishStage?.('complete')
+    return { ...entry }
+  }
+
+  /**
+   * Promotes the whole run in one manifest write. A closed top-level array is
+   * authoritative for the section, so a category the stream never mentioned is
+   * complete with zero items rather than unavailable.
+   */
+  async commit(options: CooperativeWriteOptions = {}): Promise<SectionManifestRecord> {
+    if (this.committed) {
+      throw new Error('A partial section publication can be committed only once.')
+    }
+
+    /*
+     * A closed scan that produced zero identifiable records must not erase a
+     * section that currently holds items. This is checked before any empty
+     * placeholder shard is written and before the manifest swap, so the previous
+     * generation and its derived index remain authoritative. A genuinely empty
+     * first acquisition (no prior items) is still allowed to commit.
+     */
+    const committedItemCount = [...this.entries.values()].reduce(
+      (total, entry) => total + entry.itemCount,
+      0,
+    )
+
+    if (committedItemCount === 0 && this.priorItemCount > 0) {
+      throw new EmptySectionPublicationError(this.priorItemCount)
+    }
+
+    options.onPublishStage?.('snapshot-write')
+
+    for (const entry of this.entries.values()) {
+      if (entry.shardCount > 0) {
+        continue
+      }
+
+      /*
+       * An empty category still needs one shard record: bounded category reads
+       * derive an IndexedDB key range from `shardCount`, and a zero-length range
+       * is not a valid range.
+       */
+      await this.appendShards(entry, buildCategorySnapshotShards([]), options)
+    }
+
+    assertCooperativeWriteAllowed(playbackEpoch, options.signal)
+    await assertSyncOwnership(this.database, this.profileId, this.runId)
+    options.onPublishStage?.('manifest-build')
+    options.onPublishStage?.('manifest-put')
+    const manifest = await this.publishManifest('complete')
+    this.committed = true
+
+    /*
+     * The manifest now points at the new range, so the previous one is
+     * unreachable. Pruning is cooperative and best-effort: whatever it does not
+     * remove is reclaimed by `evictRebuildableData()`.
+     */
+    options.onPublishStage?.('cleanup')
+    const writeEpoch = playbackEpoch
+    for (const [categoryKey, previous] of this.superseded) {
+      if (previous.shardCount < 1) {
+        continue
+      }
+
+      const entry = this.entries.get(categoryKey)
+      await pruneSurplusCategoryShards(
+        this.database,
+        this.profileId,
+        this.section,
+        categoryKey,
+        entry?.shardCount ?? 0,
+        previous.shardCount,
+        previous.shardBase,
+        entry?.shardBase ?? previous.shardBase,
+        writeEpoch,
+        options,
+      )
+    }
+
+    options.onPublishStage?.('complete')
+    return manifest
+  }
+
+  private entryFor(categoryKey: string, category: Category): CategoryManifestEntry {
+    const existing = this.entries.get(categoryKey)
+
+    if (existing) {
+      existing.categoryId = category.id
+      existing.name = category.name
+      return existing
+    }
+
+    const entry: CategoryManifestEntry = {
+      categoryKey,
+      categoryId: category.id,
+      name: category.name,
+      coverage: 'partial',
+      shardCount: 0,
+      shardBase: 0,
+      itemCount: 0,
+      byteEstimate: 0,
+      updatedAt: this.generation,
+    }
+    this.entries.set(categoryKey, entry)
+    return entry
+  }
+
+  private async appendShards(
+    entry: CategoryManifestEntry,
+    shards: readonly CategorySnapshotShard[],
+    options: CooperativeWriteOptions,
+  ): Promise<void> {
+    const writeEpoch = playbackEpoch
+
+    for (const shard of shards) {
+      assertCooperativeWriteAllowed(writeEpoch, options.signal)
+      await assertSyncOwnership(this.database, this.profileId, this.runId)
+      const eventLoopTurn = nextEventLoopTurn()
+      const startedAt = monotonicNow()
+
+      await putCooperativeRecord(
+        this.database,
+        'snapshots',
+        {
+          schemaVersion: LIBRARY_SCHEMA_VERSION,
+          profileId: this.profileId,
+          section: this.section,
+          categoryKey: entry.categoryKey,
+          shardIndex: (entry.shardBase ?? 0) + entry.shardCount,
+          payload: shard.payload,
+          updatedAt: this.generation,
+          itemCount: shard.itemCount,
+          byteEstimate: shard.byteEstimate,
+        } satisfies SnapshotRecord,
+        options.signal,
+      )
+
+      /*
+       * Advance the buffered cursor only after the record commits, so a
+       * cancelled flush cannot leave the next shard index pointing past a gap.
+       */
+      entry.shardCount += 1
+      entry.itemCount += shard.itemCount
+      entry.byteEstimate += shard.byteEstimate
+
+      const durationMs = monotonicNow() - startedAt
+      const eventLoopTurnMs = await eventLoopTurn
+      options.onSnapshotPut?.({
+        durationMs,
+        eventLoopTurnMs,
+        byteEstimate: shard.byteEstimate,
+        itemCount: shard.itemCount,
+      })
+      await (options.yieldControl ?? defaultYield)()
+    }
+  }
+
+  private async publishManifest(
+    coverage: Extract<LibraryCoverage, 'complete'>,
+  ): Promise<SectionManifestRecord> {
+    const manifest = createManifest(
+      this.profileId,
+      this.section,
+      [...this.entries.values()].map((entry) => ({ ...entry, coverage })),
+      this.now(),
+    )
+    await putRecord(this.database, 'manifests', manifest)
+    this.manifestWrites += 1
+    snapshotMemoryCache.clear()
+    return manifest
+  }
+}
+
 export class IndexedDbCatalogRepository {
   private readonly databaseName: string
   private readonly now: () => number
@@ -647,6 +1090,43 @@ export class IndexedDbCatalogRepository {
   close(): void {
     void this.databasePromise?.then((database) => database.close()).catch(() => undefined)
     this.databasePromise = null
+  }
+
+  /**
+   * Discards a stale database connection after browser eviction or an explicit
+   * recovery request. Opening a fresh connection cannot affect localStorage
+   * favorites, resume records, profiles, or settings.
+   */
+  async reopen(): Promise<void> {
+    const previous = this.databasePromise
+    this.databasePromise = null
+
+    try {
+      ;(await previous)?.close()
+    } catch {
+      // A browser-evicted connection may already be closed.
+    }
+
+    await this.database()
+  }
+
+  /**
+   * Development-only fault injection for recovery validation. It clears only
+   * this repository's IndexedDB database; profiles, favorites, resume history,
+   * and settings remain in their localStorage ownership boundary.
+   */
+  async simulateEviction(): Promise<void> {
+    const current = this.databasePromise
+    this.databasePromise = null
+
+    try {
+      ;(await current)?.close()
+    } catch {
+      // A browser-evicted connection may already be closed.
+    }
+
+    await deleteLibraryDatabase(this.databaseName)
+    await this.database()
   }
 
   async getMeta(profileId: string): Promise<LibraryMetaRecord | null> {
@@ -789,6 +1269,85 @@ export class IndexedDbCatalogRepository {
             },
           } satisfies LibraryMetaRecord)
           result = true
+        } catch (reason) {
+          try {
+            transaction.abort()
+          } catch {
+            // Completion may win the race with this local validation failure.
+          }
+          rejectOnce(reason)
+        }
+      }
+    })
+  }
+
+  /**
+   * Clears a run abandoned by process suspension before its coordinator could
+   * finish. The active-run lease is disposable cache state, so recovery makes
+   * an incomplete library immediately eligible for the next normal sync.
+   */
+  async recoverStaleSync(profileId: string, staleAfterMs: number): Promise<boolean> {
+    assertProfileId(profileId)
+    const database = await this.database()
+
+    return new Promise<boolean>((resolve, reject) => {
+      const transaction = database.transaction('meta', 'readwrite')
+      const store = transaction.objectStore('meta')
+      let recovered = false
+      let requestHandled = false
+      let rejected = false
+
+      const rejectOnce = (reason: unknown): void => {
+        if (!rejected) {
+          rejected = true
+          reject(reason)
+        }
+      }
+
+      transaction.oncomplete = () => {
+        if (!rejected && requestHandled) {
+          resolve(recovered)
+        }
+      }
+      transaction.onerror = () =>
+        rejectOnce(transaction.error ?? new Error('Unable to recover catalog synchronization.'))
+      transaction.onabort = () =>
+        rejectOnce(transaction.error ?? new Error('Catalog sync recovery transaction was aborted.'))
+
+      const request = store.get(profileId)
+      request.onerror = () =>
+        rejectOnce(request.error ?? new Error('Unable to read catalog sync state.'))
+      request.onsuccess = () => {
+        requestHandled = true
+
+        try {
+          const currentValue = request.result
+          const current = isMetaRecord(currentValue, profileId)
+            ? currentValue
+            : defaultMeta(profileId)
+          const currentTime = this.now()
+          const staleAt = currentTime - Math.max(0, staleAfterMs)
+          const updatedAt = current.sync.updatedAt
+
+          if (
+            !current.sync.inProgress ||
+            (typeof updatedAt === 'number' && updatedAt > staleAt)
+          ) {
+            return
+          }
+
+          store.put({
+            ...current,
+            nextDueAt: currentTime,
+            sync: {
+              ...normalizeSyncState(current.sync),
+              inProgress: false,
+              runId: undefined,
+              startedAt: undefined,
+              updatedAt: currentTime,
+            },
+          } satisfies LibraryMetaRecord)
+          recovered = true
         } catch (reason) {
           try {
             transaction.abort()
@@ -1128,12 +1687,16 @@ export class IndexedDbCatalogRepository {
    * Starts a replacement pass for a section that has no authoritative complete
    * categories. Existing partial pointers are detached before parsing restarts,
    * so a restarted non-paginated response cannot append duplicate records.
+   *
+   * The returned publication buffers all manifest mutation for the run. See
+   * `PartialSectionPublication` for why per-flush manifest writes are unsafe on
+   * the webOS runtime.
    */
-  async preparePartialSectionSnapshotRun(
+  async openPartialSectionPublication(
     profileId: string,
     section: LibrarySection,
     runId?: string,
-  ): Promise<SectionManifestRecord> {
+  ): Promise<PartialSectionPublication> {
     assertProfileId(profileId)
     selectMemoryCacheScope(this.databaseName, profileId)
     const current = await this.getManifest(profileId, section)
@@ -1142,166 +1705,22 @@ export class IndexedDbCatalogRepository {
       throw new Error('Cannot prepare partial snapshots without a category manifest.')
     }
 
-    if (current.categories.some((category) => category.coverage === 'complete')) {
-      throw new Error('Partial publication cannot replace authoritative category snapshots.')
-    }
-
     const database = await this.database()
     await assertSyncOwnership(database, profileId, runId)
-    const manifest = createManifest(
+
+    /*
+     * A complete section is a valid starting point: the run writes above the live
+     * generation and swaps the manifest at commit, so the existing snapshots stay
+     * readable and authoritative throughout.
+     */
+    return PartialSectionPublication.open({
+      database,
       profileId,
       section,
-      current.categories.map((category) => ({
-        ...category,
-        coverage: 'none',
-        shardCount: 0,
-        shardBase: 0,
-        itemCount: 0,
-        byteEstimate: 0,
-        updatedAt: this.now(),
-      })),
-      this.now(),
-    )
-    await putRecord(database, 'manifests', manifest)
-    snapshotMemoryCache.clear()
-    return manifest
-  }
-
-  /**
-   * Appends one bounded, parser-confirmed batch to a category that has no
-   * currently authoritative complete snapshot. Each manifest update makes the
-   * accumulated shards durable but explicitly partial. A later closed-array
-   * promotion is the only transition to complete coverage.
-   */
-  async appendPartialCategorySnapshot(
-    input: PartialCategorySnapshotAppendInput,
-    options: CooperativeWriteOptions = {},
-  ): Promise<CategoryManifestEntry> {
-    assertProfileId(input.profileId)
-    selectMemoryCacheScope(this.databaseName, input.profileId)
-
-    for (const item of input.items) {
-      if (item.section !== input.section) {
-        throw new Error('A category snapshot cannot contain items from another section.')
-      }
-    }
-
-    options.onPublishStage?.('snapshot-plan')
-    const categoryKey = input.categoryKey ?? input.category.id
-    const shards = buildCategorySnapshotShards(input.items)
-    const currentManifest = await this.getManifest(input.profileId, input.section)
-    const currentCategory = currentManifest?.categories.find(
-      (category) => category.categoryKey === categoryKey,
-    )
-
-    if (currentCategory?.coverage === 'complete') {
-      throw new Error('Partial publication cannot replace an authoritative category snapshot.')
-    }
-
-    const generation = currentCategory?.updatedAt ?? this.now()
-    const currentShardCount = currentCategory?.shardCount ?? 0
-    const shardBase = currentCategory?.shardBase ?? 0
-    const writeEpoch = playbackEpoch
-    const database = await this.database()
-
-    options.onPublishStage?.('snapshot-write')
-    for (let shardIndex = 0; shardIndex < shards.length; shardIndex += 1) {
-      assertCooperativeWriteAllowed(writeEpoch, options.signal)
-      await assertSyncOwnership(database, input.profileId, input.runId)
-      const shard = shards[shardIndex]
-      const eventLoopTurn = nextEventLoopTurn()
-      const startedAt = monotonicNow()
-
-      await putCooperativeRecord(
-        database,
-        'snapshots',
-        {
-          schemaVersion: LIBRARY_SCHEMA_VERSION,
-          profileId: input.profileId,
-          section: input.section,
-          categoryKey,
-          shardIndex: shardBase + currentShardCount + shardIndex,
-          payload: shard.payload,
-          updatedAt: generation,
-          itemCount: shard.itemCount,
-          byteEstimate: shard.byteEstimate,
-        } satisfies SnapshotRecord,
-        options.signal,
-      )
-
-      const durationMs = monotonicNow() - startedAt
-      const eventLoopTurnMs = await eventLoopTurn
-      options.onSnapshotPut?.({
-        durationMs,
-        eventLoopTurnMs,
-        byteEstimate: shard.byteEstimate,
-        itemCount: shard.itemCount,
-      })
-      await (options.yieldControl ?? defaultYield)()
-    }
-
-    assertCooperativeWriteAllowed(writeEpoch, options.signal)
-    await assertSyncOwnership(database, input.profileId, input.runId)
-    options.onPublishStage?.('manifest-build')
-    const categoryEntry: CategoryManifestEntry = {
-      categoryKey,
-      categoryId: input.category.id,
-      name: input.category.name,
-      coverage: 'partial',
-      shardCount: currentShardCount + shards.length,
-      shardBase,
-      itemCount: (currentCategory?.itemCount ?? 0) + input.items.length,
-      byteEstimate:
-        (currentCategory?.byteEstimate ?? 0) +
-        shards.reduce((total, shard) => total + shard.byteEstimate, 0),
-      updatedAt: generation,
-    }
-    const manifest = createManifest(
-      input.profileId,
-      input.section,
-      upsertCategoryManifest(currentManifest?.categories ?? [], categoryEntry),
-      this.now(),
-    )
-
-    options.onPublishStage?.('manifest-put')
-    await putRecord(database, 'manifests', manifest)
-    snapshotMemoryCache.clear()
-    options.onPublishStage?.('complete')
-    return categoryEntry
-  }
-
-  /**
-   * A successful, fully closed whole-section stream promotes its already
-   * persisted partial category generations in one manifest operation.
-   */
-  async promotePartialSectionSnapshots(
-    profileId: string,
-    section: LibrarySection,
-    runId?: string,
-  ): Promise<SectionManifestRecord> {
-    assertProfileId(profileId)
-    selectMemoryCacheScope(this.databaseName, profileId)
-    const current = await this.getManifest(profileId, section)
-
-    if (!current || current.categories.some((category) => category.coverage === 'none')) {
-      throw new Error('Cannot promote a section with unavailable category coverage.')
-    }
-
-    const database = await this.database()
-    await assertSyncOwnership(database, profileId, runId)
-    const manifest = createManifest(
-      profileId,
-      section,
-      current.categories.map((category) => (
-        category.coverage === 'partial'
-          ? { ...category, coverage: 'complete' }
-          : category
-      )),
-      this.now(),
-    )
-    await putRecord(database, 'manifests', manifest)
-    snapshotMemoryCache.clear()
-    return manifest
+      runId,
+      now: this.now,
+      categories: current.categories,
+    })
   }
 
   async replaceSectionSnapshots(
@@ -1319,6 +1738,11 @@ export class IndexedDbCatalogRepository {
     const writeEpoch = playbackEpoch
     const database = await this.database()
     const seenCategoryKeys = new Set<string>()
+    /*
+     * Plan without serializing. Validation and shard-slot arithmetic are cheap
+     * and depend only on this category's current manifest entry, so nothing here
+     * needs a payload.
+     */
     const plans = input.snapshots.map((snapshot) => {
       const categoryKey = snapshot.categoryKey ?? snapshot.category.id
 
@@ -1327,38 +1751,58 @@ export class IndexedDbCatalogRepository {
       }
 
       seenCategoryKeys.add(categoryKey)
+      let itemCount = 0
 
       for (const item of snapshot.items) {
         if (item.section !== input.section) {
           throw new Error('A category snapshot cannot contain items from another section.')
         }
+
+        itemCount += 1
       }
 
       const currentCategory = currentByKey.get(categoryKey)
-      const shards = buildCategorySnapshotShards(snapshot.items)
-      const generation = Math.max(
-        input.updatedAt ?? this.now(),
-        (currentCategory?.updatedAt ?? 0) + 1,
-      )
-      const nextShardBase = nextSnapshotShardBase(currentCategory, shards.length)
 
       return {
         categoryKey,
         category: snapshot.category,
-        items: snapshot.items,
-        shards,
+        /*
+         * Hold the input, not its items, so the only read of `items` after this
+         * validation pass is the one that serializes this category.
+         */
+        snapshot,
+        itemCount,
         currentCategory,
-        generation,
-        nextShardBase,
+        generation: Math.max(
+          input.updatedAt ?? this.now(),
+          (currentCategory?.updatedAt ?? 0) + 1,
+        ),
+        shardCount: 0,
+        byteEstimate: 0,
+        nextShardBase: 0,
       }
     })
 
+    /*
+     * Serialize one category at a time. Building every section shard up front
+     * held the whole section's payload strings live at once, on top of the
+     * already-resident parsed items and the streamed response state. That peak
+     * grew when cached artwork URLs were restored, and the webOS renderer is
+     * terminated at the scan-to-publish transition for a section the size of
+     * Live. Per-category serialization lets each payload be collected as soon as
+     * its record commits.
+     */
     options.onPublishStage?.('snapshot-write')
     for (const plan of plans) {
-      for (let shardIndex = 0; shardIndex < plan.shards.length; shardIndex += 1) {
+      const shards = buildCategorySnapshotShards(plan.snapshot.items)
+      plan.nextShardBase = nextSnapshotShardBase(plan.currentCategory, shards.length)
+      plan.shardCount = shards.length
+      plan.byteEstimate = shards.reduce((total, shard) => total + shard.byteEstimate, 0)
+
+      for (let shardIndex = 0; shardIndex < shards.length; shardIndex += 1) {
         assertCooperativeWriteAllowed(writeEpoch, options.signal)
         await assertSyncOwnership(database, input.profileId, input.runId)
-        const shard = plan.shards[shardIndex]
+        const shard = shards[shardIndex]
 
         await putCooperativeRecord(
           database,
@@ -1377,6 +1821,8 @@ export class IndexedDbCatalogRepository {
           options.signal,
         )
 
+        // Drop this shard's payload before the next put is scheduled.
+        shards[shardIndex] = EMPTY_SNAPSHOT_SHARD
         await (options.yieldControl ?? defaultYield)()
       }
     }
@@ -1391,10 +1837,10 @@ export class IndexedDbCatalogRepository {
         categoryId: plan.category.id,
         name: plan.category.name,
         coverage: 'complete',
-        shardCount: plan.shards.length,
+        shardCount: plan.shardCount,
         shardBase: plan.nextShardBase,
-        itemCount: plan.items.length,
-        byteEstimate: plan.shards.reduce((total, shard) => total + shard.byteEstimate, 0),
+        itemCount: plan.itemCount,
+        byteEstimate: plan.byteEstimate,
         updatedAt: plan.generation,
       }
       categories = upsertCategoryManifest(categories, entry)
@@ -1421,7 +1867,7 @@ export class IndexedDbCatalogRepository {
         input.profileId,
         input.section,
         plan.categoryKey,
-        plan.shards.length,
+        plan.shardCount,
         plan.currentCategory?.shardCount ?? 0,
         plan.currentCategory?.shardBase ?? 0,
         plan.nextShardBase,
@@ -1593,19 +2039,63 @@ export class IndexedDbCatalogRepository {
       return { coverage: 'none', items: [], reason: 'category-unavailable' }
     }
 
-    const items: StreamItem[] = []
-
-    for (let shardIndex = 0; shardIndex < category.shardCount; shardIndex += 1) {
-      const shard = await this.readCategoryShard(profileId, section, categoryId, shardIndex)
-
-      if (shard.coverage === 'none') {
-        return shard
+    try {
+      return {
+        coverage: 'complete',
+        items: await readCompleteCategorySnapshotItems(
+          await this.database(),
+          profileId,
+          section,
+          category,
+        ),
       }
+    } catch {
+      return { coverage: 'none', items: [], reason: 'snapshot-invalid' }
+    }
+  }
 
-      items.push(...shard.items)
+  async readCompleteCategoryPage(
+    profileId: string,
+    section: LibrarySection,
+    categoryId: string,
+    page: number,
+    pageSize: number,
+  ): Promise<CompleteCategoryPageReadResult> {
+    const sectionCategories = await this.readCompleteSectionCategories(profileId, section)
+
+    if (sectionCategories.coverage === 'none') {
+      return { coverage: 'none', items: [], reason: sectionCategories.reason }
     }
 
-    return { coverage: 'complete', items }
+    const manifest = await this.getManifest(profileId, section)
+    const category = manifest?.categories.find((entry) => entry.categoryKey === categoryId)
+
+    if (!category || category.coverage !== 'complete') {
+      return { coverage: 'none', items: [], reason: 'category-unavailable' }
+    }
+
+    const safePageSize = positiveInteger(pageSize, 24)
+    const pageCount = Math.max(1, Math.ceil(category.itemCount / safePageSize))
+    const safePage = Math.max(0, Math.min(Math.floor(page), pageCount - 1))
+
+    try {
+      return {
+        coverage: 'complete',
+        items: await readCompleteCategorySnapshotItems(
+          await this.database(),
+          profileId,
+          section,
+          category,
+          safePage * safePageSize,
+          safePageSize,
+        ),
+        itemCount: category.itemCount,
+        page: safePage,
+        pageCount,
+      }
+    } catch {
+      return { coverage: 'none', items: [], reason: 'snapshot-invalid' }
+    }
   }
 
   async getSearchIndexMeta(
@@ -1736,9 +2226,8 @@ export class IndexedDbCatalogRepository {
     }
 
     const safeLimit = positiveInteger(resultLimit, 60)
-    const matches: StreamItem[] = []
+    const matchedPostings: SearchIndexPosting[] = []
     const seen = new Set<string>()
-    let matchedCount = 0
 
     for (let entryIndex = 0; entryIndex < entries.length; entryIndex += 1) {
       if (options.signal?.aborted) {
@@ -1756,32 +2245,9 @@ export class IndexedDbCatalogRepository {
       }
 
       seen.add(entry[4])
-      matchedCount += 1
+      matchedPostings.push(entry)
 
-      if (matches.length < safeLimit) {
-        const stream = await this.resolveSearchIndexPosting(
-          profileId,
-          section,
-          manifest,
-          entry,
-        )
-
-        if (!stream) {
-          return report({ coverage: 'none', matches: [], reason: 'index-invalid' }, entries.length)
-        }
-
-        matches.push(stream)
-
-        if (matches.length % 8 === 0 || matches.length === safeLimit) {
-          await options.onMatches?.({
-            matches: matches.slice(),
-            matchedCount,
-            postingCount: entries.length,
-          })
-        }
-      }
-
-      if (matches.length >= safeLimit && matchedCount > safeLimit) {
+      if (matchedPostings.length > safeLimit) {
         break
       }
 
@@ -1790,10 +2256,38 @@ export class IndexedDbCatalogRepository {
       }
     }
 
+    let matches: StreamItem[]
+
+    try {
+      /*
+       * Fetch every visible result's snapshot shard inside one readonly
+       * transaction. Resolving one posting at a time used to reintroduce a
+       * serial IDB round-trip for each of the 60 displayed cards, masking the
+       * cursor-based posting-read fix on physical webOS hardware.
+       */
+      matches = await readSearchIndexPostingStreams(
+        await this.database(),
+        profileId,
+        section,
+        manifest,
+        matchedPostings.slice(0, safeLimit),
+      )
+    } catch {
+      return report({ coverage: 'none', matches: [], reason: 'index-invalid' }, entries.length)
+    }
+
+    for (let count = 8; count < matches.length; count += 8) {
+      await options.onMatches?.({
+        matches: matches.slice(0, count),
+        matchedCount: matchedPostings.length,
+        postingCount: entries.length,
+      })
+    }
+
     if (matches.length) {
       await options.onMatches?.({
         matches: matches.slice(),
-        matchedCount,
+        matchedCount: matchedPostings.length,
         postingCount: entries.length,
       })
     }
@@ -1802,7 +2296,7 @@ export class IndexedDbCatalogRepository {
       {
         coverage: 'complete',
         matches,
-        limited: matchedCount > safeLimit,
+        limited: matchedPostings.length > safeLimit,
       },
       entries.length,
     )
@@ -1898,6 +2392,7 @@ export class IndexedDbCatalogRepository {
         itemCount: currentIndex.itemCount,
         postingCount: currentIndex.postingCount,
         legacyUntitledCount: currentIndex.legacyUntitledCount,
+        preMigrationZeroPrefixCount: currentIndex.preMigrationZeroPrefixCount,
         prefixPostingCounts: currentIndex.prefixPostingCounts,
         prefixShardCounts: currentIndex.prefixShardCounts,
         elapsedMs: monotonicNow() - startedAt,
@@ -1908,6 +2403,7 @@ export class IndexedDbCatalogRepository {
         itemCount: result.itemCount,
         postingCount: result.postingCount,
         legacyUntitledCount: result.legacyUntitledCount,
+        preMigrationZeroPrefixCount: result.preMigrationZeroPrefixCount,
         reused: true,
         elapsedMs: result.elapsedMs,
       })
@@ -1924,6 +2420,7 @@ export class IndexedDbCatalogRepository {
     let itemCount = 0
     let postingCount = 0
     let legacyUntitledCount = 0
+    let preMigrationZeroPrefixCount = 0
 
     await putRecord(database, 'searchIndexMeta', {
       schemaVersion: LIBRARY_SCHEMA_VERSION,
@@ -1935,6 +2432,7 @@ export class IndexedDbCatalogRepository {
       itemCount: 0,
       postingCount: 0,
       legacyUntitledCount: 0,
+      preMigrationZeroPrefixCount: 0,
       prefixPostingCounts: {},
       prefixShardCounts: {},
     } satisfies SearchIndexMetaRecord)
@@ -2040,10 +2538,16 @@ export class IndexedDbCatalogRepository {
 
           legacyUntitledCount += missingNameCount
 
+          let sliceStartedAt = monotonicNow()
+
           for (let snapshotItemIndex = 0; snapshotItemIndex < items.length; snapshotItemIndex += 1) {
             const item = items[snapshotItemIndex]
             const foldedName = item.searchName ?? foldText(item.name)
             const prefixes = searchIndexPrefixes(foldedName)
+
+            if (!legacyAsciiSearchIndexPrefixes(foldedName).length) {
+              preMigrationZeroPrefixCount += 1
+            }
 
             itemCount += 1
             postingCount += prefixes.length
@@ -2066,6 +2570,22 @@ export class IndexedDbCatalogRepository {
               bufferedPostingCount += 1
             }
 
+            /*
+             * Yield when this posting-generation slice has run long enough. The
+             * clock is read in coarse blocks so the check itself is not a cost;
+             * without this the loop walked an entire shard unyielded.
+             */
+            if (
+              (snapshotItemIndex & 255) === 255 &&
+              monotonicNow() - sliceStartedAt >= SEARCH_INDEX_WORK_SLICE_MS
+            ) {
+              if (signal?.aborted) {
+                throw new LibraryWriteAbortedError('Local search-index build was cancelled.')
+              }
+
+              await defaultYield()
+              sliceStartedAt = monotonicNow()
+            }
           }
 
           /*
@@ -2105,9 +2625,35 @@ export class IndexedDbCatalogRepository {
         itemCount,
         postingCount,
         legacyUntitledCount,
+        preMigrationZeroPrefixCount,
         prefixPostingCounts,
         prefixShardCounts,
       } satisfies SearchIndexMetaRecord)
+
+      /*
+       * The new generation is now the one readers resolve, so every earlier
+       * generation for this section is unreachable. Nothing used to delete them:
+       * each rebuild added a full generation of shards and left the previous one
+       * behind, so `searchIndexShards` grew without bound. Measured on the
+       * physical target before this fix: 68,800 records across 10 generations for
+       * two sections, of which only 2 generations were active - 55,192 orphaned
+       * records, and the largest store in an evictable cache by a wide margin.
+       *
+       * This runs after the meta record is published, so a failure here leaves
+       * extra rows to reclaim rather than an index readers cannot resolve.
+       */
+      const supersededShardsDeleted = await deleteSupersededSearchIndexShards(
+        database,
+        profileId,
+        section,
+        generation,
+        signal,
+      )
+      performanceTrace.event('library', 'local-search-index-generations-pruned', {
+        section,
+        generation,
+        supersededShardsDeleted,
+      })
 
       const result: SearchIndexBuildResult = {
         coverage: 'complete',
@@ -2115,6 +2661,7 @@ export class IndexedDbCatalogRepository {
         itemCount,
         postingCount,
         legacyUntitledCount,
+        preMigrationZeroPrefixCount,
         prefixPostingCounts,
         prefixShardCounts,
         elapsedMs: monotonicNow() - startedAt,
@@ -2125,6 +2672,7 @@ export class IndexedDbCatalogRepository {
         itemCount,
         postingCount,
         legacyUntitledCount,
+        preMigrationZeroPrefixCount,
         elapsedMs: result.elapsedMs,
       })
       return result
@@ -2135,44 +2683,6 @@ export class IndexedDbCatalogRepository {
 
       return unavailable('database-unavailable')
     }
-  }
-
-  private async resolveSearchIndexPosting(
-    profileId: string,
-    section: LibrarySection,
-    manifest: SectionManifestRecord,
-    posting: SearchIndexPosting,
-  ): Promise<StreamItem | null> {
-    const [categoryKey, snapshotShardIndex, snapshotItemIndex, snapshotUpdatedAt, streamKey] =
-      posting
-    const category = manifest.categories.find(
-      (candidate) => candidate.categoryKey === categoryKey,
-    )
-    const shardOffset = snapshotShardIndex - (category?.shardBase ?? 0)
-
-    if (
-      !category ||
-      shardOffset < 0 ||
-      shardOffset >= category.shardCount ||
-      category.updatedAt !== snapshotUpdatedAt
-    ) {
-      return null
-    }
-
-    const shard = await this.readCategoryShard(
-      profileId,
-      section,
-      category.categoryKey,
-      shardOffset,
-    )
-
-    if (shard.coverage === 'none') {
-      return null
-    }
-
-    const item = shard.items[snapshotItemIndex]
-
-    return item && favoriteKey(item) === streamKey ? item : null
   }
 
   async searchCompleteSectionLegacy(
@@ -2511,10 +3021,11 @@ export class IndexedDbCatalogRepository {
     }
   }
 
-  async putEpg(
+  async putEpg<T extends LibraryEpgValue>(
     profileId: string,
     streamId: string,
-    value: NowNext,
+    kind: LibraryEpgKind,
+    value: T,
     ttlMs: number,
   ): Promise<void> {
     const updatedAt = this.now()
@@ -2522,33 +3033,93 @@ export class IndexedDbCatalogRepository {
       schemaVersion: LIBRARY_SCHEMA_VERSION,
       profileId,
       streamId,
-      value,
+      kind,
+      value: stripCachedUrls(value),
       updatedAt,
       expiresAt: updatedAt + Math.max(0, ttlMs),
-    } satisfies EpgRecord)
+    } satisfies EpgRecord<T>)
   }
 
-  async getEpg(profileId: string, streamId: string): Promise<NowNext | null> {
+  async getEpg<T extends LibraryEpgValue>(
+    profileId: string,
+    streamId: string,
+    kind: LibraryEpgKind,
+  ): Promise<T | null> {
     try {
       const database = await this.database()
       const record = await getRecord<unknown>(
         database,
         'epg',
-        [profileId, streamId],
+        [profileId, streamId, kind],
       )
 
-      if (!isEpgRecord(record, profileId, streamId)) {
+      if (!isEpgRecord(record, profileId, streamId, kind)) {
         return null
       }
 
       if (record.expiresAt <= this.now()) {
-        await deleteRecord(database, 'epg', [profileId, streamId])
+        await deleteRecord(database, 'epg', [profileId, streamId, kind])
         return null
       }
 
-      return record.value
+      return record.value as T
     } catch {
       return null
+    }
+  }
+
+  /**
+   * Removes data that can be re-created without touching active catalog
+   * manifests/snapshots or localStorage user state. The order is intentional:
+   * programme cache, details cache, derived search data, then superseded shards.
+   */
+  async evictRebuildableData(profileId: string): Promise<RebuildableCacheEvictionResult> {
+    assertProfileId(profileId)
+    const database = await this.database()
+    const epgRecordsDeleted = await deleteProfileRowsWithCount(database, 'epg', profileId)
+    const detailRecordsDeleted = await deleteProfileRowsWithCount(database, 'details', profileId)
+    const searchIndexRecordsDeleted =
+      await deleteProfileRowsWithCount(database, 'searchIndexMeta', profileId) +
+      await deleteProfileRowsWithCount(database, 'searchIndexShards', profileId) +
+      await deleteProfileRowsWithCount(database, 'searchShards', profileId)
+    const manifests = await Promise.all(
+      (['live', 'vod', 'series'] as const).map((section) =>
+        this.getManifest(profileId, section),
+      ),
+    )
+    const supersededSnapshotRecordsDeleted = await deleteSupersededSnapshotRows(
+      database,
+      profileId,
+      manifests.filter((manifest): manifest is SectionManifestRecord => manifest !== null),
+    )
+
+    searchMemoryCache.clear()
+    snapshotMemoryCache.clear()
+
+    return {
+      epgRecordsDeleted,
+      detailRecordsDeleted,
+      searchIndexRecordsDeleted,
+      supersededSnapshotRecordsDeleted,
+    }
+  }
+
+  /**
+   * Estimates the profile's IndexedDB footprint without serializing provider
+   * credentials, playback URLs, or catalog values outside the database.
+   * The value is used only when StorageManager does not expose a device quota.
+   */
+  async estimateProfileStorage(profileId: string): Promise<ProfileLibraryStorageEstimate> {
+    assertProfileId(profileId)
+    const database = await this.database()
+    const estimates = await Promise.all(
+      LIBRARY_STORE_NAMES.map((storeName) =>
+        estimateProfileStoreBytes(database, storeName, profileId),
+      ),
+    )
+
+    return {
+      byteEstimate: estimates.reduce((total, estimate) => total + estimate, 0),
     }
   }
 
@@ -2658,7 +3229,13 @@ export class IndexedDbCatalogRepository {
 
   private database(): Promise<IDBDatabase> {
     if (!this.databasePromise) {
-      this.databasePromise = openLibraryDatabase(this.databaseName)
+      const opening = openLibraryDatabase(this.databaseName)
+      this.databasePromise = opening
+      void opening.catch(() => {
+        if (this.databasePromise === opening) {
+          this.databasePromise = null
+        }
+      })
     }
 
     return this.databasePromise
@@ -2677,13 +3254,18 @@ function createStore(
 
 function searchIndexPrefixes(value: string): string[] {
   const prefixes = new Set<string>()
-  const words = foldText(value).match(/[a-z0-9]{2,}/g) ?? []
 
-  for (const word of words) {
-    const prefix = searchIndexPrefixForToken(word)
+  for (const token of searchTokens(value)) {
+    const characters = Array.from(token)
 
-    if (prefix) {
-      prefixes.add(prefix)
+    /*
+     * Keep one posting per token at the rarest-prefix selection width. Retaining
+     * all 1/2/3-character variants tripled the VOD migration footprint on the
+     * physical webOS device; one-character queries therefore remain an explicit
+     * local-search limitation rather than ballooning every persistent index.
+     */
+    if (characters.length >= 2) {
+      prefixes.add(characters.slice(0, Math.min(3, characters.length)).join(''))
     }
   }
 
@@ -2691,14 +3273,16 @@ function searchIndexPrefixes(value: string): string[] {
 }
 
 function searchIndexPrefixForToken(token: string): string | null {
-  const folded = foldText(token)
-  const match = folded.match(/[a-z0-9]{2,}/)
+  const characters = Array.from(searchTokens(token)[0] ?? '')
 
-  if (!match) {
-    return null
-  }
+  return characters.length >= 2
+    ? characters.slice(0, Math.min(3, characters.length)).join('')
+    : null
+}
 
-  return match[0].slice(0, Math.min(3, match[0].length))
+/** The retired v1 tokenizer, retained only to audit its local migration impact. */
+function legacyAsciiSearchIndexPrefixes(value: string): string[] {
+  return foldText(value).match(/[a-z0-9]{2,}/g) ?? []
 }
 
 async function putSearchIndexShardBatch(
@@ -2720,6 +3304,132 @@ async function putSearchIndexShardBatch(
   await complete
 }
 
+/**
+ * Deletes every `searchIndexShards` row for a section whose generation is not the
+ * currently active one. Readers require an exact generation match, so these rows
+ * are unreachable; leaving them made a rebuildable cache grow without bound.
+ *
+ * Deletion is cooperative: it yields between bounded batches and stops for
+ * playback or cancellation, leaving the remainder for the next rebuild or for
+ * `evictRebuildableData()`.
+ */
+async function deleteSupersededSearchIndexShards(
+  database: IDBDatabase,
+  profileId: string,
+  section: LibrarySection,
+  activeGeneration: number,
+  signal?: AbortSignal,
+): Promise<number> {
+  const writeEpoch = playbackEpoch
+  let deleted = 0
+
+  for (;;) {
+    if (!canContinueBackgroundCleanup(writeEpoch, signal)) {
+      return deleted
+    }
+
+    const staleKeys = await collectSupersededSearchIndexKeys(
+      database,
+      profileId,
+      section,
+      activeGeneration,
+      SEARCH_INDEX_WRITE_RECORD_BATCH_SIZE,
+    )
+
+    if (!staleKeys.length) {
+      return deleted
+    }
+
+    const transaction = database.transaction('searchIndexShards', 'readwrite')
+    const complete = transactionComplete(transaction)
+    const store = transaction.objectStore('searchIndexShards')
+
+    for (const key of staleKeys) {
+      store.delete(key)
+    }
+
+    await complete
+    deleted += staleKeys.length
+    await defaultYield()
+  }
+}
+
+function collectSupersededSearchIndexKeys(
+  database: IDBDatabase,
+  profileId: string,
+  section: LibrarySection,
+  activeGeneration: number,
+  limit: number,
+): Promise<IDBValidKey[]> {
+  return new Promise<IDBValidKey[]>((resolve, reject) => {
+    const transaction = database.transaction('searchIndexShards', 'readonly')
+    const store = transaction.objectStore('searchIndexShards')
+    /*
+     * Key order is [profileId, section, generation, prefix, shardIndex], so one
+     * bounded range per section covers every generation for it.
+     */
+    const request = store.openKeyCursor(
+      IDBKeyRange.bound(
+        [profileId, section],
+        [profileId, section, Number.MAX_SAFE_INTEGER, [], Number.MAX_SAFE_INTEGER],
+      ),
+    )
+    const keys: IDBValidKey[] = []
+    let failed = false
+
+    const rejectOnce = (reason: unknown): void => {
+      if (!failed) {
+        failed = true
+        reject(reason)
+      }
+    }
+
+    request.onerror = () =>
+      rejectOnce(request.error ?? new Error('Unable to scan search index generations.'))
+    transaction.onerror = () =>
+      rejectOnce(transaction.error ?? new Error('Unable to scan search index generations.'))
+    transaction.onabort = () =>
+      rejectOnce(transaction.error ?? new Error('Search index generation scan was aborted.'))
+    transaction.oncomplete = () => {
+      if (!failed) {
+        resolve(keys)
+      }
+    }
+
+    request.onsuccess = () => {
+      const cursor = request.result
+
+      if (!cursor) {
+        return
+      }
+
+      const key = cursor.key
+
+      /*
+       * The active generation is a single contiguous block in key order. Stepping
+       * through every one of its shards to prove they are current made this scan
+       * walk the whole live index (hundreds of thousands of keys at VOD scale).
+       * When the cursor lands inside the active generation, jump past it in one
+       * seek instead, so only genuinely superseded generations are visited.
+       */
+      if (Array.isArray(key) && key[2] === activeGeneration) {
+        cursor.continue([profileId, section, activeGeneration + 1])
+        return
+      }
+
+      if (Array.isArray(key)) {
+        keys.push(key as IDBValidKey)
+      }
+
+      if (keys.length >= limit) {
+        return
+      }
+
+      cursor.continue()
+    }
+  })
+}
+
 async function readSearchIndexPostings(
   database: IDBDatabase,
   profileId: string,
@@ -2728,29 +3438,313 @@ async function readSearchIndexPostings(
   prefix: string,
   shardCount: number,
 ): Promise<SearchIndexPosting[]> {
-  const postings: SearchIndexPosting[] = []
-
-  for (let shardIndex = 0; shardIndex < shardCount; shardIndex += 1) {
-    const record = await getRecord<unknown>(
-      database,
-      'searchIndexShards',
-      [profileId, section, generation, prefix, shardIndex],
-    )
-
-    if (!isSearchIndexShardRecord(record, profileId, section, generation, prefix, shardIndex)) {
-      throw new Error('Local search index shard is unavailable.')
-    }
-
-    const parsed = parseSearchIndexPostings(record)
-
-    if (!parsed) {
-      throw new Error('Local search index shard is invalid.')
-    }
-
-    postings.push(...parsed)
+  if (shardCount < 1) {
+    return []
   }
 
-  return postings
+  return new Promise<SearchIndexPosting[]>((resolve, reject) => {
+    const transaction = database.transaction('searchIndexShards', 'readonly')
+    const store = transaction.objectStore('searchIndexShards')
+    const range = IDBKeyRange.bound(
+      [profileId, section, generation, prefix, 0],
+      [profileId, section, generation, prefix, shardCount - 1],
+    )
+    const postings: SearchIndexPosting[] = []
+    let expectedShardIndex = 0
+    let completed = false
+
+    const fail = (reason: unknown): void => {
+      if (!completed) {
+        completed = true
+        reject(reason)
+      }
+    }
+
+    transaction.oncomplete = () => {
+      if (!completed) {
+        if (expectedShardIndex !== shardCount) {
+          fail(new Error('Local search index shard is unavailable.'))
+          return
+        }
+        completed = true
+        resolve(postings)
+      }
+    }
+    transaction.onabort = () =>
+      fail(transaction.error ?? new Error('Local search index transaction was aborted.'))
+    transaction.onerror = () =>
+      fail(transaction.error ?? new Error('Local search index transaction failed.'))
+
+    const request = store.openCursor(range)
+    request.onerror = () =>
+      fail(request.error ?? new Error('Unable to read local search index shards.'))
+    request.onsuccess = () => {
+      const cursor = request.result
+
+      if (!cursor) {
+        return
+      }
+
+      const record = cursor.value
+
+      if (
+        !isSearchIndexShardRecord(
+          record,
+          profileId,
+          section,
+          generation,
+          prefix,
+          expectedShardIndex,
+        )
+      ) {
+        fail(new Error('Local search index shard is invalid.'))
+        try {
+          transaction.abort()
+        } catch {
+          // The readonly transaction may already be completing.
+        }
+        return
+      }
+
+      const parsed = parseSearchIndexPostings(record)
+
+      if (!parsed) {
+        fail(new Error('Local search index shard payload is invalid.'))
+        try {
+          transaction.abort()
+        } catch {
+          // The readonly transaction may already be completing.
+        }
+        return
+      }
+
+      postings.push(...parsed)
+      expectedShardIndex += 1
+      cursor.continue()
+    }
+  })
+}
+
+async function readSearchIndexPostingStreams(
+  database: IDBDatabase,
+  profileId: string,
+  section: LibrarySection,
+  manifest: SectionManifestRecord,
+  postings: readonly SearchIndexPosting[],
+): Promise<StreamItem[]> {
+  if (!postings.length) {
+    return []
+  }
+
+  const categories = new Map(
+    manifest.categories.map((category) => [category.categoryKey, category]),
+  )
+  const snapshots = new Map<
+    string,
+    {
+      category: CategoryManifestEntry
+      snapshotShardIndex: number
+    }
+  >()
+
+  for (const posting of postings) {
+    if (!isSearchIndexPosting(posting)) {
+      throw new Error('Local search index posting is invalid.')
+    }
+
+    const [categoryKey, snapshotShardIndex, , snapshotUpdatedAt] = posting
+    const category = categories.get(categoryKey)
+    const shardOffset = snapshotShardIndex - (category?.shardBase ?? 0)
+
+    if (
+      !category ||
+      shardOffset < 0 ||
+      shardOffset >= category.shardCount ||
+      category.updatedAt !== snapshotUpdatedAt
+    ) {
+      throw new Error('Local search index posting references an unavailable snapshot.')
+    }
+
+    const key = snapshotReadKey(categoryKey, snapshotShardIndex)
+
+    if (!snapshots.has(key)) {
+      snapshots.set(key, { category, snapshotShardIndex })
+    }
+  }
+
+  const transaction = database.transaction('snapshots', 'readonly')
+  const complete = transactionComplete(transaction)
+  const store = transaction.objectStore('snapshots')
+  const requests = [...snapshots.entries()].map(([key, snapshot]) => ({
+    key,
+    snapshot,
+    request: store.get([
+      profileId,
+      section,
+      snapshot.category.categoryKey,
+      snapshot.snapshotShardIndex,
+    ]),
+  }))
+
+  /*
+   * Queue all reads synchronously before awaiting so older webOS engines keep
+   * the transaction alive and the visible result page costs one IDB read.
+   */
+  const records = await Promise.all(
+    requests.map(({ request }) => requestResult<unknown>(request)),
+  )
+  await complete
+
+  const itemsBySnapshot = new Map<string, StreamItem[]>()
+
+  for (let index = 0; index < requests.length; index += 1) {
+    const { key, snapshot } = requests[index]
+    const record = records[index]
+
+    if (
+      !isSnapshotRecord(
+        record,
+        profileId,
+        section,
+        snapshot.category.categoryKey,
+        snapshot.snapshotShardIndex,
+      ) ||
+      record.updatedAt !== snapshot.category.updatedAt
+    ) {
+      throw new Error('Local search index snapshot is unavailable.')
+    }
+
+    const items = parseSnapshotItems(record)
+
+    if (!items) {
+      throw new Error('Local search index snapshot payload is invalid.')
+    }
+
+    itemsBySnapshot.set(key, items)
+  }
+
+  return postings.map((posting) => {
+    const [categoryKey, snapshotShardIndex, snapshotItemIndex, , streamKey] = posting
+    const item = itemsBySnapshot
+      .get(snapshotReadKey(categoryKey, snapshotShardIndex))
+      ?.[snapshotItemIndex]
+
+    if (!item || favoriteKey(item) !== streamKey) {
+      throw new Error('Local search index posting does not match its authoritative snapshot.')
+    }
+
+    return item
+  })
+}
+
+function readCompleteCategorySnapshotItems(
+  database: IDBDatabase,
+  profileId: string,
+  section: LibrarySection,
+  category: CategoryManifestEntry,
+  offset = 0,
+  limit = Number.MAX_SAFE_INTEGER,
+): Promise<StreamItem[]> {
+  const shardBase = category.shardBase ?? 0
+  const start = Math.max(0, Math.floor(offset))
+  const maximum = Math.max(0, Math.floor(limit))
+
+  return new Promise<StreamItem[]>((resolve, reject) => {
+    const transaction = database.transaction('snapshots', 'readonly')
+    const store = transaction.objectStore('snapshots')
+    const range = IDBKeyRange.bound(
+      [profileId, section, category.categoryKey, shardBase],
+      [profileId, section, category.categoryKey, shardBase + category.shardCount - 1],
+    )
+    const items: StreamItem[] = []
+    let expectedShardIndex = shardBase
+    let skipped = 0
+    let windowSatisfied = false
+    let completed = false
+
+    const fail = (reason: unknown): void => {
+      if (!completed) {
+        completed = true
+        reject(reason)
+      }
+    }
+
+    transaction.oncomplete = () => {
+      if (!completed) {
+        if (!windowSatisfied && expectedShardIndex !== shardBase + category.shardCount) {
+          fail(new Error('Category snapshot shard is unavailable.'))
+          return
+        }
+        completed = true
+        resolve(items)
+      }
+    }
+    transaction.onabort = () =>
+      fail(transaction.error ?? new Error('Category snapshot transaction was aborted.'))
+    transaction.onerror = () =>
+      fail(transaction.error ?? new Error('Category snapshot transaction failed.'))
+
+    const request = store.openCursor(range)
+    request.onerror = () =>
+      fail(request.error ?? new Error('Unable to read category snapshot shards.'))
+    request.onsuccess = () => {
+      const cursor = request.result
+
+      if (!cursor) {
+        return
+      }
+
+      const record = cursor.value
+
+      if (
+        !isSnapshotRecord(
+          record,
+          profileId,
+          section,
+          category.categoryKey,
+          expectedShardIndex,
+        ) ||
+        record.updatedAt !== category.updatedAt
+      ) {
+        fail(new Error('Category snapshot shard is unavailable.'))
+        try {
+          transaction.abort()
+        } catch {
+          // The readonly transaction may already be completing.
+        }
+        return
+      }
+
+      const parsed = parseSnapshotItems(record)
+
+      if (!parsed) {
+        fail(new Error('Category snapshot payload is invalid.'))
+        try {
+          transaction.abort()
+        } catch {
+          // The readonly transaction may already be completing.
+        }
+        return
+      }
+
+      for (const item of parsed) {
+        if (skipped < start) {
+          skipped += 1
+        } else if (items.length < maximum) {
+          items.push(item)
+        }
+      }
+
+      expectedShardIndex += 1
+
+      if (items.length >= maximum) {
+        windowSatisfied = true
+        return
+      }
+
+      cursor.continue()
+    }
+  })
 }
 
 function countLegacyMissingNames(record: SnapshotRecord): number | null {
@@ -2799,6 +3793,7 @@ function isSearchIndexMetaRecord(
     isNonNegativeInteger(value.itemCount) &&
     isNonNegativeInteger(value.postingCount) &&
     isNonNegativeInteger(value.legacyUntitledCount) &&
+    isNonNegativeInteger(value.preMigrationZeroPrefixCount) &&
     isRecord(value.prefixPostingCounts) &&
     Object.values(value.prefixPostingCounts).every(isNonNegativeInteger) &&
     isRecord(value.prefixShardCounts) &&
@@ -3108,6 +4103,179 @@ function deleteProfileRows(store: IDBObjectStore, profileId: string): Promise<vo
   })
 }
 
+async function deleteProfileRowsWithCount(
+  database: IDBDatabase,
+  storeName: LibraryStoreName,
+  profileId: string,
+): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const transaction = database.transaction(storeName, 'readwrite')
+    const store = transaction.objectStore(storeName)
+    const request = store.openCursor()
+    let deleted = 0
+    let failed = false
+
+    const rejectOnce = (reason: unknown): void => {
+      if (!failed) {
+        failed = true
+        reject(reason)
+      }
+    }
+
+    request.onerror = () =>
+      rejectOnce(request.error ?? new Error('Unable to evict profile library records.'))
+    transaction.onerror = () =>
+      rejectOnce(transaction.error ?? new Error('Profile library eviction failed.'))
+    transaction.onabort = () =>
+      rejectOnce(transaction.error ?? new Error('Profile library eviction was aborted.'))
+    transaction.oncomplete = () => {
+      if (!failed) {
+        resolve(deleted)
+      }
+    }
+    request.onsuccess = () => {
+      const cursor = request.result
+
+      if (!cursor) {
+        return
+      }
+
+      if (Array.isArray(cursor.primaryKey) && cursor.primaryKey[0] === profileId) {
+        cursor.delete()
+        deleted += 1
+      }
+
+      cursor.continue()
+    }
+  })
+}
+
+async function estimateProfileStoreBytes(
+  database: IDBDatabase,
+  storeName: LibraryStoreName,
+  profileId: string,
+): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const transaction = database.transaction(storeName, 'readonly')
+    const store = transaction.objectStore(storeName)
+    const request = store.openCursor()
+    let byteEstimate = 0
+    let failed = false
+
+    const rejectOnce = (reason: unknown): void => {
+      if (!failed) {
+        failed = true
+        reject(reason)
+      }
+    }
+
+    request.onerror = () =>
+      rejectOnce(request.error ?? new Error(`Unable to estimate ${storeName} storage.`))
+    transaction.onerror = () =>
+      rejectOnce(transaction.error ?? new Error(`Unable to estimate ${storeName} storage.`))
+    transaction.onabort = () =>
+      rejectOnce(transaction.error ?? new Error(`Estimating ${storeName} storage was aborted.`))
+    transaction.oncomplete = () => {
+      if (!failed) {
+        resolve(byteEstimate)
+      }
+    }
+    request.onsuccess = () => {
+      const cursor = request.result
+
+      if (!cursor) {
+        return
+      }
+
+      const primaryKey = cursor.primaryKey
+      const belongsToProfile =
+        primaryKey === profileId || (Array.isArray(primaryKey) && primaryKey[0] === profileId)
+
+      if (belongsToProfile) {
+        try {
+          byteEstimate += utf8ByteLength(JSON.stringify(cursor.value))
+        } catch {
+          // A malformed cache row cannot be safely measured, so leave it for
+          // normal schema recovery rather than treating it as provider work.
+        }
+      }
+
+      cursor.continue()
+    }
+  })
+}
+
+async function deleteSupersededSnapshotRows(
+  database: IDBDatabase,
+  profileId: string,
+  manifests: readonly SectionManifestRecord[],
+): Promise<number> {
+  const activeKeys = new Set<string>()
+
+  for (const manifest of manifests) {
+    for (const category of manifest.categories) {
+      for (let offset = 0; offset < category.shardCount; offset += 1) {
+        activeKeys.add(
+          `${manifest.section}\u0000${category.categoryKey}\u0000${(category.shardBase ?? 0) + offset}`,
+        )
+      }
+    }
+  }
+
+  return new Promise<number>((resolve, reject) => {
+    const transaction = database.transaction('snapshots', 'readwrite')
+    const store = transaction.objectStore('snapshots')
+    const request = store.openCursor()
+    let deleted = 0
+    let failed = false
+
+    const rejectOnce = (reason: unknown): void => {
+      if (!failed) {
+        failed = true
+        reject(reason)
+      }
+    }
+
+    request.onerror = () =>
+      rejectOnce(request.error ?? new Error('Unable to evict superseded snapshots.'))
+    transaction.onerror = () =>
+      rejectOnce(transaction.error ?? new Error('Superseded snapshot eviction failed.'))
+    transaction.onabort = () =>
+      rejectOnce(transaction.error ?? new Error('Superseded snapshot eviction was aborted.'))
+    transaction.oncomplete = () => {
+      if (!failed) {
+        resolve(deleted)
+      }
+    }
+    request.onsuccess = () => {
+      const cursor = request.result
+
+      if (!cursor) {
+        return
+      }
+
+      const value = cursor.value as Partial<SnapshotRecord>
+      const activeKey =
+        typeof value.section === 'string' &&
+        typeof value.categoryKey === 'string' &&
+        typeof value.shardIndex === 'number'
+          ? `${value.section}\u0000${value.categoryKey}\u0000${value.shardIndex}`
+          : null
+
+      if (
+        Array.isArray(cursor.primaryKey) &&
+        cursor.primaryKey[0] === profileId &&
+        (!activeKey || !activeKeys.has(activeKey))
+      ) {
+        cursor.delete()
+        deleted += 1
+      }
+
+      cursor.continue()
+    }
+  })
+}
+
 async function putCooperativeRecord(
   database: IDBDatabase,
   storeName: 'snapshots' | 'searchShards',
@@ -3269,6 +4437,14 @@ function toCachedStream(stream: StreamItem): StreamItem {
    * endpoints. Preserve the identity and search fields after recursively
    * removing URL-bearing optional metadata so a title cannot make an otherwise
    * complete local shard unreadable.
+   *
+   * Artwork endpoints (icon/cover/seriesCover) are also legitimate display
+   * data, not credentialed transport. The recursive strip removes them because
+   * they are URL-like, which left cached snapshots with no poster/logo source
+   * and forced every browse/search card to a text placeholder. The credentialed
+   * playback URL (directSource) is excluded separately above, and the same
+   * artwork fields are already persisted for favorites/resume via
+   * toStoredStream, so restore them here from the whitelisted stored record.
    */
   return {
     ...sanitized,
@@ -3276,8 +4452,24 @@ function toCachedStream(stream: StreamItem): StreamItem {
     name: stored.name,
     section: stored.section,
     categoryId: stored.categoryId,
+    icon: retainedArtwork(stored.icon),
+    cover: retainedArtwork(stored.cover),
+    seriesCover: retainedArtwork(stored.seriesCover),
     searchName: stored.searchName,
+    // Preserve the guide-mapping identifier verbatim. It is a plain token, not
+    // credentialed transport, but a scheme-like value (e.g. "sky:sports") could
+    // otherwise be dropped by the URL-like recursive strip above.
+    epgChannelId: stored.epgChannelId,
   }
+}
+
+/**
+ * Preserve a provider artwork endpoint verbatim, or return undefined when the
+ * field is absent. Keeping the key undefined rather than an empty string lets
+ * the renderer fall through to its text/monogram placeholder cleanly.
+ */
+function retainedArtwork(value: string | undefined): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
 function toCachedDetails<T extends LibraryDetails>(value: T): T {
@@ -3300,6 +4492,10 @@ function toCachedDetails<T extends LibraryDetails>(value: T): T {
 }
 
 function stripCachedUrls<T>(value: T): T {
+  if (value instanceof Date) {
+    return new Date(value.getTime()) as T
+  }
+
   if (Array.isArray(value)) {
     return value.map(stripCachedUrls) as T
   }
@@ -3551,6 +4747,7 @@ function isEpgRecord(
   value: unknown,
   profileId: string,
   streamId: string,
+  kind: LibraryEpgKind,
 ): value is EpgRecord {
   if (!isRecord(value)) {
     return false
@@ -3560,6 +4757,7 @@ function isEpgRecord(
     value.schemaVersion === LIBRARY_SCHEMA_VERSION &&
     value.profileId === profileId &&
     value.streamId === streamId &&
+    value.kind === kind &&
     isFiniteNumber(value.updatedAt) &&
     isFiniteNumber(value.expiresAt) &&
     'value' in value
@@ -3577,7 +4775,27 @@ function isSyncSectionState(value: unknown): value is LibrarySyncSectionState {
     isNonNegativeInteger(value.nextCategoryCursor) &&
     (value.lastAttemptAt === undefined || isFiniteNumber(value.lastAttemptAt)) &&
     (value.lastSuccessAt === undefined || isFiniteNumber(value.lastSuccessAt)) &&
-    (value.lastFailureAt === undefined || isFiniteNumber(value.lastFailureAt))
+    (value.lastFailureAt === undefined || isFiniteNumber(value.lastFailureAt)) &&
+    (value.lastFailureDetail === undefined || isSyncSectionFailureDetail(value.lastFailureDetail))
+  )
+}
+
+function isSyncSectionFailureDetail(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false
+  }
+
+  return (
+    typeof value.failureStage === 'string' &&
+    typeof value.failureKind === 'string' &&
+    isFiniteNumber(value.updatedAt) &&
+    (value.rawItemCount === undefined || isNonNegativeInteger(value.rawItemCount)) &&
+    (value.acceptedItemCount === undefined || isNonNegativeInteger(value.acceptedItemCount)) &&
+    (value.streamedRecordCount === undefined || isNonNegativeInteger(value.streamedRecordCount)) &&
+    (value.bytesReceived === undefined || isNonNegativeInteger(value.bytesReceived)) &&
+    (value.arrayClosed === undefined || typeof value.arrayClosed === 'boolean') &&
+    (value.elapsedMs === undefined || isFiniteNumber(value.elapsedMs)) &&
+    (value.refused === undefined || typeof value.refused === 'boolean')
   )
 }
 

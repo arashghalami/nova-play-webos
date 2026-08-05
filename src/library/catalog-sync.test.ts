@@ -4,8 +4,15 @@ import { ProviderError } from '../provider-error'
 import { performanceTrace } from '../performance-trace'
 import { ProviderBroker } from '../provider-broker'
 import { FixtureProviderTransport } from '../provider-transport'
-import type { Category, LibrarySection, StreamItem, XtreamProfile } from '../types'
-import type { StreamScanOptions } from '../xtream-client'
+import type {
+  Category,
+  LibrarySection,
+  NowNext,
+  StreamItem,
+  VodDetails,
+  XtreamProfile,
+} from '../types'
+import type { SectionScanResult, StreamScanOptions } from '../xtream-client'
 import {
   CatalogSyncCoordinator,
   VOD_SYNC_MEASUREMENT_MAX_RESPONSE_BYTES,
@@ -14,6 +21,7 @@ import {
 import {
   IndexedDbCatalogRepository,
   deleteLibraryDatabase,
+  type SnapshotPublishStage,
 } from './catalog-repository'
 
 class MemoryStorage implements Storage {
@@ -95,10 +103,28 @@ describe('CatalogSyncCoordinator', () => {
       dailyRequestBudget: 6,
     })
 
-    const result = await new CatalogSyncCoordinator(broker, repository).sync(
-      fixtureProfile.id,
-    )
+    const progress: Array<{
+      stage: string
+      section?: LibrarySection
+      itemsAcquired?: number
+    }> = []
+    const result = await new CatalogSyncCoordinator(broker, repository, {
+      onProgress: (event) => progress.push(event),
+    }).sync(fixtureProfile.id)
 
+    expect(progress).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ stage: 'starting' }),
+        expect.objectContaining({ stage: 'categories', section: 'live' }),
+        expect.objectContaining({ stage: 'scanning', section: 'vod' }),
+        expect.objectContaining({
+          stage: 'section-complete',
+          section: 'series',
+          itemsAcquired: 1,
+        }),
+        expect.objectContaining({ stage: 'finishing' }),
+      ]),
+    )
     expect(result).toMatchObject({
       status: 'completed',
       requestCount: 6,
@@ -155,6 +181,77 @@ describe('CatalogSyncCoordinator', () => {
       interactive: { used: 0 },
       sync: { used: 5, remaining: 1 },
     })
+  })
+
+  it('evicts only rebuildable cache records before provider sync when storage headroom is low', async () => {
+    const repository = createRepository()
+    const provider = new FixtureCatalogProvider()
+    let estimateCallCount = 0
+
+    vi.stubGlobal('navigator', {
+      storage: {
+        estimate: vi.fn(async () => {
+          estimateCallCount += 1
+          const mib = 1024 * 1024
+          return estimateCallCount === 1
+            ? { usage: 390 * mib, quota: 400 * mib }
+            : { usage: 100 * mib, quota: 400 * mib }
+        }),
+      },
+    })
+
+    await repository.putSectionManifest('profile-a', 'live', [
+      { id: 'live-a', name: 'Live A' },
+    ])
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'live',
+      category: { id: 'live-a', name: 'Live A' },
+      items: [stream('live-existing', 'live', 'live-a')],
+    })
+    await repository.putDetails<VodDetails>(
+      'profile-a',
+      'vod',
+      'vod-details',
+      { id: 'vod-details', metadata: {} },
+      60_000,
+    )
+    await repository.putEpg<NowNext>(
+      'profile-a',
+      'live-existing',
+      'now-next',
+      {
+        now: {
+          title: 'Current',
+          start: new Date(0),
+          end: new Date(1),
+        },
+      },
+      60_000,
+    )
+
+    const result = await new CatalogSyncCoordinator(provider, repository).sync('profile-a')
+
+    expect(result).toMatchObject({
+      status: 'completed',
+      requestCount: 6,
+      storage: {
+        state: 'ready',
+        before: { allowed: false, source: 'navigator' },
+        after: { allowed: true, source: 'navigator' },
+        eviction: {
+          epgRecordsDeleted: 1,
+          detailRecordsDeleted: 1,
+        },
+      },
+    })
+    await expect(repository.getDetails('profile-a', 'vod', 'vod-details')).resolves.toBeNull()
+    await expect(repository.getEpg('profile-a', 'live-existing', 'now-next')).resolves.toBeNull()
+    await expect(repository.readCompleteCategory('profile-a', 'live', 'live-a')).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'live-a-1' })],
+    })
+    expect(provider.calls).toHaveLength(6)
   })
 
   it('runs an explicit VOD-only measurement from the persisted manifest in one request', async () => {
@@ -474,23 +571,32 @@ describe('CatalogSyncCoordinator', () => {
   it('records bounded probe-only detail for an internal snapshot publication fault', async () => {
     const repository = createRepository()
     const provider = new FixtureCatalogProvider()
-    const originalAppend = repository.appendPartialCategorySnapshot.bind(repository)
+    const originalOpen = repository.openPartialSectionPublication.bind(repository)
     const appendSpy = vi
-      .spyOn(repository, 'appendPartialCategorySnapshot')
-      .mockImplementation(async (input, options) => {
-        if (input.section === 'live') {
-          options?.onPublishStage?.('manifest-put')
-          const error = new ReferenceError(
-            'structuredClone is not defined at https://fixture-user:fixture-password@private.invalid/',
-          )
-          error.stack =
-            'ReferenceError: structuredClone is not defined\\n' +
-            '    at publish (app.js:101:22)\\n' +
-            '    at coordinator (app.js:99:4)'
-          throw error
+      .spyOn(repository, 'openPartialSectionPublication')
+      .mockImplementation(async (profileId, section, runId) => {
+        const publication = await originalOpen(profileId, section, runId)
+
+        if (section !== 'live') {
+          return publication
         }
 
-        return originalAppend(input, options)
+        return Object.assign(Object.create(Object.getPrototypeOf(publication)), publication, {
+          appendCategoryItems: async (
+            _input: unknown,
+            options?: { onPublishStage?: (stage: SnapshotPublishStage) => void },
+          ) => {
+            options?.onPublishStage?.('manifest-put')
+            const error = new ReferenceError(
+              'structuredClone is not defined at https://fixture-user:fixture-password@private.invalid/',
+            )
+            error.stack =
+              'ReferenceError: structuredClone is not defined\\n' +
+              '    at publish (app.js:101:22)\\n' +
+              '    at coordinator (app.js:99:4)'
+            throw error
+          },
+        })
       })
     performanceTrace.enable()
     performanceTrace.clear()
@@ -527,7 +633,7 @@ describe('CatalogSyncCoordinator', () => {
     }
   })
 
-  it('persists a durable partial category snapshot after an interrupted first section scan and resumes the first incomplete category', async () => {
+  it('leaves an interrupted first section scan non-authoritative and resumes the first incomplete category', async () => {
     let now = 1_000
     const repository = createRepository(() => now)
     const provider = new FixtureCatalogProvider()
@@ -538,13 +644,18 @@ describe('CatalogSyncCoordinator', () => {
     const failed = await coordinator.sync('profile-a')
 
     expect(failed).toMatchObject({ status: 'failed', requestCount: 6 })
+    /*
+     * Streamed shards stay durable in the snapshots store, but the manifest is
+     * written only at the closed-array commit, so an interrupted run publishes
+     * no category pointer at all.
+     */
     expect((await repository.getManifest('profile-a', 'vod'))?.coverage).toMatchObject({
-      state: 'partial',
+      state: 'none',
       completeCategoryCount: 0,
-      itemCount: 128,
+      itemCount: 0,
     })
     expect((await repository.getMeta('profile-a'))?.sync.sections?.vod).toMatchObject({
-      coverage: 'partial',
+      coverage: 'none',
       wholeSectionFailureCount: 1,
       nextCategoryCursor: 0,
     })
@@ -601,6 +712,307 @@ describe('CatalogSyncCoordinator', () => {
     })
   })
 
+  it('persists per-section failure detail that survives later sections succeeding', async () => {
+    let now = 1_000
+    const repository = createRepository(() => now)
+    const provider = new FixtureCatalogProvider()
+    // VOD fails; live and series (which run after in the plan order) succeed.
+    provider.failScans.add('vod')
+    const coordinator = new CatalogSyncCoordinator(provider, repository, { now: () => now })
+
+    const result = await coordinator.sync('profile-a')
+
+    expect(result).toMatchObject({ status: 'failed' })
+    const meta = await repository.getMeta('profile-a')
+    // The single global breadcrumb would be overwritten by the later successes;
+    // the per-section detail must still name VOD's failure.
+    const vod = meta?.sync.sections?.vod
+    expect(vod?.wholeSectionFailureCount).toBe(1)
+    expect(vod?.lastFailureDetail).toMatchObject({
+      failureStage: 'provider-scan',
+      failureKind: 'provider:server',
+    })
+    expect(typeof vod?.lastFailureDetail?.updatedAt).toBe('number')
+    // Sections that succeeded carry no failure detail.
+    expect(meta?.sync.sections?.live?.lastFailureDetail).toBeUndefined()
+    expect(meta?.sync.sections?.series?.lastFailureDetail).toBeUndefined()
+  })
+
+  it('gives VOD a larger scan deadline than the smaller sections', async () => {
+    const repository = createRepository()
+    const provider = new FixtureCatalogProvider()
+    const coordinator = new CatalogSyncCoordinator(provider, repository)
+
+    await coordinator.sync('profile-a')
+
+    const timeoutFor = (section: LibrarySection): number | undefined => {
+      const opts = provider.scanOptions.find(
+        (o) => !o.categoryId && provider.scanSections.get(o) === section,
+      )
+      return opts?.timeoutMs
+    }
+    // VOD's deadline must exceed Live's, so the largest response is not starved.
+    const vodTimeout = timeoutFor('vod')
+    const liveTimeout = timeoutFor('live')
+    expect(vodTimeout).toBeGreaterThan(liveTimeout ?? 0)
+    expect(liveTimeout).toBe(120_000)
+    expect(vodTimeout).toBe(420_000)
+  })
+
+  it('preserves an authoritative complete section when a refresh scan yields zero identifiable records', async () => {
+    vi.stubGlobal('localStorage', new MemoryStorage())
+    let now = 1_000
+    const repository = createRepository(() => now)
+    const provider = new FixtureCatalogProvider()
+    const coordinator = new CatalogSyncCoordinator(provider, repository, { now: () => now })
+
+    const first = await coordinator.sync('profile-a')
+    expect(first).toMatchObject({ status: 'completed' })
+    const beforeManifest = await repository.getManifest('profile-a', 'live')
+    expect(beforeManifest?.coverage).toMatchObject({ state: 'complete', itemCount: 2 })
+
+    now = requiredNextDueAt(first)
+    provider.emptyScans.add('live')
+    performanceTrace.enable()
+    performanceTrace.clear()
+
+    const refreshed = await coordinator.sync('profile-a')
+
+    expect(refreshed).toMatchObject({ status: 'failed', requestCount: 6 })
+    // The previous generation's items are untouched: no zero-item swap occurred.
+    const afterManifest = await repository.getManifest('profile-a', 'live')
+    expect(afterManifest?.coverage).toMatchObject({ state: 'complete', itemCount: 2 })
+    await expect(
+      repository.readCategoryShard('profile-a', 'live', 'live-a', 0),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'live-a-1' })],
+    })
+    expect((await repository.getMeta('profile-a'))?.sync.sections?.live).toMatchObject({
+      coverage: 'complete',
+      wholeSectionFailureCount: 1,
+    })
+    expect(
+      performanceTrace
+        .snapshot()
+        .events.find((candidate) => candidate.name === 'catalog-sync-section-failed'),
+    ).toMatchObject({
+      category: 'library',
+      data: { section: 'live', failureStage: 'empty-validation' },
+    })
+  })
+
+  it('preserves an authoritative section when an all-unidentifiable Series response closes empty', async () => {
+    vi.stubGlobal('localStorage', new MemoryStorage())
+    let now = 1_000
+    const repository = createRepository(() => now)
+    const provider = new FixtureCatalogProvider()
+    const coordinator = new CatalogSyncCoordinator(provider, repository, { now: () => now })
+
+    const first = await coordinator.sync('profile-a')
+    expect(first).toMatchObject({ status: 'completed' })
+    const beforeManifest = await repository.getManifest('profile-a', 'series')
+    expect(beforeManifest?.coverage).toMatchObject({ state: 'complete', itemCount: 2 })
+
+    now = requiredNextDueAt(first)
+    provider.emptyScans.add('series')
+
+    const refreshed = await coordinator.sync('profile-a')
+
+    expect(refreshed).toMatchObject({ status: 'failed' })
+    const afterManifest = await repository.getManifest('profile-a', 'series')
+    expect(afterManifest?.coverage).toMatchObject({ state: 'complete', itemCount: 2 })
+    await expect(
+      repository.readCategoryShard('profile-a', 'series', 'series-a', 0),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'series-a-1' })],
+    })
+  })
+
+  it('permits a genuinely empty first acquisition to publish a complete empty section', async () => {
+    vi.stubGlobal('localStorage', new MemoryStorage())
+    const repository = createRepository()
+    const provider = new FixtureCatalogProvider()
+    provider.emptyScans.add('live')
+    const coordinator = new CatalogSyncCoordinator(provider, repository)
+
+    const result = await coordinator.sync('profile-a')
+
+    // Live has no prior items, so the empty close is a valid first result.
+    expect(result).toMatchObject({ status: 'completed' })
+    expect((await repository.getManifest('profile-a', 'live'))?.coverage).toMatchObject({
+      state: 'complete',
+      itemCount: 0,
+    })
+    expect((await repository.getMeta('profile-a'))?.sync.sections?.live).toMatchObject({
+      coverage: 'complete',
+      wholeSectionFailureCount: 0,
+    })
+  })
+
+  it('refuses a first acquisition whose records all lack identifiers', async () => {
+    vi.stubGlobal('localStorage', new MemoryStorage())
+    const repository = createRepository()
+    const provider = new FixtureCatalogProvider()
+    provider.unidentifiableScans.add('live')
+    provider.unidentifiableRawCount = 12
+    performanceTrace.enable()
+    performanceTrace.clear()
+
+    const result = await coordinatorSync(provider, repository)
+
+    expect(result).toMatchObject({ status: 'failed' })
+    // No prior items, but raw records arrived and none were identifiable, so the
+    // section must not publish an empty complete generation.
+    expect((await repository.getManifest('profile-a', 'live'))?.coverage).toMatchObject({
+      state: 'none',
+      itemCount: 0,
+    })
+    expect(
+      performanceTrace
+        .snapshot()
+        .events.find((candidate) => candidate.name === 'catalog-sync-section-failed'),
+    ).toMatchObject({
+      category: 'library',
+      data: { section: 'live', failureStage: 'empty-validation' },
+    })
+  })
+
+  it('preserves a populated section when a refresh collapses to a few records', async () => {
+    vi.stubGlobal('localStorage', new MemoryStorage())
+    let now = 1_000
+    const repository = createRepository(() => now)
+    const provider = new FixtureCatalogProvider()
+    // 40 items per section so a 2-record close is below the 10% retain ratio.
+    provider.wholeSectionItemCount = 40
+    const coordinator = new CatalogSyncCoordinator(provider, repository, { now: () => now })
+
+    const first = await coordinator.sync('profile-a')
+    expect(first).toMatchObject({ status: 'completed' })
+    expect((await repository.getManifest('profile-a', 'live'))?.coverage).toMatchObject({
+      state: 'complete',
+      itemCount: 40,
+    })
+
+    now = requiredNextDueAt(first)
+    provider.wholeSectionItemCount = 2
+
+    const refreshed = await coordinator.sync('profile-a')
+
+    expect(refreshed).toMatchObject({ status: 'failed' })
+    // The healthy 40-item generation is retained; the 2-record collapse is refused.
+    expect((await repository.getManifest('profile-a', 'live'))?.coverage).toMatchObject({
+      state: 'complete',
+      itemCount: 40,
+    })
+  })
+
+  it('marks the scan boundary as scanning with a zero count before the first checkpoint', async () => {
+    const storage = new MemoryStorage()
+    vi.stubGlobal('localStorage', storage)
+    const repository = createRepository()
+    const provider = new FixtureCatalogProvider()
+    const stages: Array<{ stage: string; section: string | null; itemCount: number }> = []
+    const originalScan = provider.backgroundScanSection.bind(provider)
+    vi.spyOn(provider, 'backgroundScanSection').mockImplementation(async (section, options) => {
+      const raw = storage.getItem('nova-play.sync-breadcrumb')
+
+      if (raw) {
+        const value = JSON.parse(raw) as { stage: string; section: string | null; itemCount: number }
+        stages.push({ stage: value.stage, section: value.section, itemCount: value.itemCount })
+      }
+
+      return originalScan(section, options)
+    })
+
+    const result = await coordinatorSync(provider, repository)
+
+    expect(result).toMatchObject({ status: 'completed' })
+    // Every section scan is entered with the boundary already recorded at 0.
+    expect(stages).toEqual([
+      { stage: 'scanning', section: 'live', itemCount: 0 },
+      { stage: 'scanning', section: 'vod', itemCount: 0 },
+      { stage: 'scanning', section: 'series', itemCount: 0 },
+    ])
+  })
+
+  it('leaves a finished breadcrumb after an ordinary section failure', async () => {
+    const storage = new MemoryStorage()
+    vi.stubGlobal('localStorage', storage)
+    const repository = createRepository()
+    const provider = new FixtureCatalogProvider()
+    provider.failScans.add('vod')
+
+    const result = await coordinatorSync(provider, repository)
+
+    expect(result).toMatchObject({ status: 'failed' })
+    const raw = storage.getItem('nova-play.sync-breadcrumb')
+    expect(raw).not.toBeNull()
+    expect(JSON.parse(raw as string)).toMatchObject({ stage: 'finished' })
+  })
+
+  it('clears the breadcrumb when a run is cancelled', async () => {
+    const storage = new MemoryStorage()
+    vi.stubGlobal('localStorage', storage)
+    const repository = createRepository()
+    const provider = new FixtureCatalogProvider()
+    const coordinator = new CatalogSyncCoordinator(provider, repository)
+    const originalScan = provider.backgroundScanSection.bind(provider)
+    vi.spyOn(provider, 'backgroundScanSection').mockImplementation(async (section, options) => {
+      coordinator.cancel()
+      return originalScan(section, options)
+    })
+
+    const result = await coordinator.sync('profile-a')
+
+    expect(result.status).toBe('cancelled')
+    expect(storage.getItem('nova-play.sync-breadcrumb')).toBeNull()
+  })
+
+  /*
+   * Publication used to branch on coverage: an incomplete section published in
+   * bounded chunks while an already complete one accumulated the whole section in
+   * memory and published it in one go. That left the largest sections on the path
+   * that never once completed on the physical target. Both now use the chunked
+   * path, and nothing may reintroduce the accumulating one.
+   */
+  it('refreshes an already complete section through chunked incremental publication', async () => {
+    let now = 1_000
+    const repository = createRepository(() => now)
+    const provider = new FixtureCatalogProvider()
+    const coordinator = new CatalogSyncCoordinator(provider, repository, { now: () => now })
+
+    const first = await coordinator.sync('profile-a')
+    expect(first).toMatchObject({ status: 'completed' })
+    expect((await repository.getMeta('profile-a'))?.sync.sections?.live?.coverage).toBe(
+      'complete',
+    )
+
+    const openSpy = vi.spyOn(repository, 'openPartialSectionPublication')
+    const wholeSectionSpy = vi.spyOn(repository, 'replaceSectionSnapshots')
+    now = requiredNextDueAt(first)
+
+    try {
+      const refreshed = await coordinator.sync('profile-a')
+
+      expect(refreshed).toMatchObject({ status: 'completed', requestCount: 6 })
+      // One publication per section, none through the accumulating path.
+      expect(openSpy.mock.calls.map((call) => call[1]).sort()).toEqual([
+        'live',
+        'series',
+        'vod',
+      ])
+      expect(wholeSectionSpy).not.toHaveBeenCalled()
+      await expect(
+        repository.readCategoryShard('profile-a', 'live', 'live-a', 0),
+      ).resolves.toMatchObject({ coverage: 'complete' })
+    } finally {
+      openSpy.mockRestore()
+      wholeSectionSpy.mockRestore()
+    }
+  })
+
   it('keeps every scheduled run at the six-request ceiling across a week of failures', async () => {
     let now = 1_000
     const repository = createRepository(() => now)
@@ -625,8 +1037,14 @@ describe('CatalogSyncCoordinator', () => {
 class FixtureCatalogProvider implements CatalogSyncProvider {
   readonly calls: string[] = []
   readonly scanOptions: StreamScanOptions[] = []
+  readonly scanSections = new Map<StreamScanOptions, LibrarySection>()
   readonly failScans = new Set<string>()
   readonly partialFailures = new Set<string>()
+  readonly emptyScans = new Set<string>()
+  readonly unidentifiableScans = new Set<string>()
+  unidentifiableRawCount = 4
+  /** When set, a whole-section scan emits this many identifiable items. */
+  wholeSectionItemCount: number | null = null
   readonly refuseCategories = new Set<string>()
   partialBatchCount = 1
   maxInFlight = 0
@@ -649,14 +1067,19 @@ class FixtureCatalogProvider implements CatalogSyncProvider {
   async backgroundScanSection(
     section: LibrarySection,
     options: StreamScanOptions = {},
-  ): Promise<void> {
+  ): Promise<SectionScanResult> {
     const key = options.categoryId ? `${section}:${options.categoryId}` : section
     this.scanOptions.push(options)
+    this.scanSections.set(options, section)
 
-    await this.run(`scan:${key}`, async () => {
+    return this.run(`scan:${key}`, async () => {
       const values = options.categoryId
         ? [stream(`${options.categoryId}-slice`, section, options.categoryId)]
-        : catalogStreams(section)
+        : this.wholeSectionItemCount !== null
+          ? Array.from({ length: this.wholeSectionItemCount }, (_, index) =>
+              stream(`${section}-${index}`, section, `${section}-${index % 2 === 0 ? 'a' : 'b'}`),
+            )
+          : catalogStreams(section)
 
       if (this.partialFailures.has(key)) {
         await options.onMatches?.(
@@ -671,7 +1094,28 @@ class FixtureCatalogProvider implements CatalogSyncProvider {
         throw new ProviderError('server', 'Fixture server failure.', true)
       }
 
+      /*
+       * A cleanly closed response that never yields an identifiable record. The
+       * transport succeeds; the scan simply emits nothing.
+       */
+      if (this.emptyScans.has(key) || this.emptyScans.has(section)) {
+        return scanResult(0, 0)
+      }
+
+      /*
+       * A cleanly closed response whose records all failed identity: raw records
+       * arrived but none were accepted, so onMatches is never invoked.
+       */
+      if (this.unidentifiableScans.has(key) || this.unidentifiableScans.has(section)) {
+        const raw = this.unidentifiableRawCount
+        options.onScanStatistics?.(scanResult(raw, 0))
+        return scanResult(raw, 0)
+      }
+
       await options.onMatches?.(values)
+      const accepted = values.length
+      options.onScanStatistics?.(scanResult(accepted, accepted))
+      return scanResult(accepted, accepted)
     })
   }
 
@@ -686,6 +1130,24 @@ class FixtureCatalogProvider implements CatalogSyncProvider {
     } finally {
       this.inFlight -= 1
     }
+  }
+}
+
+function coordinatorSync(
+  provider: CatalogSyncProvider,
+  repository: IndexedDbCatalogRepository,
+): ReturnType<CatalogSyncCoordinator['sync']> {
+  return new CatalogSyncCoordinator(provider, repository).sync('profile-a')
+}
+
+function scanResult(raw: number, accepted: number): SectionScanResult {
+  return {
+    rawItemCount: raw,
+    parsedItemCount: raw,
+    acceptedItemCount: accepted,
+    missingIdentifierCount: Math.max(0, raw - accepted),
+    bytesReceived: raw * 64,
+    arrayClosed: true,
   }
 }
 

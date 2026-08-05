@@ -9,24 +9,65 @@ const sources = import.meta.glob('./**/*.ts', {
 describe('local-first catalog regressions', () => {
   const mainSource = sources['./main.ts']
 
-  it('keeps global search local and avoids startup account validation', () => {
+  it('keeps startup account validation disabled while initializing durable library recovery', () => {
     expect(mainSource).toMatch(/function localGlobalSearchMatches\(/)
-    expect(mainSource).toMatch(/Movies have not been downloaded yet\. Refresh library from Settings\./)
-    expect(mainSource).not.toMatch(/searchStreams\s*\(/)
     expect(mainSource).not.toMatch(/void refreshAccount\(true\)/)
+    expect(mainSource).toMatch(/void initializeLibrarySync\(profile\.id\)/)
+    expect(mainSource).toMatch(/catalogRepository\.recoverStaleSync\(\s*profileId,\s*CATALOG_SYNC_STALE_RUN_MS\s*\)/)
   })
 
-  it('reads browse categories and category contents only from authoritative local snapshots', () => {
+  it('uses local snapshots first, then a single interactive request only for incomplete browse sections', () => {
     expect(mainSource).toMatch(
       /await catalogRepository\.readCompleteSectionCategories\(\s*activeProfile\.id,\s*section,\s*\)/,
     )
     expect(mainSource).toMatch(
-      /await catalogRepository\.readCompleteCategory\(\s*activeProfile\.id,\s*activeCatalog\.section,\s*category\.id,\s*\)/,
+      /await catalogRepository\.readCompleteCategoryPage\(\s*activeProfile\.id,\s*activeCatalog\.section,\s*category\.id,\s*0,\s*catalogPageSize\(\),\s*\)/,
     )
-    expect(mainSource).not.toMatch(/await activeClient\.categories\(section, signal\)/)
-    expect(mainSource).not.toMatch(
+    expect(mainSource).toMatch(/await activeClient\.categories\(section, signal\)/)
+    expect(mainSource).toMatch(
       /await activeClient\.streams\(activeCatalog\.section, category\.id, signal\)/,
     )
+    expect(mainSource).toMatch(/source: 'live'/)
+    expect(mainSource).toMatch(/Live provider results/)
+  })
+
+  it('provides submit-only, section-scoped live global search for incomplete sections', () => {
+    expect(mainSource).toMatch(/async function searchGlobalLiveSection\(section: LibrarySection\)/)
+    expect(mainSource).toMatch(/activeClient\.searchStreams\(section, query,/)
+    expect(mainSource).toMatch(/data-action="search-global-live-section"/)
+    expect(mainSource).toMatch(/Search \$\{escape\(labels\[section\]\)\} live/)
+    expect(mainSource).toMatch(/globalSearchSectionSource\.set\(section, 'live'\)/)
+    expect(mainSource).not.toMatch(/Promise\.all\(\s*GLOBAL_SEARCH_SECTIONS\.map\(/)
+  })
+
+  it('retains existing progressive-search cards while appending later batches', () => {
+    expect(mainSource).toMatch(/function updateGlobalSearchSection\(section: LibrarySection\): void/)
+    expect(mainSource).toMatch(
+      /querySelectorAll<HTMLElement>\('\[data-global-search-card-key\]'\)[\s\S]*?card\.remove\(\)/,
+    )
+    expect(mainSource).toMatch(/if \(!existing\) \{\s*content\.insertAdjacentHTML\(\s*'beforeend',/)
+    expect(mainSource).toMatch(/assignNavigationZones\(\)\s*\n\s*invalidateSpatialLayout\(\)/)
+  })
+
+  it('keeps Guide category and channel-list reads in the complete local catalog', () => {
+    expect(mainSource).toMatch(
+      /async function openGuide\([\s\S]*?catalogRepository\.readCompleteSectionCategories\(\s*activeProfile\.id,\s*'live',/,
+    )
+    expect(mainSource).toMatch(
+      /async function openGuide\([\s\S]*?catalogRepository\.readCompleteCategoryPage\(\s*activeProfile\.id,\s*'live',\s*selectedCategory\.id,/,
+    )
+    expect(mainSource).not.toMatch(/activeClient\.categories\('live', signal\)/)
+    expect(mainSource).not.toMatch(/activeClient\.streams\('live', guideCategory\.id, signal\)/)
+    expect(mainSource).toMatch(/return view === 'guide'/)
+  })
+
+  it('keeps detail and programme requests behind durable TTL cache reads', () => {
+    expect(mainSource).toMatch(/catalogRepository\.getDetails<SeriesDetails>\(/)
+    expect(mainSource).toMatch(/catalogRepository\.getDetails<VodDetails>\(/)
+    expect(mainSource).toMatch(/catalogRepository\.putDetails\(/)
+    expect(mainSource).toMatch(/catalogRepository\.getEpg<NowNext>\(/)
+    expect(mainSource).toMatch(/catalogRepository\.getEpg<Program\[\]>\(/)
+    expect(mainSource).toMatch(/catalogRepository\.putEpg\(/)
   })
 
   it('does not prefetch EPG during catalog or guide rendering', () => {
@@ -35,21 +76,25 @@ describe('local-first catalog regressions', () => {
     expect(mainSource).toMatch(/await activeClient\.nowNext\(stream\.id, signal\)/)
   })
 
-  it('keeps provider acquisition explicit while browse and search read the local catalog', () => {
-    expect(mainSource).toMatch(
-      /new CatalogSyncCoordinator\(\s*client,\s*catalogRepository(?:,\s*\{[\s\S]*?internalFaultDiagnostics:[\s\S]*?\})?\s*\)/,
-    )
-    expect(mainSource).toMatch(/catalogRepository\.readCompleteCategory\(/)
-    expect(mainSource).toMatch(/catalogRepository\.searchCompleteSection\(/)
-    expect(mainSource).not.toMatch(/searchStreams\s*\(/)
+  it('starts incomplete background acquisition, reports truthful cooldown state, and gates production diagnostics', () => {
+    expect(mainSource).toMatch(/function createCatalogSyncCoordinator\(nextClient: ProviderBroker\)/)
+    expect(mainSource).toMatch(/new CatalogSyncCoordinator\(nextClient, catalogRepository, \{/)
+    expect(mainSource).toMatch(/onProgress: updateLibrarySyncProgress/)
     expect(mainSource).toMatch(/function scheduleCatalogSync\(/)
-    expect(mainSource).toMatch(/data-action="refresh-library"/)
-    expect(mainSource).toMatch(/if \(action === 'refresh-library'\)/)
-    expect(mainSource).toMatch(/catalogSync\?\.cancel\(\)/)
-    expect(mainSource).not.toMatch(
-      /initializeAppHistory\(\)\s*\nrender\(\)\s*\nscheduleCatalogSync\(\)/,
+    expect(mainSource).toMatch(/void initializeLibrarySync\(nextProfile\.id\)/)
+    expect(mainSource).toMatch(/Downloaded library is incomplete\. Next attempt/)
+    expect(mainSource).toMatch(/if \(action === 'measure-vod-library' && libraryProbeEnabled\)/)
+    expect(mainSource).not.toMatch(/data-action="measure-vod-library"/)
+  })
+
+  it('keeps the video sizing capture probe-only and preserves normal-package probe boundaries', () => {
+    expect(mainSource).toMatch(/if \(libraryProbeEnabled\) \{\s*resetVideoSizingProbe\(\)/)
+    expect(mainSource).toMatch(/function captureVideoSizing\(/)
+    expect(mainSource).toMatch(/videoWidth: video\.videoWidth/)
+    expect(mainSource).toMatch(/objectFit: window\.getComputedStyle\(video\)\.objectFit/)
+    expect(mainSource).toMatch(/videoSizing: \{\s*capture\(\)/)
+    expect(mainSource).toMatch(
+      /if \(\s*import\.meta\.env\.DEV \|\|[\s\S]*?window\.__NOVA_LIBRARY_PROBE__ = \{/,
     )
-    expect(mainSource).not.toMatch(/nowNextCache\.clear\(\)\s*\n\s*scheduleCatalogSync\(\)/)
-    expect(mainSource).not.toMatch(/render\(\)\s*\n\s*scheduleCatalogSync\(\)\s*\n}\s*\n\s*function togglePlayback/)
   })
 })

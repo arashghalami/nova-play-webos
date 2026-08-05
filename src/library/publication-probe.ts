@@ -40,14 +40,27 @@ export async function runPublicationProbe(
       return {
         category,
         categoryKey: category.id,
+        /*
+         * Representative record size matters: a probe built from four short
+         * fields understates the real peak by several times, and the field that
+         * grew most is artwork, which is now retained by the cache writer. These
+         * are synthetic strings on a non-routable host, never provider values.
+         */
         items: Array.from(
           { length: itemsPerCategory },
           (_, itemIndex): StreamItem => ({
             id: `synthetic-${categoryIndex}-${itemIndex}`,
-            name: `Synthetic item ${categoryIndex + 1}-${itemIndex + 1}`,
+            name: `Synthetic item ${categoryIndex + 1}-${itemIndex + 1} extended title padding`,
             section: 'vod',
             categoryId: category.id,
-            searchName: `synthetic item ${categoryIndex + 1}-${itemIndex + 1}`,
+            searchName: `synthetic item ${categoryIndex + 1}-${itemIndex + 1} extended title padding`,
+            icon: `https://synthetic.invalid/artwork/icon/${categoryIndex}-${itemIndex}-0123456789abcdef.jpg`,
+            cover: `https://synthetic.invalid/artwork/cover/${categoryIndex}-${itemIndex}-0123456789abcdef.jpg`,
+            rating: '8.2',
+            year: '2026',
+            added: '1785800000',
+            containerExtension: 'mp4',
+            plot: `Synthetic plot text for item ${categoryIndex + 1}-${itemIndex + 1} used only to make the probe record representative of a provider record.`,
           }),
         ),
       }

@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
+import {
+  IDBFactory,
+  IDBKeyRange,
+  IDBObjectStore as FakeIDBObjectStore,
+} from 'fake-indexeddb'
 import { favoriteKey, toStoredStream } from '../storage'
 import { matchesQuery, queryTokens } from '../search'
 import { ProviderBroker } from '../provider-broker'
@@ -8,6 +12,7 @@ import type { StreamItem, VodDetails, XtreamProfile } from '../types'
 import type { LibrarySyncState, LibraryMetaRecord } from './catalog-repository'
 import { CatalogSyncCoordinator } from './catalog-sync'
 import {
+  EmptySectionPublicationError,
   IndexedDbCatalogRepository,
   LIBRARY_STORE_NAMES,
   LibraryWriteAbortedError,
@@ -18,6 +23,7 @@ import {
   openLibraryDatabase,
   clearLibraryMemoryCaches,
   setLibraryPlaybackStarting,
+  type LibraryStoreName,
 } from './catalog-repository'
 
 const databaseNames: string[] = []
@@ -112,6 +118,7 @@ describe('flat catalog repository', () => {
     expect(transaction.objectStore('epg').keyPath).toEqual([
       'profileId',
       'streamId',
+      'kind',
     ])
     database.close()
   })
@@ -173,7 +180,7 @@ describe('flat catalog repository', () => {
     expect((await repository.getMeta('profile-b'))?.nextDueAt).toBe(222)
   })
 
-  it('keeps parser-confirmed category snapshots durable but unavailable until a closed section is promoted', async () => {
+  it('keeps parser-confirmed category snapshots durable but unavailable until the closed section commits', async () => {
     const repository = createRepository()
     const categories = [
       { id: 'vod-a', name: 'VOD A' },
@@ -181,18 +188,25 @@ describe('flat catalog repository', () => {
     ]
 
     await repository.putSectionManifest('profile-a', 'vod', categories)
-    await repository.preparePartialSectionSnapshotRun('profile-a', 'vod')
-    await repository.appendPartialCategorySnapshot({
-      profileId: 'profile-a',
-      section: 'vod',
+    const publication = await repository.openPartialSectionPublication('profile-a', 'vod')
+    await publication.appendCategoryItems({
       category: categories[0],
       items: [stream('vod-a-1', 'VOD A One', 'vod', categories[0].id)],
     })
 
+    // The shard is already durable; only the manifest pointer is deferred.
+    expect(
+      await readRawRecord(databaseNames[0], 'snapshots', [
+        'profile-a',
+        'vod',
+        categories[0].id,
+        0,
+      ]),
+    ).toMatchObject({ itemCount: 1 })
     expect((await repository.getManifest('profile-a', 'vod'))?.coverage).toMatchObject({
-      state: 'partial',
+      state: 'none',
       completeCategoryCount: 0,
-      itemCount: 1,
+      itemCount: 0,
     })
     await expect(
       repository.readCategoryShard('profile-a', 'vod', categories[0].id, 0),
@@ -201,13 +215,11 @@ describe('flat catalog repository', () => {
       reason: 'category-unavailable',
     })
 
-    await repository.appendPartialCategorySnapshot({
-      profileId: 'profile-a',
-      section: 'vod',
+    await publication.appendCategoryItems({
       category: categories[1],
       items: [stream('vod-b-1', 'VOD B One', 'vod', categories[1].id)],
     })
-    await repository.promotePartialSectionSnapshots('profile-a', 'vod')
+    await publication.commit()
 
     expect((await repository.getManifest('profile-a', 'vod'))?.coverage).toMatchObject({
       state: 'complete',
@@ -226,6 +238,312 @@ describe('flat catalog repository', () => {
       coverage: 'complete',
       items: [expect.objectContaining({ id: 'vod-b-1' })],
     })
+  })
+
+  /*
+   * The VOD section stalled the webOS runtime because the partial path rewrote
+   * the entire 363-category manifest on every 128-item flush. Manifest cost has
+   * to stay tied to the category count, never to the flush count, so this
+   * measures real `manifests` store writes at two flush granularities.
+   */
+  it('keeps partial-publication manifest writes proportional to categories, not to flushes', async () => {
+    const categoryCount = 12
+    const categories = Array.from({ length: categoryCount }, (_unused, index) => ({
+      id: `vod-${index}`,
+      name: `VOD ${index}`,
+    }))
+    const itemsPerCategory = 64
+
+    const runWithFlushSize = async (
+      flushSize: number,
+    ): Promise<{ manifestWrites: number; flushes: number; itemCount: number }> => {
+      const repository = createRepository()
+      await repository.putSectionManifest('profile-a', 'vod', categories)
+      const manifestWrites = countManifestWrites()
+      let flushes = 0
+
+      try {
+        const publication = await repository.openPartialSectionPublication('profile-a', 'vod')
+
+        for (const category of categories) {
+          const items = Array.from({ length: itemsPerCategory }, (_unused, index) =>
+            stream(`${category.id}-${index}`, `Title ${index}`, 'vod', category.id),
+          )
+
+          for (let offset = 0; offset < items.length; offset += flushSize) {
+            await publication.appendCategoryItems({
+              category,
+              items: items.slice(offset, offset + flushSize),
+            })
+            flushes += 1
+          }
+        }
+
+        await publication.commit()
+      } finally {
+        manifestWrites.restore()
+      }
+
+      const manifest = await repository.getManifest('profile-a', 'vod')
+
+      expect(manifest?.coverage).toMatchObject({
+        state: 'complete',
+        categoryCount,
+        completeCategoryCount: categoryCount,
+        itemCount: categoryCount * itemsPerCategory,
+      })
+
+      return {
+        manifestWrites: manifestWrites.count(),
+        flushes,
+        itemCount: manifest?.coverage.itemCount ?? 0,
+      }
+    }
+
+    const coarse = await runWithFlushSize(itemsPerCategory)
+    const fine = await runWithFlushSize(4)
+
+    // Sixteen times as many flushes over the same items and categories.
+    expect(fine.flushes).toBe(coarse.flushes * 16)
+    expect(fine.itemCount).toBe(coarse.itemCount)
+
+    /*
+     * Manifest writes must not move with flush count at all. The current design
+     * writes twice per run - one detach, one commit - which is well inside the
+     * per-category ceiling this asserts.
+     */
+    expect(fine.manifestWrites).toBe(coarse.manifestWrites)
+    expect(fine.manifestWrites).toBeLessThanOrEqual(categoryCount)
+    expect(fine.manifestWrites).toBeLessThan(fine.flushes)
+  })
+
+  /*
+   * A whole-section publication used to serialize every category's shards before
+   * writing any, so the section's entire payload set stayed live at once. On the
+   * TV that peak, on top of the resident parsed items, terminates the renderer at
+   * the scan-to-publish transition for a section the size of Live.
+   */
+  it('serializes a whole-section publication one category at a time', async () => {
+    const repository = createRepository()
+    const categoryCount = 8
+    const itemsPerCategory = 40
+    const categories = Array.from({ length: categoryCount }, (_unused, index) => ({
+      id: `live-${index}`,
+      name: `Live ${index}`,
+    }))
+    await repository.putSectionManifest('profile-a', 'live', categories)
+
+    /*
+     * Each category's `items` is read twice: once by the up-front validation
+     * pass, which deliberately still rejects a cross-section item before any
+     * record is written, and once when that category is serialized. Recording the
+     * write count at each read shows which reads happen before any write.
+     */
+    const readsAt = new Map<string, number[]>()
+    const snapshotWrites = countStoreWrites('snapshots')
+
+    const snapshots = categories.map((category) => {
+      const items = Array.from({ length: itemsPerCategory }, (_unused, index) =>
+        stream(`${category.id}-${index}`, `Title ${index}`, 'live', category.id),
+      )
+
+      return {
+        category,
+        categoryKey: category.id,
+        get items(): readonly StreamItem[] {
+          const seen = readsAt.get(category.id) ?? []
+          seen.push(snapshotWrites.count())
+          readsAt.set(category.id, seen)
+          return items
+        },
+      }
+    })
+
+    try {
+      await repository.replaceSectionSnapshots(
+        { profileId: 'profile-a', section: 'live', snapshots },
+      )
+    } finally {
+      snapshotWrites.restore()
+    }
+
+    // 40 items stays well inside one shard, so category N is serialized after
+    // exactly N snapshot writes - never all of them up front.
+    expect(snapshotWrites.count()).toBe(categoryCount)
+    categories.forEach((category, index) => {
+      const reads = readsAt.get(category.id) ?? []
+      expect(reads).toHaveLength(2)
+      expect(reads[0]).toBe(0)
+      expect(reads[1]).toBe(index)
+    })
+
+    const manifest = await repository.getManifest('profile-a', 'live')
+    expect(manifest?.coverage).toMatchObject({
+      state: 'complete',
+      categoryCount,
+      completeCategoryCount: categoryCount,
+      itemCount: categoryCount * itemsPerCategory,
+    })
+    await expect(
+      repository.readCompleteCategory('profile-a', 'live', 'live-3'),
+    ).resolves.toMatchObject({ coverage: 'complete' })
+  })
+
+  /*
+   * Every search-index rebuild writes a fresh generation, and readers require an
+   * exact generation match. Nothing deleted the superseded ones, so an evictable
+   * cache grew without bound: the physical target reached 68,800 shard records
+   * across 10 generations for two sections, of which only 2 were reachable.
+   */
+  it('deletes superseded search-index generations when a rebuild republishes a section', async () => {
+    const repository = createRepository()
+    const categories = [{ id: 'live-a', name: 'Live A' }]
+    const items = Array.from({ length: 60 }, (_unused, index) =>
+      stream(`live-a-${index}`, `Channel ${index}`, 'live', 'live-a'),
+    )
+
+    const publishAndIndex = async (): Promise<number> => {
+      await repository.putSectionManifest('profile-a', 'live', categories)
+      await repository.replaceCategorySnapshot({
+        profileId: 'profile-a',
+        section: 'live',
+        category: categories[0],
+        items,
+      })
+      const [result] = await repository.rebuildSearchIndexes('profile-a', ['live'])
+      expect(result.coverage).toBe('complete')
+      return result.coverage === 'complete' ? result.generation : 0
+    }
+
+    const firstGeneration = await publishAndIndex()
+    const afterFirst = await readShardGenerations(databaseNames[0])
+    expect(afterFirst.size).toBe(1)
+    const firstShardCount = afterFirst.get(firstGeneration) ?? 0
+    expect(firstShardCount).toBeGreaterThan(0)
+
+    // A second publication moves the manifest generation, forcing a fresh index.
+    const secondGeneration = await publishAndIndex()
+    expect(secondGeneration).not.toBe(firstGeneration)
+
+    const afterSecond = await readShardGenerations(databaseNames[0])
+    expect([...afterSecond.keys()]).toEqual([secondGeneration])
+    expect(afterSecond.get(secondGeneration)).toBe(firstShardCount)
+
+    // The surviving generation is the one search actually resolves.
+    expect((await repository.getSearchIndexMeta('profile-a', 'live'))?.generation).toBe(
+      secondGeneration,
+    )
+    await expect(
+      repository.searchCompleteSection('profile-a', 'live', 'channel', 5),
+    ).resolves.toMatchObject({ coverage: 'complete' })
+  })
+
+  /*
+   * Every whole-section scan now publishes incrementally, including a refresh of a
+   * section that is already complete. That must not disturb what readers resolve:
+   * the run writes above the live generation and swaps the manifest in one write
+   * at commit, so an interrupted refresh leaves the previous generation
+   * authoritative. This is the accepted rule that a failed refresh never erases a
+   * complete section.
+   */
+  it('keeps a complete section readable throughout a refresh and after an abandoned one', async () => {
+    const repository = createRepository()
+    const categories = [{ id: 'live-a', name: 'Live A' }]
+
+    await repository.putSectionManifest('profile-a', 'live', categories)
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'live',
+      category: categories[0],
+      items: [stream('live-a-original', 'Original Channel', 'live', 'live-a')],
+    })
+
+    const readOriginal = async () =>
+      repository.readCompleteCategory('profile-a', 'live', 'live-a')
+
+    await expect(readOriginal()).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'live-a-original' })],
+    })
+
+    // An abandoned refresh: shards written, never committed.
+    const abandoned = await repository.openPartialSectionPublication('profile-a', 'live')
+    await abandoned.appendCategoryItems({
+      category: categories[0],
+      items: [stream('live-a-replacement', 'Replacement Channel', 'live', 'live-a')],
+    })
+
+    expect((await repository.getManifest('profile-a', 'live'))?.coverage.state).toBe('complete')
+    await expect(readOriginal()).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'live-a-original' })],
+    })
+
+    // A committed refresh swaps atomically and the new generation is what reads see.
+    const committed = await repository.openPartialSectionPublication('profile-a', 'live')
+    await committed.appendCategoryItems({
+      category: categories[0],
+      items: [stream('live-a-second', 'Second Channel', 'live', 'live-a')],
+    })
+    await committed.commit()
+
+    expect((await repository.getManifest('profile-a', 'live'))?.coverage.state).toBe('complete')
+    await expect(readOriginal()).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'live-a-second' })],
+    })
+
+    // Exactly one manifest write per run, and no superseded shards left behind.
+    expect(committed.manifestWriteCount).toBe(1)
+    const generations = await readSnapshotShardIndexes(databaseNames[0], 'live', 'live-a')
+    const manifest = await repository.getManifest('profile-a', 'live')
+    const active = manifest?.categories[0]
+    expect(generations).toEqual(
+      Array.from({ length: active?.shardCount ?? 0 }, (_unused, offset) =>
+        (active?.shardBase ?? 0) + offset,
+      ),
+    )
+  })
+
+  it('refuses to commit a zero-item run over a section that still holds items', async () => {
+    const repository = createRepository()
+    const categories = [{ id: 'live-a', name: 'Live A' }]
+
+    await repository.putSectionManifest('profile-a', 'live', categories)
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'live',
+      category: categories[0],
+      items: [stream('live-a-original', 'Original Channel', 'live', 'live-a')],
+    })
+
+    // A run that appends nothing before commit: the closed array was empty.
+    const empty = await repository.openPartialSectionPublication('profile-a', 'live')
+    expect(empty.priorAuthoritativeItemCount).toBe(1)
+    await expect(empty.commit()).rejects.toBeInstanceOf(EmptySectionPublicationError)
+
+    // No swap occurred: the previous generation is still authoritative.
+    expect(empty.manifestWriteCount).toBe(0)
+    await expect(
+      repository.readCompleteCategory('profile-a', 'live', 'live-a'),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: 'live-a-original' })],
+    })
+  })
+
+  it('permits a genuinely empty first commit when no prior items exist', async () => {
+    const repository = createRepository()
+    const categories = [{ id: 'live-a', name: 'Live A' }]
+
+    await repository.putSectionManifest('profile-a', 'live', categories)
+
+    const first = await repository.openPartialSectionPublication('profile-a', 'live')
+    expect(first.priorAuthoritativeItemCount).toBe(0)
+    const manifest = await first.commit()
+
+    expect(manifest.coverage).toMatchObject({ state: 'complete', itemCount: 0 })
+    expect(first.manifestWriteCount).toBe(1)
   })
 
   it('serves only a complete section through bounded local category and search reads', async () => {
@@ -385,6 +703,92 @@ describe('flat catalog repository', () => {
     })
   })
 
+  it('resolves visible indexed matches across snapshot shards in their posting order', async () => {
+    const repository = createRepository()
+    const category = { id: 'batched-search', name: 'Batched search' }
+    const items = Array.from({ length: 3_001 }, (_, index) =>
+      stream(
+        `item-${index}`,
+        index % 1_500 === 0
+          ? `Batched target ${index}`
+          : `Ordinary title ${index}`,
+        'vod',
+        category.id,
+      ),
+    )
+
+    await repository.putSectionManifest('profile-a', 'vod', [category])
+    const entry = await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'vod',
+      category,
+      items,
+    })
+    await repository.rebuildSearchIndexes('profile-a', ['vod'])
+
+    expect(entry.shardCount).toBeGreaterThan(1)
+
+    await expect(
+      repository.searchCompleteSection('profile-a', 'vod', 'batched', 10),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      limited: false,
+      matches: [
+        expect.objectContaining({ id: 'item-0' }),
+        expect.objectContaining({ id: 'item-1500' }),
+        expect.objectContaining({ id: 'item-3000' }),
+      ],
+    })
+  })
+
+  it('indexes and retrieves Cyrillic, Arabic, and CJK titles after the Unicode migration', async () => {
+    const repository = createRepository()
+    const category = { id: 'international', name: 'International' }
+    const items = [
+      stream('cyrillic', 'Новости мира', 'vod', category.id),
+      stream('arabic', 'أخبار العالم', 'vod', category.id),
+      stream('cjk', '映画 東京', 'vod', category.id),
+      stream('single-cjk', '山', 'vod', category.id),
+    ]
+
+    await repository.putSectionManifest('profile-a', 'vod', [category])
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'vod',
+      category,
+      items,
+    })
+
+    const [build] = await repository.rebuildSearchIndexes('profile-a', ['vod'])
+
+    expect(build).toMatchObject({
+      coverage: 'complete',
+      itemCount: 4,
+      preMigrationZeroPrefixCount: 4,
+    })
+
+    for (const [query, id] of [
+      ['новости', 'cyrillic'],
+      ['أخبار', 'arabic'],
+      ['映画', 'cjk'],
+    ] as const) {
+      await expect(
+        repository.searchCompleteSection('profile-a', 'vod', query, 10),
+      ).resolves.toMatchObject({
+        coverage: 'complete',
+        matches: [expect.objectContaining({ id })],
+      })
+    }
+
+    await expect(
+      repository.searchCompleteSection('profile-a', 'vod', '山', 10),
+    ).resolves.toEqual({
+      coverage: 'complete',
+      matches: [],
+      limited: false,
+    })
+  })
+
   it('keeps legacy sanitized URL-like titles readable in complete local shards', async () => {
     const repository = createRepository()
     const category = { id: 'legacy-live', name: 'Legacy Live' }
@@ -484,6 +888,43 @@ describe('flat catalog repository', () => {
     expect(restored.map((item) => item.id)).toEqual(items.map((item) => item.id))
   })
 
+  it('reads only the requested visible category page from bounded snapshot shards', async () => {
+    const repository = createRepository()
+    const category = { id: 'paged', name: 'Paged' }
+    const items = Array.from({ length: 3_100 }, (_, index) =>
+      stream(`item-${index}`, `Paged item ${index}`, 'vod', category.id),
+    )
+
+    await repository.putSectionManifest('profile-a', 'vod', [category])
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'vod',
+      category,
+      items,
+    })
+
+    const page = await repository.readCompleteCategoryPage(
+      'profile-a',
+      'vod',
+      category.id,
+      2,
+      24,
+    )
+
+    expect(page).toMatchObject({
+      coverage: 'complete',
+      itemCount: 3_100,
+      page: 2,
+      pageCount: 130,
+    })
+
+    if (page.coverage === 'complete') {
+      expect(page.items).toHaveLength(24)
+      expect(page.items[0]).toMatchObject({ id: 'item-48' })
+      expect(page.items[23]).toMatchObject({ id: 'item-71' })
+    }
+  })
+
   it('degrades complete manifest coverage to none when a snapshot shard was evicted', async () => {
     const repository = createRepository()
     const category = { id: 'movies', name: 'Movies' }
@@ -526,17 +967,67 @@ describe('flat catalog repository', () => {
     }
 
     await repository.putDetails('profile-a', 'vod', details.id, details, 50)
-    await repository.putEpg('profile-a', 'stream-1', epg, 50)
+    await repository.putEpg('profile-a', 'stream-1', 'now-next', epg, 50)
 
     expect(await repository.getDetails('profile-a', 'vod', details.id)).toEqual(
       details,
     )
-    expect(await repository.getEpg('profile-a', 'stream-1')).toEqual(epg)
+    expect(await repository.getEpg('profile-a', 'stream-1', 'now-next')).toEqual(epg)
 
     now = 1_051
 
     expect(await repository.getDetails('profile-a', 'vod', details.id)).toBeNull()
-    expect(await repository.getEpg('profile-a', 'stream-1')).toBeNull()
+    expect(await repository.getEpg('profile-a', 'stream-1', 'now-next')).toBeNull()
+  })
+
+  it('evicts rebuildable records without deleting an active catalog or protected user-state boundary', async () => {
+    const repository = createRepository()
+    const category = { id: 'movies', name: 'Movies' }
+    const activeItem = stream('movie-a', 'Active movie', 'vod', category.id)
+
+    await repository.putSectionManifest('profile-a', 'vod', [category])
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'vod',
+      category,
+      items: [activeItem],
+    })
+    await repository.rebuildSearchIndexes('profile-a', ['vod'])
+    await repository.putDetails(
+      'profile-a',
+      'vod',
+      activeItem.id,
+      { id: activeItem.id, metadata: { plot: 'Cached detail' } },
+      1_000,
+    )
+    await repository.putEpg(
+      'profile-a',
+      'stream-a',
+      'now-next',
+      { now: { title: 'Now', start: new Date(0), end: new Date(1_000) } },
+      1_000,
+    )
+
+    const result = await repository.evictRebuildableData('profile-a')
+
+    expect(result).toMatchObject({
+      epgRecordsDeleted: 1,
+      detailRecordsDeleted: 1,
+    })
+    await expect(repository.getDetails('profile-a', 'vod', activeItem.id)).resolves.toBeNull()
+    await expect(repository.getEpg('profile-a', 'stream-a', 'now-next')).resolves.toBeNull()
+    await expect(
+      repository.readCompleteCategory('profile-a', 'vod', category.id),
+    ).resolves.toMatchObject({
+      coverage: 'complete',
+      items: [expect.objectContaining({ id: activeItem.id })],
+    })
+    await expect(
+      repository.searchCompleteSection('profile-a', 'vod', 'active', 10),
+    ).resolves.toMatchObject({
+      coverage: 'none',
+      reason: 'index-unavailable',
+    })
   })
 
   it('builds compact search shards and matches the direct shared matcher', async () => {
@@ -625,6 +1116,33 @@ describe('flat catalog repository', () => {
       items: [],
       reason: 'category-unavailable',
     })
+  })
+
+  it('clears an abandoned sync lease only after the configured stale interval', async () => {
+    let now = 1_000
+    const repository = createRepository(() => now)
+
+    expect(await repository.tryBeginSync('profile-a', 'abandoned-run', 600_000)).toBe(true)
+    now = 600_999
+
+    expect(await repository.recoverStaleSync('profile-a', 600_000)).toBe(false)
+    expect((await repository.getMeta('profile-a'))?.sync).toMatchObject({
+      inProgress: true,
+      runId: 'abandoned-run',
+    })
+
+    now = 601_000
+
+    expect(await repository.recoverStaleSync('profile-a', 600_000)).toBe(true)
+    expect(await repository.getMeta('profile-a')).toMatchObject({
+      nextDueAt: 601_000,
+      sync: {
+        inProgress: false,
+        updatedAt: 601_000,
+      },
+    })
+    expect((await repository.getMeta('profile-a'))?.sync.runId).toBeUndefined()
+    expect(await repository.recoverStaleSync('profile-a', 600_000)).toBe(false)
   })
 
   it('persists a sync-state read-modify-write in the same transaction callback', async () => {
@@ -1100,6 +1618,82 @@ describe('flat catalog repository', () => {
     })
   })
 
+  it('retains provider artwork URLs in durable snapshots while excluding credentialed playback URLs', async () => {
+    const repository = createRepository()
+    const category = { id: 'movies', name: 'Movies' }
+    const posterUrl = 'https://image.tmdb.org/t/p/original/poster-token.jpg'
+    const coverUrl = 'https://image.tmdb.org/t/p/original/cover-token.jpg'
+    const seriesCoverUrl = 'https://image.tmdb.org/t/p/original/series-token.jpg'
+    const privateSource = 'https://provider.invalid/movie/secret-token.mp4'
+    const movie = {
+      ...stream('movie-art', 'Artwork movie', 'vod', category.id),
+      icon: posterUrl,
+      cover: coverUrl,
+      seriesCover: seriesCoverUrl,
+      directSource: privateSource,
+    }
+
+    await repository.putSectionManifest('profile-a', 'vod', [category])
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'vod',
+      category,
+      items: [movie],
+    })
+
+    const raw = JSON.stringify(
+      await readStoreRecord(databaseNames[0], 'snapshots', ['profile-a', 'vod', category.id, 0]),
+    )
+    // The credentialed playback URL must never reach a durable snapshot.
+    expect(raw).not.toContain(privateSource)
+
+    const page = await repository.readCategoryShard('profile-a', 'vod', category.id, 0)
+    expect(page.coverage).toBe('complete')
+
+    if (page.coverage === 'complete') {
+      // Artwork endpoints are legitimate display data and must survive so the
+      // browse/search renderer has a source to admit instead of a placeholder.
+      expect(page.items[0]).toMatchObject({
+        id: 'movie-art',
+        icon: posterUrl,
+        cover: coverUrl,
+        seriesCover: seriesCoverUrl,
+      })
+      expect((page.items[0] as { directSource?: string }).directSource).toBeUndefined()
+    }
+  })
+
+  it('retains the provider EPG channel identifier in durable snapshots, including scheme-like tokens', async () => {
+    const repository = createRepository()
+    const category = { id: 'news', name: 'News' }
+    // A colon-bearing identifier would be dropped by the URL-like recursive
+    // strip if it were not explicitly whitelisted, so it is the important case.
+    const channel = {
+      ...stream('live-epg', 'Guide channel', 'live', category.id),
+      epgChannelId: 'sky:sports.uk',
+      directSource: 'https://provider.invalid/live/secret-token.ts',
+    }
+
+    await repository.putSectionManifest('profile-a', 'live', [category])
+    await repository.replaceCategorySnapshot({
+      profileId: 'profile-a',
+      section: 'live',
+      category,
+      items: [channel],
+    })
+
+    const page = await repository.readCategoryShard('profile-a', 'live', category.id, 0)
+    expect(page.coverage).toBe('complete')
+
+    if (page.coverage === 'complete') {
+      expect(page.items[0]).toMatchObject({
+        id: 'live-epg',
+        epgChannelId: 'sky:sports.uk',
+      })
+      expect((page.items[0] as { directSource?: string }).directSource).toBeUndefined()
+    }
+  })
+
   it('deletes only the selected profile cache and excludes direct playback URLs from durable records', async () => {
     const repository = createRepository()
     const category = { id: 'movies', name: 'Movies' }
@@ -1371,6 +1965,113 @@ function transactionCompleteForTest(transaction: IDBTransaction): Promise<void> 
     transaction.onerror = () =>
       reject(transaction.error ?? new Error('IndexedDB transaction failed in the test harness.'))
   })
+}
+
+/**
+ * Counts real `manifests` store writes by instrumenting IndexedDB itself, so
+ * the assertion measures storage work rather than a counter the production code
+ * maintains for the test's benefit.
+ */
+function countStoreWrites(storeName: LibraryStoreName): {
+  count: () => number
+  restore: () => void
+} {
+  const prototype = FakeIDBObjectStore.prototype
+  const original = prototype.put
+  let writes = 0
+
+  prototype.put = function instrumentedPut(
+    this: IDBObjectStore,
+    ...args: Parameters<IDBObjectStore['put']>
+  ): IDBRequest<IDBValidKey> {
+    if (this.name === storeName) {
+      writes += 1
+    }
+
+    return original.apply(this, args)
+  }
+
+  return {
+    count: () => writes,
+    restore: () => {
+      prototype.put = original
+    },
+  }
+}
+
+function countManifestWrites(): { count: () => number; restore: () => void } {
+  return countStoreWrites('manifests')
+}
+
+/** Surviving snapshot shard indexes for one category, in order. */
+async function readSnapshotShardIndexes(
+  databaseName: string,
+  section: string,
+  categoryKey: string,
+): Promise<number[]> {
+  const database = await openLibraryDatabase(databaseName)
+
+  try {
+    const transaction = database.transaction('snapshots', 'readonly')
+    const complete = transactionCompleteForTest(transaction)
+    const keys = await requestValue(transaction.objectStore('snapshots').getAllKeys())
+    await complete
+
+    return keys
+      .filter(
+        (key): key is IDBValidKey[] =>
+          Array.isArray(key) && key[1] === section && key[2] === categoryKey,
+      )
+      .map((key) => Number(key[3]))
+      .sort((left, right) => left - right)
+  } finally {
+    database.close()
+  }
+}
+
+/** Maps each `searchIndexShards` generation to its surviving record count. */
+async function readShardGenerations(
+  databaseName: string,
+): Promise<Map<number, number>> {
+  const database = await openLibraryDatabase(databaseName)
+
+  try {
+    const transaction = database.transaction('searchIndexShards', 'readonly')
+    const complete = transactionCompleteForTest(transaction)
+    const keys = await requestValue(
+      transaction.objectStore('searchIndexShards').getAllKeys(),
+    )
+    await complete
+
+    const generations = new Map<number, number>()
+
+    for (const key of keys) {
+      const generation = Array.isArray(key) ? Number(key[2]) : Number.NaN
+      generations.set(generation, (generations.get(generation) ?? 0) + 1)
+    }
+
+    return generations
+  } finally {
+    database.close()
+  }
+}
+
+async function readRawRecord(
+  databaseName: string,
+  storeName: 'snapshots' | 'manifests',
+  key: IDBValidKey,
+): Promise<unknown> {
+  const database = await openLibraryDatabase(databaseName)
+
+  try {
+    const transaction = database.transaction(storeName, 'readonly')
+    const complete = transactionCompleteForTest(transaction)
+    const value = await requestValue(transaction.objectStore(storeName).get(key))
+    await complete
+    return value
+  } finally {
+    database.close()
+  }
 }
 
 function createRepository(

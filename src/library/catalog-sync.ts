@@ -5,20 +5,59 @@ import type {
   ProviderCatalogSyncPreflight,
 } from '../provider-broker'
 import { internalFaultTraceData } from './internal-fault-diagnostics'
+import type { SectionScanResult } from '../xtream-client'
 import type { Category, LibrarySection, StreamItem } from '../types'
 import {
+  assessLibraryStorageHeadroom,
+  measureLibraryStorage,
+  type LibraryStorageHeadroom,
+} from './storage-budget'
+import {
+  clearSyncBreadcrumb,
+  degradedFlushItems,
+  nextDegradationCount,
+  readSyncBreadcrumb,
+  writeSyncBreadcrumb,
+  type BreadcrumbStorage,
+  type SyncBreadcrumbStage,
+} from './sync-breadcrumb'
+import {
+  EmptySectionPublicationError,
   IndexedDbCatalogRepository,
   LibraryWriteAbortedError,
   type CooperativeWriteOptions,
   type LibraryCoverage,
+  type LibrarySyncSectionFailureDetail,
   type LibrarySyncSectionState,
+  type PartialSectionPublication,
+  type RebuildableCacheEvictionResult,
   type SnapshotPublishStage,
 } from './catalog-repository'
 
 export const CATALOG_SYNC_SECTIONS: readonly LibrarySection[] = ['live', 'vod', 'series']
 export const CATALOG_SYNC_DAILY_REQUEST_LIMIT = 6
 export const CATALOG_SYNC_HEADER_TIMEOUT_MS = 15_000
+/**
+ * Total scan deadline for a normal section. VOD is far larger and gets its own
+ * bound below: the response-byte ceiling is section-scaled, but the timeout used
+ * to be uniform, so VOD - measured at 71,541 ms standalone, with under 48 s of
+ * headroom against 120 s, and running third after two publications and two index
+ * builds - could exhaust the shared deadline while Live and Series never came
+ * close. Scaling the deadline to the section's measured response removes that.
+ */
 export const CATALOG_SYNC_TOTAL_TIMEOUT_MS = 120_000
+/**
+ * VOD scan deadline. VOD's ~79.7 MB response measured 71,541 ms alone on the
+ * real provider; on a scheduled run it also follows two other publications and
+ * index builds. On-device synthetic runs at true VOD scale (194k items, ~80 MB
+ * streamed through the real parser) exhausted both the shared 120 s bound
+ * (reached ~61k) and a 240 s bound (reached ~137k), so the deadline must be
+ * materially larger than either. 420 s keeps a bounded upper limit while giving
+ * the largest section the room the shared 120 s never did. The section-scaled
+ * response-byte ceiling remains the real size guard; this only stops a healthy,
+ * still-streaming VOD scan from being aborted mid-flight.
+ */
+export const CATALOG_SYNC_VOD_TOTAL_TIMEOUT_MS = 420_000
 export const CATALOG_SYNC_SUCCESS_COOLDOWN_MS = 24 * 60 * 60 * 1000
 export const CATALOG_SYNC_FAILURE_COOLDOWN_INITIAL_MS = 6 * 60 * 60 * 1000
 export const CATALOG_SYNC_FAILURE_COOLDOWN_MAX_MS = 24 * 60 * 60 * 1000
@@ -29,6 +68,47 @@ export const CATALOG_SYNC_REQUESTS_PER_COMPLETE_RUN = 6
  * snapshot limit so each parser checkpoint is one cooperative cache unit.
  */
 export const PARTIAL_CATEGORY_FLUSH_ITEMS = 128
+/**
+ * Minimum interval between `scanning` progress notifications. The scan fires a
+ * progress event per parsed batch (hundreds to thousands per section), and the
+ * UI sink recomputes an aria-live region on each one. Coalescing to a bounded
+ * rate keeps the accessibility-tree and layout cost off the parse's hot path
+ * while a large section streams, without changing the final reported count.
+ */
+export const CATALOG_SYNC_PROGRESS_THROTTLE_MS = 250
+/**
+ * The largest proportional drop in accepted records, relative to the section's
+ * prior authoritative item count, that a refresh may publish. A closed scan that
+ * retains less than this fraction is treated as a catastrophic collapse and
+ * refused, preserving the previous generation rather than keying the guard on an
+ * exact zero that a single surviving record would defeat.
+ */
+export const CATALOG_SYNC_COLLAPSE_RETAIN_RATIO = 0.1
+
+/**
+ * A closed section scan whose accepted records cannot justify replacing the
+ * current generation. Payload-free: it carries only the counts behind the
+ * refusal. Raised before publication so the previous manifest, snapshots, and
+ * derived index remain authoritative.
+ */
+export class SectionScanValidationError extends Error {
+  readonly code = 'section-scan-validation'
+  readonly rawItemCount: number
+  readonly acceptedItemCount: number
+  readonly priorItemCount: number
+
+  constructor(reason: string, counts: {
+    rawItemCount: number
+    acceptedItemCount: number
+    priorItemCount: number
+  }) {
+    super(reason)
+    this.name = 'SectionScanValidationError'
+    this.rawItemCount = counts.rawItemCount
+    this.acceptedItemCount = counts.acceptedItemCount
+    this.priorItemCount = counts.priorItemCount
+  }
+}
 /**
  * The physical VOD measurement completed at 79,696,256 bytes. 96 MiB leaves
  * more than 20 MiB of headroom while retaining a bounded sync-lane response.
@@ -85,6 +165,17 @@ export type CatalogSyncSectionResult = CatalogSyncSectionOutcome & {
   refused?: boolean
 }
 
+export type CatalogSyncStorageMaintenance =
+  | {
+      state: 'ready'
+      before: LibraryStorageHeadroom
+      after: LibraryStorageHeadroom
+      eviction: RebuildableCacheEvictionResult | null
+    }
+  | {
+      state: 'unavailable'
+    }
+
 export type CatalogSyncResult =
   | {
       status: 'completed' | 'failed' | 'cancelled'
@@ -94,6 +185,7 @@ export type CatalogSyncResult =
       issuedRequestCount: number | null
       nextDueAt: number
       sections: CatalogSyncSectionResult[]
+      storage?: CatalogSyncStorageMaintenance
     }
   | {
       status: 'busy' | 'cooldown' | 'deferred'
@@ -101,7 +193,14 @@ export type CatalogSyncResult =
       issuedRequestCount: 0
       nextDueAt?: number
       sections: []
+      storage?: CatalogSyncStorageMaintenance
     }
+
+export type CatalogSyncProgress = {
+  stage: 'starting' | 'categories' | 'scanning' | 'section-complete' | 'finishing'
+  section?: LibrarySection
+  itemsAcquired?: number
+}
 
 export type CatalogSyncRunOptions = {
   /**
@@ -128,6 +227,31 @@ export type CatalogSyncOptions = {
    * diagnostic builds. Provider failures remain fully classified and sanitized.
    */
   internalFaultDiagnostics?: boolean
+  /**
+   * Provides payload-free progress for the persistent UI indicator. It never
+   * changes the serial provider plan or exposes provider response content.
+   */
+  onProgress?: (progress: CatalogSyncProgress) => void
+  /**
+   * Overrides the crash-surviving breadcrumb store. Production uses the default
+   * `localStorage` key; the synthetic sync probe passes an isolated store so a
+   * renderer kill during a probe run cannot leave a marker that would degrade
+   * the next real sync's flush size.
+   */
+  breadcrumbStore?: BreadcrumbStorage | null
+  /**
+   * Overrides the `scanning` progress throttle window in milliseconds. Defaults
+   * to `CATALOG_SYNC_PROGRESS_THROTTLE_MS`. A value of 0 restores one event per
+   * parsed batch, which the on-device A/B uses to measure the unthrottled DOM
+   * sink against the throttled one.
+   */
+  progressThrottleMs?: number
+  /**
+   * Diagnostic-only override of the per-section scan `timeoutMs`. Omit for the
+   * production section-scaled deadline. The VOD-scale synthetic uses this to
+   * reproduce the old uniform 120 s bound.
+   */
+  scanTimeoutMs?: number
 }
 
 /**
@@ -148,8 +272,20 @@ export class CatalogSyncCoordinator {
   private readonly staleRunMs: number
   private readonly onSnapshotPut?: CooperativeWriteOptions['onSnapshotPut']
   private readonly internalFaultDiagnostics: boolean
+  private readonly onProgress?: (progress: CatalogSyncProgress) => void
+  /**
+   * Explicit breadcrumb store, or undefined to use the shared localStorage key.
+   * `false` in the option is not accepted; only a store or null/undefined.
+   */
+  private readonly breadcrumbStore?: BreadcrumbStorage | null
+  /** Throttle window for `scanning` progress; 0 restores per-batch emission. */
+  private readonly progressThrottleMs: number
+  /** Diagnostic override of the per-section scan deadline; undefined = scaled. */
+  private readonly scanTimeoutMsOverride?: number
   private activeController: AbortController | null = null
   private runSequence = 0
+  /** Wall-clock of the last emitted `scanning` progress event, for throttling. */
+  private lastScanProgressAt = 0
 
   constructor(
     provider: CatalogSyncProvider,
@@ -167,6 +303,23 @@ export class CatalogSyncCoordinator {
     this.staleRunMs = options.staleRunMs ?? CATALOG_SYNC_STALE_RUN_MS
     this.onSnapshotPut = options.onSnapshotPut
     this.internalFaultDiagnostics = options.internalFaultDiagnostics === true
+    this.onProgress = options.onProgress
+    this.breadcrumbStore = options.breadcrumbStore
+    this.progressThrottleMs =
+      options.progressThrottleMs ?? CATALOG_SYNC_PROGRESS_THROTTLE_MS
+    this.scanTimeoutMsOverride = options.scanTimeoutMs
+  }
+
+  private scanTimeoutMs(section: LibrarySection): number {
+    return this.scanTimeoutMsOverride ?? syncScanTimeoutMs(section)
+  }
+
+  /**
+   * Resolves the breadcrumb store to use. When the option is unset, the shared
+   * module default (localStorage) is used by passing `undefined` through.
+   */
+  private breadcrumb(): BreadcrumbStorage | null | undefined {
+    return this.breadcrumbStore
   }
 
   get isRunning(): boolean {
@@ -175,6 +328,90 @@ export class CatalogSyncCoordinator {
 
   cancel(): void {
     this.activeController?.abort()
+  }
+
+  private reportProgress(progress: CatalogSyncProgress): void {
+    this.onProgress?.(progress)
+  }
+
+  /**
+   * Emits a `scanning` progress event no more than once per throttle window.
+   * `force` bypasses the window for the boundary events (first batch of a
+   * section and the final count) so the count a reader sees always settles on
+   * the true total. Between those, intermediate batches are coalesced.
+   *
+   * A throttle window of 0 restores the pre-fix behaviour of one event per
+   * parsed batch. This exists so the on-device A/B (unthrottled `outerHTML`
+   * replacement versus throttled in-place mutation) is measurable from one
+   * build; production leaves it at the default.
+   */
+  private reportScanProgress(
+    section: LibrarySection,
+    itemsAcquired: number,
+    force = false,
+  ): void {
+    if (!this.onProgress) {
+      return
+    }
+
+    const now = this.now()
+
+    if (
+      !force &&
+      this.progressThrottleMs > 0 &&
+      now - this.lastScanProgressAt < this.progressThrottleMs
+    ) {
+      return
+    }
+
+    this.lastScanProgressAt = now
+    this.onProgress({ stage: 'scanning', section, itemsAcquired })
+  }
+
+  /**
+   * Refuses a closed scan whose accepted records cannot justify replacing the
+   * current generation. Throws {@link SectionScanValidationError} before any
+   * publication; a passing scan returns silently.
+   */
+  private assertScanIsPublishable(
+    scanResult: { rawItemCount: number; acceptedItemCount: number },
+    streamedRecordCount: number,
+    priorItemCount: number,
+  ): void {
+    const accepted = Math.max(scanResult.acceptedItemCount, streamedRecordCount)
+
+    // A response that carried records but produced none we could identify is a
+    // parser/identity failure regardless of whether a prior generation exists.
+    if (accepted === 0 && scanResult.rawItemCount > 0) {
+      throw new SectionScanValidationError(
+        `A closed scan parsed ${scanResult.rawItemCount} record(s) but none were ` +
+          'identifiable; publication refused.',
+        {
+          rawItemCount: scanResult.rawItemCount,
+          acceptedItemCount: accepted,
+          priorItemCount,
+        },
+      )
+    }
+
+    // A near-total collapse against a populated prior generation is refused even
+    // when a few records survive, so a healthy section is never overwritten by a
+    // degenerate response.
+    if (
+      priorItemCount > 0 &&
+      accepted > 0 &&
+      accepted < priorItemCount * CATALOG_SYNC_COLLAPSE_RETAIN_RATIO
+    ) {
+      throw new SectionScanValidationError(
+        `A closed scan retained only ${accepted} of ${priorItemCount} prior item(s), ` +
+          'below the collapse threshold; publication refused.',
+        {
+          rawItemCount: scanResult.rawItemCount,
+          acceptedItemCount: accepted,
+          priorItemCount,
+        },
+      )
+    }
   }
 
   async sync(
@@ -221,12 +458,87 @@ export class CatalogSyncCoordinator {
       }
     }
 
+    /*
+     * A breadcrumb left in a working stage means the previous run never reached
+     * `finished`: it crashed or the renderer was killed. Rather than repeat the
+     * work that ended it, halve the flush size for this run. Cancellation clears
+     * the breadcrumb, so a paused run is not treated as a failure.
+     */
+    const priorBreadcrumb = readSyncBreadcrumb(this.breadcrumb())
+    const degradations = nextDegradationCount(priorBreadcrumb)
+    const flushItems = degradedFlushItems(PARTIAL_CATEGORY_FLUSH_ITEMS, priorBreadcrumb)
+    const markStage = (
+      stage: SyncBreadcrumbStage,
+      section: LibrarySection | null = null,
+      itemCount = 0,
+    ): void => {
+      writeSyncBreadcrumb({
+        stage,
+        section,
+        itemCount,
+        degradations,
+        updatedAt: this.now(),
+      }, this.breadcrumb())
+    }
+
+    if (flushItems !== PARTIAL_CATEGORY_FLUSH_ITEMS) {
+      performanceTrace.event('library', 'catalog-sync-degraded-batch', {
+        priorStage: priorBreadcrumb?.stage ?? null,
+        priorSection: priorBreadcrumb?.section ?? null,
+        priorItemCount: priorBreadcrumb?.itemCount ?? 0,
+        degradations,
+        flushItems,
+      })
+    }
+
+    markStage('starting')
+    markStage('storage-preflight')
+    const storage = await this.maintainStorageHeadroom(profileId)
+
+    if (storage.state !== 'ready' || !storage.after.allowed) {
+      performanceTrace.event('library', 'catalog-sync-storage-deferred', {
+        storageAvailable: storage.state === 'ready',
+        storageSource: storage.state === 'ready' ? storage.after.source : null,
+        evictionPerformed: storage.state === 'ready' && storage.eviction !== null,
+      })
+      /*
+       * A storage deferral is an ordinary, non-crash exit that returns while the
+       * breadcrumb still reads `storage-preflight`. Leaving that working-stage
+       * marker would make the next run misclassify this as a renderer kill and
+       * needlessly halve its flush size, so clear it as terminal.
+       */
+      clearSyncBreadcrumb(this.breadcrumb())
+      return {
+        status: 'deferred',
+        requestCount: 0,
+        issuedRequestCount: 0,
+        sections: [],
+        storage,
+      }
+    }
+
+    performanceTrace.event('library', 'catalog-sync-storage-ready', {
+      storageSource: storage.after.source,
+      storageUsageBytes: storage.after.usageBytes,
+      storageQuotaBytes: storage.after.quotaBytes,
+      storageHeadroomBytes: storage.after.availableBytes,
+      evictionPerformed: storage.eviction !== null,
+    })
+
     const controller = new AbortController()
     this.activeController = controller
     const runId = `catalog-sync-${now}-${this.runSequence += 1}`
+    this.reportProgress({ stage: 'starting' })
+
 
     if (!await this.repository.tryBeginSync(profileId, runId, this.staleRunMs)) {
       this.activeController = null
+      /*
+       * A failed sync lease is a clean early return, not a crash: another run
+       * already owns the breadcrumb. Clear the working-stage marker this attempt
+       * wrote so it cannot be read as an unfinished run by the next launch.
+       */
+      clearSyncBreadcrumb(this.breadcrumb())
       return { status: 'busy', requestCount: 0, issuedRequestCount: 0, sections: [] }
     }
 
@@ -305,6 +617,8 @@ export class CatalogSyncCoordinator {
         }
 
         const attemptAt = this.now()
+        this.reportProgress({ stage: 'categories', section })
+        markStage('categories', section)
 
         const finishRequest = beginProviderRequest(section)
 
@@ -405,6 +719,8 @@ export class CatalogSyncCoordinator {
           sectionStates,
           controller.signal,
           () => beginProviderRequest(section),
+          flushItems,
+          markStage,
           runOptions.maxResponseBytes ?? syncResponseByteLimit(section),
         )
         sections.push(result)
@@ -423,11 +739,22 @@ export class CatalogSyncCoordinator {
       }
     } finally {
       const currentTime = this.now()
+      this.reportProgress({ stage: 'finishing' })
       const outcome = cancelled || controller.signal.aborted
         ? 'cancelled'
         : failed
           ? 'failed'
           : 'completed'
+      /*
+       * Reaching here at all means the run ended in JavaScript rather than being
+       * killed, so the breadcrumb has done its job. A recorded failure is already
+       * described by the persisted section checkpoints.
+       */
+      if (outcome === 'cancelled') {
+        clearSyncBreadcrumb(this.breadcrumb())
+      } else {
+        markStage('finished')
+      }
       const updatedMeta = await this.repository.updateSyncState(
         profileId,
         runId,
@@ -490,7 +817,49 @@ export class CatalogSyncCoordinator {
         issuedRequestCount,
         nextDueAt,
         sections: reportedSections,
+        storage,
       }
+    }
+  }
+
+  /**
+   * Provider work is not allowed to begin while the local durable catalog lacks
+   * its reserved write headroom. Rebuildable data is evicted in repository
+   * order (EPG, details, search indexes, superseded snapshots) before deferral;
+   * active catalog snapshots and localStorage user state remain protected.
+   */
+  private async maintainStorageHeadroom(
+    profileId: string,
+  ): Promise<CatalogSyncStorageMaintenance> {
+    try {
+      const beforeEstimate = await this.repository.estimateProfileStorage(profileId)
+      const before = assessLibraryStorageHeadroom(
+        await measureLibraryStorage(beforeEstimate.byteEstimate),
+      )
+
+      if (before.allowed) {
+        return {
+          state: 'ready',
+          before,
+          after: before,
+          eviction: null,
+        }
+      }
+
+      const eviction = await this.repository.evictRebuildableData(profileId)
+      const afterEstimate = await this.repository.estimateProfileStorage(profileId)
+      const after = assessLibraryStorageHeadroom(
+        await measureLibraryStorage(afterEstimate.byteEstimate),
+      )
+
+      return {
+        state: 'ready',
+        before,
+        after,
+        eviction,
+      }
+    } catch {
+      return { state: 'unavailable' }
     }
   }
 
@@ -503,19 +872,44 @@ export class CatalogSyncCoordinator {
     states: Map<LibrarySection, LibrarySyncSectionState>,
     signal: AbortSignal,
     recordRequest: () => (() => void),
+    flushItems: number,
+    markStage: (
+      stage: SyncBreadcrumbStage,
+      section: LibrarySection | null,
+      itemCount: number,
+    ) => void,
     maxResponseBytes?: number,
   ): Promise<CatalogSyncSectionOutcome> {
     const attemptAt = this.now()
-    const incrementalPublication = state.coverage !== 'complete'
-    const buckets = incrementalPublication ? null : new Map<string, StreamItem[]>()
+    /*
+     * Every whole-section scan publishes incrementally, whatever the section's
+     * current coverage. The accumulate-then-publish alternative held the entire
+     * section in memory and produced a 2.3 s unyielded main-thread span at Live
+     * scale on the physical target, and four consecutive Live acquisitions
+     * terminated the renderer at exactly that transition. The chunked path yields
+     * between bounded flushes, keeps partial generations invisible to readers, and
+     * promotes only on a closed top-level array; it has completed 194,302 items on
+     * the same hardware. Coverage-dependent branching bought nothing and left the
+     * larger sections on the unproven path.
+     */
     const categoryById = new Map(categories.map((category) => [category.id, category]))
     const pendingByCategory = new Map<string, StreamItem[]>()
-    const partialCategoryKeys = new Set<string>()
+    let publication: PartialSectionPublication | null = null
+    const requirePublication = (): PartialSectionPublication => {
+      if (!publication) {
+        throw new Error('The section publication was not opened before its first flush.')
+      }
+
+      return publication
+    }
     const heap = createHeapSampler()
     let streamedRecordCount = 0
     let nextHeapSampleAt = 1_024
+    let nextBreadcrumbAt = 2_048
     let failureStage: CatalogSyncFailureStage = 'provider-scan'
     let publishStage: SnapshotPublishStage | null = null
+    let scanStartedAt = 0
+    let lastScanStatistics: SectionScanResult | null = null
 
     const categoryForKey = (categoryKey: string): Category => {
       const known = categoryById.get(categoryKey)
@@ -541,13 +935,10 @@ export class CatalogSyncCoordinator {
 
       pendingByCategory.delete(categoryKey)
       failureStage = 'snapshot-publish'
-      await this.repository.appendPartialCategorySnapshot(
+      await requirePublication().appendCategoryItems(
         {
-          profileId,
-          section,
           category: categoryForKey(categoryKey),
           items,
-          runId,
         },
         {
           signal,
@@ -557,7 +948,6 @@ export class CatalogSyncCoordinator {
           },
         },
       )
-      partialCategoryKeys.add(categoryKey)
       failureStage = 'provider-scan'
     }
 
@@ -570,100 +960,106 @@ export class CatalogSyncCoordinator {
     const finishRequest = recordRequest()
 
     try {
-      if (incrementalPublication) {
-        failureStage = 'snapshot-publish'
-        await this.repository.preparePartialSectionSnapshotRun(profileId, section, runId)
-        failureStage = 'provider-scan'
-      }
+      failureStage = 'snapshot-publish'
+      publication = await this.repository.openPartialSectionPublication(
+        profileId,
+        section,
+        runId,
+      )
+      failureStage = 'provider-scan'
+      /*
+       * Mark the scan boundary immediately. Without this a targeted run stays
+       * labelled `storage-preflight` until the first 2,048-record breadcrumb, so
+       * a crash before record 2,048 could not be told apart from a pre-scan
+       * failure. The count is 0 until the first bounded checkpoint updates it.
+       */
+      markStage('scanning', section, 0)
+      this.lastScanProgressAt = 0
+      scanStartedAt = this.now()
 
-      await this.provider.backgroundScanSection(section, {
+      const scanResult = await this.provider.backgroundScanSection(section, {
         signal,
         responseTimeoutMs: CATALOG_SYNC_HEADER_TIMEOUT_MS,
-        timeoutMs: CATALOG_SYNC_TOTAL_TIMEOUT_MS,
+        timeoutMs: this.scanTimeoutMs(section),
         maxResponseBytes,
+        onScanStatistics: (statistics) => {
+          // Captured continuously so the catch block can persist detail even when
+          // the scan throws before returning its result.
+          lastScanStatistics = statistics
+        },
         onMatches: async (batch) => {
+          const firstBatch = streamedRecordCount === 0
           streamedRecordCount += batch.length
+          this.reportScanProgress(section, streamedRecordCount, firstBatch)
 
           if (streamedRecordCount >= nextHeapSampleAt) {
             heap.sample()
             nextHeapSampleAt = streamedRecordCount + 1_024
           }
 
+          /*
+           * Bounded rate: one synchronous storage write per 2,048 records rather
+           * than per batch. This marker survives a renderer kill and names the
+           * record count the previous run reached.
+           */
+          if (streamedRecordCount >= nextBreadcrumbAt) {
+            markStage('scanning', section, streamedRecordCount)
+            nextBreadcrumbAt = streamedRecordCount + 2_048
+          }
+
           for (const item of batch) {
             const categoryKey = item.categoryId || 'uncategorized'
+            const pending = pendingByCategory.get(categoryKey) ?? []
+            pending.push(item)
+            pendingByCategory.set(categoryKey, pending)
 
-            if (incrementalPublication) {
-              const pending = pendingByCategory.get(categoryKey) ?? []
-              pending.push(item)
-              pendingByCategory.set(categoryKey, pending)
-
-              if (pending.length >= PARTIAL_CATEGORY_FLUSH_ITEMS) {
-                await flushPartialCategory(categoryKey)
-              }
-              continue
-            }
-
-            const existing = buckets!.get(categoryKey)
-
-            if (existing) {
-              existing.push(item)
-            } else {
-              buckets!.set(categoryKey, [item])
+            if (pending.length >= flushItems) {
+              await flushPartialCategory(categoryKey)
             }
           }
         },
       })
 
       finishRequest()
+
+      /*
+       * Validate the closed scan against the typed provider statistics before any
+       * publication. Two cases the exact-zero commit guard cannot see:
+       *
+       *  - raw records arrived but none were identifiable (accepted 0, raw > 0):
+       *    reject even on a first acquisition, because an all-unidentifiable
+       *    response is a parser/identity failure, not an empty catalog; and
+       *  - a catastrophic collapse against the prior authoritative count, so a
+       *    single surviving record among tens of thousands cannot mask a
+       *    near-total identifier loss and overwrite a healthy section.
+       *
+       * A genuinely empty first acquisition (raw 0, no prior items) still passes.
+       */
+      failureStage = 'empty-validation'
+      const priorItemCount = requirePublication().priorAuthoritativeItemCount
+      this.assertScanIsPublishable(scanResult, streamedRecordCount, priorItemCount)
+
       failureStage = 'snapshot-publish'
+      // The transition four consecutive Live acquisitions never survived.
+      markStage('publishing', section, streamedRecordCount)
 
-      if (incrementalPublication) {
-        await flushPartialSnapshots()
-
-        for (const category of categories) {
-          if (partialCategoryKeys.has(category.id)) {
-            continue
-          }
-
-          await this.repository.appendPartialCategorySnapshot(
-            {
-              profileId,
-              section,
-              category,
-              items: [],
-              runId,
-            },
-            {
-              signal,
-              onSnapshotPut: this.onSnapshotPut,
-              onPublishStage: (stage) => {
-                publishStage = stage
-              },
-            },
-          )
-          partialCategoryKeys.add(category.id)
-        }
-
-        await this.repository.promotePartialSectionSnapshots(profileId, section, runId)
-      } else {
-        await this.repository.replaceSectionSnapshots(
-          {
-            profileId,
-            section,
-            runId,
-            snapshots: snapshotsForWholeSection(categories, buckets!),
-          },
-          {
-            signal,
-            onSnapshotPut: this.onSnapshotPut,
-            onPublishStage: (stage) => {
-              publishStage = stage
-            },
-          },
-        )
-      }
+      await flushPartialSnapshots()
+      /*
+       * One manifest write promotes the whole run. Categories the closed array
+       * never mentioned are committed complete with zero items. `commit` refuses
+       * to promote a zero-item run over a section that still holds items, so an
+       * all-unidentifiable response leaves the previous generation authoritative.
+       */
+      await requirePublication().commit({
+        signal,
+        onSnapshotPut: this.onSnapshotPut,
+        onPublishStage: (stage) => {
+          publishStage = stage
+        },
+      })
       failureStage = 'manifest-read'
       const manifest = await this.repository.getManifest(profileId, section)
+      markStage('indexing', section, streamedRecordCount)
 
       /*
        * Search postings are derived only after the strict array has closed and
@@ -709,7 +1105,13 @@ export class CatalogSyncCoordinator {
         maxResponseBytes,
         heap,
       )
+      markStage('section-complete', section, streamedRecordCount)
 
+      this.reportProgress({
+        stage: 'section-complete',
+        section,
+        itemsAcquired: streamedRecordCount,
+      })
       return { section, mode: 'whole-section', success: true }
     } catch (reason) {
       finishRequest()
@@ -725,6 +1127,9 @@ export class CatalogSyncCoordinator {
         return { section, mode: 'whole-section', success: false, reason: 'cancelled' }
       }
 
+      const emptyRefusal =
+        reason instanceof EmptySectionPublicationError ||
+        reason instanceof SectionScanValidationError
       const refused = isProviderRefusal(reason)
       traceWholeSectionMemory(
         section,
@@ -736,19 +1141,47 @@ export class CatalogSyncCoordinator {
       traceSectionFailure(
         section,
         'whole-section',
-        failureStage,
+        emptyRefusal ? 'empty-validation' : failureStage,
         publishStage,
         reason,
         refused,
         this.internalFaultDiagnostics,
       )
       const manifest = await this.repository.getManifest(profileId, section)
+      const now = this.now()
+      /*
+       * Persist per-section failure detail in the sync meta record. Unlike the
+       * single global breadcrumb - which a later section's success overwrites -
+       * this survives the run's terminal state, so a mid-run section failure can
+       * be diagnosed after the fact without another provider request. Payload-free.
+       */
+      // Read through a widening cast: the value is assigned inside the scan's
+      // onScanStatistics callback, which the compiler's control-flow analysis
+      // does not observe, so it would otherwise narrow this to `null`.
+      const stats = lastScanStatistics as SectionScanResult | null
+      const failureDetail: LibrarySyncSectionFailureDetail = {
+        failureStage: emptyRefusal ? 'empty-validation' : failureStage,
+        failureKind: classifyFailureKind(reason, emptyRefusal, refused),
+        streamedRecordCount,
+        elapsedMs: scanStartedAt > 0 ? Math.max(0, now - scanStartedAt) : undefined,
+        refused,
+        updatedAt: now,
+        ...(stats
+          ? {
+              rawItemCount: stats.rawItemCount,
+              acceptedItemCount: stats.acceptedItemCount,
+              bytesReceived: stats.bytesReceived,
+              arrayClosed: stats.arrayClosed,
+            }
+          : {}),
+      }
       await this.updateSectionState(profileId, runId, section, states, {
         coverage: manifest?.coverage.state ?? state.coverage,
         wholeSectionFailureCount: state.wholeSectionFailureCount + 1,
         nextCategoryCursor: firstIncompleteCategoryCursor(categories, manifest),
         lastAttemptAt: attemptAt,
-        lastFailureAt: this.now(),
+        lastFailureAt: now,
+        lastFailureDetail: failureDetail,
       })
       return {
         section,
@@ -798,9 +1231,16 @@ export class CatalogSyncCoordinator {
         signal,
         categoryId: category.id,
         responseTimeoutMs: CATALOG_SYNC_HEADER_TIMEOUT_MS,
-        timeoutMs: CATALOG_SYNC_TOTAL_TIMEOUT_MS,
+        timeoutMs: this.scanTimeoutMs(section),
         maxResponseBytes: syncResponseByteLimit(section),
-        onMatches: (batch) => items.push(...batch),
+        onMatches: (batch) => {
+          items.push(...batch)
+          this.reportProgress({
+            stage: 'scanning',
+            section,
+            itemsAcquired: items.length,
+          })
+        },
       })
 
       finishRequest()
@@ -869,6 +1309,11 @@ export class CatalogSyncCoordinator {
         lastSuccessAt: this.now(),
       })
 
+      this.reportProgress({
+        stage: 'section-complete',
+        section,
+        itemsAcquired: items.length,
+      })
       return {
         section,
         mode: 'category-slice',
@@ -954,6 +1399,16 @@ function syncResponseByteLimit(section: LibrarySection): number | undefined {
   return section === 'vod' ? VOD_SYNC_MAX_RESPONSE_BYTES : undefined
 }
 
+/**
+ * Total scan deadline scaled to the section's measured response, so the largest
+ * section is not starved of time by a bound sized for the smallest.
+ */
+function syncScanTimeoutMs(section: LibrarySection): number {
+  return section === 'vod'
+    ? CATALOG_SYNC_VOD_TOTAL_TIMEOUT_MS
+    : CATALOG_SYNC_TOTAL_TIMEOUT_MS
+}
+
 function firstIncompleteCategoryCursor(
   categories: readonly Category[],
   manifest: Awaited<ReturnType<IndexedDbCatalogRepository['getManifest']>>,
@@ -991,32 +1446,6 @@ function uniqueCategories(categories: readonly Category[]): Category[] {
   }
 
   return [...unique.values()]
-}
-
-function snapshotsForWholeSection(
-  categories: readonly Category[],
-  buckets: ReadonlyMap<string, readonly StreamItem[]>,
-): Array<{ category: Category; categoryKey: string; items: readonly StreamItem[] }> {
-  const categoryById = new Map<string, Category>()
-
-  for (const category of categories) {
-    categoryById.set(category.id, category)
-  }
-
-  for (const categoryId of buckets.keys()) {
-    if (!categoryById.has(categoryId)) {
-      categoryById.set(categoryId, {
-        id: categoryId,
-        name: categoryId === 'uncategorized' ? 'Uncategorized' : `Category ${categoryId}`,
-      })
-    }
-  }
-
-  return [...categoryById.values()].map((category) => ({
-    category,
-    categoryKey: category.id,
-    items: buckets.get(category.id) ?? [],
-  }))
 }
 
 type HeapSampler = {
@@ -1093,6 +1522,7 @@ function failureCooldownMs(
 type CatalogSyncFailureStage =
   | 'provider-scan'
   | 'snapshot-publish'
+  | 'empty-validation'
   | 'manifest-read'
   | 'sync-state'
 
@@ -1142,4 +1572,35 @@ function isCancelled(reason: unknown, signal: AbortSignal): boolean {
     reason instanceof LibraryWriteAbortedError ||
     (isProviderError(reason) && reason.kind === 'cancelled')
   )
+}
+
+/**
+ * A short, payload-free classification of a whole-section failure for the
+ * persisted per-section detail. Provider errors contribute only their `kind`
+ * (e.g. `timeout`, `too-large`, `rate-limited`), never message text.
+ */
+function classifyFailureKind(
+  reason: unknown,
+  emptyRefusal: boolean,
+  refused: boolean,
+): string {
+  if (emptyRefusal) {
+    return reason instanceof SectionScanValidationError
+      ? 'scan-validation'
+      : 'empty-publication'
+  }
+
+  if (refused) {
+    return isProviderError(reason) ? `refused:${reason.kind}` : 'refused'
+  }
+
+  if (isProviderError(reason)) {
+    return `provider:${reason.kind}`
+  }
+
+  if (reason instanceof LibraryWriteAbortedError) {
+    return 'library-write-aborted'
+  }
+
+  return reason instanceof Error ? reason.name : 'unknown'
 }

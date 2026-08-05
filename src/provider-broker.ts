@@ -7,7 +7,12 @@ import {
 } from './provider-search-guard'
 import { ProviderError } from './provider-error'
 import type { ProviderTransport } from './provider-transport'
-import { XtreamClient, type StreamScanOptions } from './xtream-client'
+import {
+  XtreamClient,
+  type SectionScanResult,
+  type StreamScanOptions,
+  type StreamSearchOptions,
+} from './xtream-client'
 import type {
   AccountSummary,
   Category,
@@ -153,6 +158,21 @@ export class ProviderBroker {
     )
   }
 
+  /**
+   * One explicit submitted live-search request. Callers must select the section
+   * themselves; this broker deliberately never fans one user query out across
+   * multiple provider sections.
+   */
+  searchStreams(
+    section: LibrarySection,
+    query: string,
+    options: StreamSearchOptions = {},
+  ): Promise<StreamItem[]> {
+    return this.request('interactive', 'interactive', options.signal, (client) =>
+      client.searchStreams(section, query, options),
+    )
+  }
+
   backgroundCategories(
     section: LibrarySection,
     signal?: AbortSignal,
@@ -177,7 +197,7 @@ export class ProviderBroker {
   backgroundScanSection(
     section: LibrarySection,
     options: StreamScanOptions = {},
-  ): Promise<void> {
+  ): Promise<SectionScanResult> {
     return this.request('background', 'sync', options.signal, (client) =>
       client.scanSection(section, options),
     )

@@ -51,14 +51,18 @@ export function foldText(value: string): string {
 }
 
 /**
- * Split a raw query into folded search tokens. Whitespace-separated so that
- * "office us" becomes ["office", "us"] and matches "The Office (US)" regardless
- * of word order or punctuation between the words.
+ * Produce folded word tokens for every Unicode letter/number run. This is the
+ * shared tokenizer for full scans, index construction, and indexed queries:
+ * punctuation and whitespace are separators, while every script remains
+ * searchable (including Cyrillic, Arabic, CJK, and supplementary-plane text).
  */
+export function searchTokens(value: string): string[] {
+  return foldText(value).match(/[\p{L}\p{N}]+/gu) ?? []
+}
+
+/** Split a raw query with the same Unicode separator rules as the search index. */
 export function queryTokens(query: string): string[] {
-  const folded = foldText(query)
-  const tokens = folded.match(/[^\s]+/g)
-  return tokens !== null ? tokens : []
+  return searchTokens(query)
 }
 
 /**

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { foldText, matchesQuery, normalizeQuery, queryTokens } from './search'
+import { foldText, matchesQuery, normalizeQuery, queryTokens, searchTokens } from './search'
 
 describe('foldText', () => {
   it('lowercases and strips Latin diacritics', () => {
@@ -19,9 +19,19 @@ describe('foldText', () => {
 })
 
 describe('queryTokens', () => {
-  it('splits on whitespace and folds each token', () => {
+  it('splits on punctuation/whitespace and folds each token', () => {
     expect(queryTokens('  Office   US ')).toEqual(['office', 'us'])
     expect(queryTokens('Pokémon')).toEqual(['pokemon'])
+    expect(queryTokens('Office—US / 2026')).toEqual(['office', 'us', '2026'])
+  })
+
+  it('keeps Unicode word tokens from every supported script', () => {
+    expect(searchTokens('Новости, أخبار، 映画 東京')).toEqual([
+      'новости',
+      'أخبار',
+      '映画',
+      '東京',
+    ])
   })
 
   it('returns an empty list for blank input', () => {

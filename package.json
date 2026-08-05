@@ -5,14 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && node scripts/check-import-cycles.mjs && vite build && node scripts/check-webos-bundle.mjs && npm run build:library-probe-worker",
+    "build": "tsc && node scripts/check-import-cycles.mjs && vite build && node scripts/check-webos-bundle.mjs && node scripts/check-css-baseline.mjs && npm run build:library-probe-worker",
     "build:library-probe-worker": "vite build --config vite.worker.config.ts",
     "test": "vitest run",
     "test:proxy": "vitest run metadata-proxy/worker.test.ts",
     "preview": "vite preview",
     "proxy:dev": "wrangler dev --config metadata-proxy/wrangler.toml",
     "proxy:deploy": "wrangler deploy --config metadata-proxy/wrangler.toml",
-    "package:webos": "npm run build && ares-package webos-app -o packages"
+    "package:webos": "npm run build && node scripts/require-metadata-proxy.mjs && ares-package webos-app -o packages"
   },
   "devDependencies": {
     "fake-indexeddb": "^6.2.5",

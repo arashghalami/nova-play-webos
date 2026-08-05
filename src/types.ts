@@ -178,6 +178,13 @@ export interface StreamItem {
   seriesId?: string
   plot?: string
   channelNumber?: string
+  /**
+   * Provider-declared EPG channel identifier (Xtream `epg_channel_id`). It is a
+   * plain guide-mapping token, never credential- or URL-bearing, and is used to
+   * align a channel with a schedule source. Optional because many channels have
+   * no guide mapping.
+   */
+  epgChannelId?: string
   catchup?: CatchupCapability
   directSource?: string
   season?: string

@@ -73,9 +73,37 @@ export type StreamScanOptions = RequestOptions & {
    * callbacks whose expression body returns an incidental value.
    */
   onMatches?: (matches: StreamItem[]) => void
+  /**
+   * Reports payload-free scan statistics once the scan terminates, on success
+   * or failure. Catalog synchronization uses this to reason about raw-versus-
+   * accepted record counts without a second pass over the response.
+   */
+  onScanStatistics?: (statistics: SectionScanResult) => void
 }
 
-type StreamSearchOptions = StreamScanOptions & {
+/**
+ * Payload-free statistics for one completed section scan. The coordinator uses
+ * these to distinguish a genuinely empty provider array from a non-empty
+ * response whose records were all unidentifiable, so a catastrophic collapse
+ * cannot silently erase an authoritative section, and a single surviving record
+ * among tens of thousands cannot mask a near-total identifier loss.
+ */
+export type SectionScanResult = {
+  /** Top-level array members observed, before any parse or identity check. */
+  rawItemCount: number
+  /** Records that parsed as JSON objects without throwing. */
+  parsedItemCount: number
+  /** Parsed records that yielded a usable identity (a non-empty id). */
+  acceptedItemCount: number
+  /** Parsed records rejected for a missing/empty section identifier. */
+  missingIdentifierCount: number
+  /** Bytes read from the response body. */
+  bytesReceived: number
+  /** True only when the strict top-level array closed cleanly. */
+  arrayClosed: boolean
+}
+
+export type StreamSearchOptions = StreamScanOptions & {
   limit?: number
   excludeCategoryIds?: ReadonlySet<string>
   matchAll?: boolean
@@ -997,14 +1025,29 @@ export class XtreamClient {
   async scanSection(
     section: LibrarySection,
     options: StreamScanOptions = {},
-  ): Promise<void> {
+  ): Promise<SectionScanResult> {
+    let statistics: SectionScanResult = {
+      rawItemCount: 0,
+      parsedItemCount: 0,
+      acceptedItemCount: 0,
+      missingIdentifierCount: 0,
+      bytesReceived: 0,
+      arrayClosed: false,
+    }
+
     await this.searchStreams(section, '', {
       ...options,
       matchAll: true,
       requireCompleteArray: true,
       limit: Number.MAX_SAFE_INTEGER,
       collectMatches: false,
+      onScanStatistics: (value) => {
+        statistics = value
+        options.onScanStatistics?.(value)
+      },
     })
+
+    return statistics
   }
 
   async searchStreams(
@@ -1058,6 +1101,8 @@ export class XtreamClient {
     let responseHeaderElapsedMs: number | null = null
     let bytesReceived = 0
     let recordsParsed = 0
+    let rawTopLevelCount = 0
+    let missingIdentifierCount = 0
     let matchCount = 0
     let pendingMatches: StreamItem[] = []
     let objectParts: string[] = []
@@ -1114,6 +1159,7 @@ export class XtreamClient {
       // pure-ASCII record on the native lowercase fast path; only pay the
       // per-character fold when the source actually contains accents (so an
       // accented title still survives the prefilter, confirmed below).
+      rawTopLevelCount += 1
       const haystack = NON_ASCII_PATTERN.test(source)
         ? foldText(source)
         : source.toLowerCase()
@@ -1147,6 +1193,8 @@ export class XtreamClient {
           }
 
           pendingMatches.push(stream)
+        } else {
+          missingIdentifierCount += 1
         }
       } catch (reason) {
         if (options.requireCompleteArray) {
@@ -1461,6 +1509,7 @@ export class XtreamClient {
       throw reason
     } finally {
       if (options.requireCompleteArray) {
+        const arrayClosed = hasCompleteArrayRoot(rootState)
         performanceTrace.event(
           'data',
           'xtream-catalog-scan-terminal',
@@ -1473,7 +1522,10 @@ export class XtreamClient {
             elapsedMs: Date.now() - scanStartedAt,
             bytesReceived,
             recordsParsed,
-            topLevelArrayClosed: hasCompleteArrayRoot(rootState),
+            rawItemCount: rawTopLevelCount,
+            acceptedItemCount: matchCount,
+            missingIdentifierCount,
+            topLevelArrayClosed: arrayClosed,
             scanTimedOut: timedOut,
             scanSucceeded,
             failureKind: terminalFailureKind,
@@ -1481,6 +1533,14 @@ export class XtreamClient {
           },
           { requestId: requestId ?? undefined },
         )
+        options.onScanStatistics?.({
+          rawItemCount: rawTopLevelCount,
+          parsedItemCount: recordsParsed,
+          acceptedItemCount: matchCount,
+          missingIdentifierCount,
+          bytesReceived,
+          arrayClosed,
+        })
       }
 
       performanceTrace.endRequest(requestId, {
@@ -1661,6 +1721,7 @@ export class XtreamClient {
       containerExtension: readString(record.container_extension),
       seriesId: readString(record.series_id),
       channelNumber: readString(record.num),
+      epgChannelId: readString(record.epg_channel_id),
       catchup: parseCatchup(record),
       directSource: readString(record.direct_source),
       searchName: foldText(name),

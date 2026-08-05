@@ -103,8 +103,11 @@ import {
   runLibraryCapabilityProbe,
   type CapabilityProbeRunOptions,
   type CatalogSyncStorageInspection,
+  type VideoSizingReport,
+  type VideoSizingSample,
 } from './library/capability-probe'
 import { runPublicationProbe } from './library/publication-probe'
+import { cleanupSyncSimulation, runSyncSimulationProbe } from './library/sync-simulation-probe'
 import {
   armFlatSnapshotPlaybackStartup,
   deleteFlatSnapshotDatabase,
@@ -124,8 +127,11 @@ import {
 } from './library/catalog-repository'
 import {
   CATALOG_SYNC_SECTIONS,
+  CATALOG_SYNC_STALE_RUN_MS,
   CatalogSyncCoordinator,
   VOD_SYNC_MEASUREMENT_MAX_RESPONSE_BYTES,
+  type CatalogSyncProgress,
+  type CatalogSyncResult,
   type CatalogSyncRunOptions,
 } from './library/catalog-sync'
 import { catalogSyncRearmDelay } from './library/catalog-sync-scheduler'
@@ -152,7 +158,25 @@ type CatalogState = {
   isFavorites: boolean
   sort: CatalogSort
   availabilityMessage?: string
+  /**
+   * The default category view retains only its visible page. Filtering/sorting
+   * deliberately materializes the category because those operations need its
+   * complete local set.
+   */
+  windowedCategory?: boolean
+  totalStreamCount?: number
   results?: CatalogResults
+  source?: 'downloaded' | 'live'
+}
+
+type GuideState = {
+  categories: Category[]
+  category: Category | null
+  streams: StreamItem[]
+  page: number
+  pageCount: number
+  totalStreamCount: number
+  availabilityMessage?: string
 }
 
 type CachedStreams = {
@@ -200,6 +224,15 @@ type GlobalSearchViewUpdate = {
 }
 
 type PlayerUiMode = 'immersive' | 'overlay' | 'focused' | 'seeking'
+
+type LibrarySyncUiState = {
+  outcome: 'idle' | 'running' | 'completed' | 'failed' | 'cancelled' | 'cooldown' | 'deferred'
+  incompleteSections: LibrarySection[]
+  currentSection?: LibrarySection
+  itemsAcquired?: number
+  nextDueAt?: number
+  failedSections: LibrarySection[]
+}
 const CATALOG_PAGE_SIZE = 60
 const WEBOS_CATALOG_PAGE_SIZE = 24
 // Local, in-memory catalog filtering is cheap, so it can react faster than the
@@ -215,14 +248,17 @@ const GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT = 12
 const MIN_GLOBAL_SEARCH_LENGTH = 2
 const MAX_NOW_NEXT_ENTRIES = 600
 const NOW_NEXT_CACHE_TTL_MS = 5 * 60_000
+const EPG_CACHE_TTL_MS = 15 * 60_000
+const DETAIL_CACHE_TTL_MS = 12 * 60 * 60_000
 const PLAYBACK_ATTEMPT_TIMEOUT_MS = 12_000
 // Older webOS Chromium eagerly decodes every image in a 60-card DOM grid even
 // when loading="lazy" is present. Admit only nearby artwork and limit active
 // decodes so category rendering cannot monopolize the UI thread.
-const DEFERRED_IMAGE_CONCURRENCY = 4
-const WEBOS_DEFERRED_IMAGE_CONCURRENCY = 1
-const DEFERRED_IMAGE_PREFETCH_PX = 0
-const WEBOS_DEFERRED_IMAGE_COOLDOWN_MS = 180
+const DEFERRED_IMAGE_CONCURRENCY = 6
+const WEBOS_DEFERRED_IMAGE_CONCURRENCY = 3
+const DEFERRED_IMAGE_PREFETCH_PX = 480
+const WEBOS_DEFERRED_IMAGE_COOLDOWN_MS = 0
+const LIBRARY_SYNC_LAUNCH_DELAY_MS = 1_000
 const AMPERSAND = String.fromCharCode(38)
 const ESCAPE_PATTERN = /[&<>"']/g
 const ESCAPED_CHARACTERS: Record<string, string> = {
@@ -263,6 +299,18 @@ function isWebOsRuntime(): boolean {
       /web0s|webos/i.test(navigator.userAgent),
   )
 }
+
+const libraryProbeEnabled =
+  import.meta.env.DEV || import.meta.env.VITE_ENABLE_LIBRARY_PROBE === 'true'
+
+/**
+ * Build-time kill switch for automatic catalog acquisition. When
+ * `VITE_DISABLE_CATALOG_SYNC=true`, the scheduler never arms and any sync call
+ * short-circuits, so a fresh/incomplete profile cannot trigger the ~150 MB
+ * whole-section download. This exists for metered-connection diagnostics on the
+ * emulator; normal builds leave it unset and behave exactly as before.
+ */
+const catalogSyncDisabled = import.meta.env.VITE_DISABLE_CATALOG_SYNC === 'true'
 
 if (isWebOsRuntime()) {
   document.documentElement.dataset.webosRuntime = 'true'
@@ -356,17 +404,14 @@ provisionProfileFromLaunchParams()
 let profile = loadProfile()
 let client = profile ? new ProviderBroker(profile) : null
 const catalogRepository = new IndexedDbCatalogRepository()
-let catalogSync = client
-  ? new CatalogSyncCoordinator(client, catalogRepository, {
-      internalFaultDiagnostics: import.meta.env.VITE_ENABLE_LIBRARY_PROBE === 'true',
-    })
-  : null
+let catalogSync = client ? createCatalogSyncCoordinator(client) : null
 let catalogSyncTimer: number | null = null
 let activeLibraryProbeController: AbortController | null = null
 let settings: AppSettings = profile
   ? loadSettings(profile.id)
   : { ...DEFAULT_SETTINGS }
 let account: AccountSummary | null = null
+let accountCapturedAt: number | null = null
 let view: AppView = profile ? 'home' : 'login'
 performanceTrace.setView(view)
 let renderedView: AppView | null = null
@@ -408,12 +453,23 @@ let navigationSequence = 0
 let navigationToken = 0
 let navigationController: AbortController | null = null
 let liveQueue: StreamItem[] = []
-let guideStreams: StreamItem[] = []
+let guide: GuideState = {
+  categories: [],
+  category: null,
+  streams: [],
+  page: 0,
+  pageCount: 1,
+  totalStreamCount: 0,
+}
 let globalSearchResults: StreamItem[] = []
 let globalSearchQuery = ''
 let globalSearchStatus = ''
 let globalSearchSequence = 0
 const globalSearchSectionAvailability = new Map<LibrarySection, boolean>()
+const globalSearchSectionSource = new Map<
+  LibrarySection,
+  'live' | 'live-loading' | 'live-unavailable'
+>()
 let localSearchIndexMigrationProfileId: string | null = null
 let searchReturnView: AppView = 'home'
 let pendingFocus: FocusSnapshot | null = null
@@ -432,6 +488,14 @@ let pendingSpatialInteractionId: number | null = null
 let deferredImageLoads = 0
 let deferredImageScheduleHandle: number | null = null
 const LIBRARY_SYNC_IDLE_DELAY_MS = 10_000
+let librarySyncStaleTimer: number | null = null
+let librarySyncState: LibrarySyncUiState = {
+  outcome: 'idle',
+  incompleteSections: [],
+  failedSections: [],
+}
+let videoSizingActiveEngine: VideoSizingSample['activeEngine'] = 'unknown'
+let videoSizingHistory: VideoSizingSample[] = []
 const spatialLayoutCache = createSpatialLayoutCache<HTMLElement, NavigationLayout>()
 const frameNavigation = createFrameNavigationScheduler(
   (direction) => {
@@ -1167,6 +1231,7 @@ function renderShell(content: string, title = currentViewTitle()): void {
           <button class="icon-button" data-action="settings" data-focus-id="top-settings" aria-label="Settings" title="Settings">${icon('settings')}</button>
         </div>
       </header>
+      ${renderLibrarySyncIndicator()}
       <main class="page">${content}</main>
       <footer class="helpbar">
         <span><kbd>← ↑ ↓ →</kbd> Navigate</span>
@@ -1301,8 +1366,8 @@ function renderLogin(): void {
         throw new Error(STORAGE_FAILURE_MESSAGE)
       }
 
-      account = nextAccount
       activateProfile(nextProfile, nextClient)
+      setAccountSummary(nextAccount)
       view = 'home'
       render()
     } catch (reason) {
@@ -1326,8 +1391,247 @@ function renderLogin(): void {
   restoreFocus(snapshot)
 }
 
+function formatSyncDueAt(value: number | undefined): string {
+  return value && value > Date.now() ? new Date(value).toLocaleString() : 'as soon as possible'
+}
+
+function librarySyncIndicatorContent(): { outcome: string; title: string; detail: string } {
+  const state = librarySyncState
+  const incompleteLabels = state.incompleteSections.map((section) => labels[section])
+  const incomplete = incompleteLabels.length ? incompleteLabels.join(', ') : 'all sections'
+  let title = 'Downloaded library ready'
+  let detail = 'Your downloaded library is available offline.'
+
+  if (state.outcome === 'running') {
+    title = `Downloading ${state.currentSection ? labels[state.currentSection] : 'library'}`
+    detail = state.itemsAcquired
+      ? `${state.itemsAcquired.toLocaleString()} items acquired in the current section.`
+      : 'Preparing the next downloaded-library section.'
+  } else if (state.outcome === 'failed') {
+    title = 'Downloaded library needs attention'
+    detail = `Still missing: ${incomplete}. The previous attempt did not complete; next attempt ${formatSyncDueAt(state.nextDueAt)}.`
+  } else if (state.outcome === 'cancelled') {
+    title = 'Downloaded library paused'
+    detail = `Still missing: ${incomplete}. Downloading resumes when the app is active.`
+  } else if (state.outcome === 'cooldown' || state.outcome === 'deferred') {
+    title = incompleteLabels.length ? 'Downloaded library is incomplete' : 'Downloaded library ready'
+    detail = incompleteLabels.length
+      ? `Still missing: ${incomplete}. Next attempt ${formatSyncDueAt(state.nextDueAt)}.`
+      : 'Your downloaded library is available offline.'
+  } else if (incompleteLabels.length) {
+    title = 'Downloading library in the background'
+    detail = `Still missing: ${incomplete}.`
+  }
+
+  return { outcome: state.outcome, title, detail }
+}
+
+function renderLibrarySyncIndicator(): string {
+  if (!profile) {
+    return ''
+  }
+
+  const { outcome, title, detail } = librarySyncIndicatorContent()
+
+  return `
+    <aside id="library-sync-status" class="library-sync-status is-${outcome}" aria-live="polite">
+      <span class="library-sync-status-dot" aria-hidden="true"></span>
+      <span><strong data-sync-title>${escape(title)}</strong><small data-sync-detail>${escape(detail)}</small></span>
+    </aside>
+  `
+}
+
+/*
+ * Probe-only switch for the on-device A/B. When true, the indicator reverts to
+ * the pre-fix `outerHTML` replacement so cell A1 can measure the accessibility-
+ * tree/layout cost the throttled in-place path (A2) removes. Production never
+ * sets this; it defaults to the cheap in-place update.
+ */
+let librarySyncIndicatorLegacyReplace = false
+
+/*
+ * Progress updates mutate the existing nodes instead of replacing the element.
+ * The scan fires many `scanning` events per section, and `outerHTML =` would
+ * destroy and rebuild the aria-live region on each one, forcing a full parse,
+ * layout, and accessibility-tree recomputation on the TV. Rewriting only the
+ * two text nodes (and the outcome class when it changes) keeps the aria-live
+ * region stable and the update cheap. The coordinator already throttles the
+ * `scanning` event rate; this keeps each surviving update inexpensive.
+ */
+function updateLibrarySyncIndicator(): void {
+  const current = document.querySelector<HTMLElement>('#library-sync-status')
+
+  if (!current) {
+    return
+  }
+
+  if (librarySyncIndicatorLegacyReplace) {
+    // A1 cell only: the destructive path under measurement.
+    current.outerHTML = renderLibrarySyncIndicator()
+    return
+  }
+
+  const { outcome, title, detail } = librarySyncIndicatorContent()
+  const expectedClass = `library-sync-status is-${outcome}`
+
+  if (current.className !== expectedClass) {
+    current.className = expectedClass
+  }
+
+  const titleNode = current.querySelector<HTMLElement>('[data-sync-title]')
+  const detailNode = current.querySelector<HTMLElement>('[data-sync-detail]')
+
+  if (titleNode && titleNode.textContent !== title) {
+    titleNode.textContent = title
+  }
+
+  if (detailNode && detailNode.textContent !== detail) {
+    detailNode.textContent = detail
+  }
+}
+
+function updateLibrarySyncProgress(progress: CatalogSyncProgress): void {
+  if (progress.stage === 'starting') {
+    librarySyncState = {
+      ...librarySyncState,
+      outcome: 'running',
+      currentSection: undefined,
+      itemsAcquired: 0,
+      failedSections: [],
+    }
+  } else if (progress.stage === 'categories' || progress.stage === 'scanning') {
+    librarySyncState = {
+      ...librarySyncState,
+      outcome: 'running',
+      currentSection: progress.section,
+      itemsAcquired: progress.itemsAcquired ?? librarySyncState.itemsAcquired,
+    }
+  } else if (progress.stage === 'section-complete') {
+    librarySyncState = {
+      ...librarySyncState,
+      outcome: 'running',
+      currentSection: progress.section,
+      itemsAcquired: progress.itemsAcquired,
+    }
+  }
+
+  updateLibrarySyncIndicator()
+}
+
+function createCatalogSyncCoordinator(nextClient: ProviderBroker): CatalogSyncCoordinator {
+  return new CatalogSyncCoordinator(nextClient, catalogRepository, {
+    internalFaultDiagnostics: libraryProbeEnabled,
+    onProgress: updateLibrarySyncProgress,
+  })
+}
+
+function clearLibrarySyncStaleTimer(): void {
+  if (librarySyncStaleTimer !== null) {
+    window.clearTimeout(librarySyncStaleTimer)
+    librarySyncStaleTimer = null
+  }
+}
+
+function armLibrarySyncStaleRecovery(
+  profileId: string,
+  updatedAt: number | undefined,
+): void {
+  clearLibrarySyncStaleTimer()
+  const staleAt = (updatedAt ?? Date.now()) + CATALOG_SYNC_STALE_RUN_MS
+  const delay = Math.max(0, staleAt - Date.now())
+
+  librarySyncStaleTimer = window.setTimeout(() => {
+    librarySyncStaleTimer = null
+    void catalogRepository.recoverStaleSync(profileId, CATALOG_SYNC_STALE_RUN_MS).then(
+      async (recovered) => {
+        if (profile?.id !== profileId) {
+          return
+        }
+
+        if (recovered) {
+          performanceTrace.event('library', 'catalog-sync-stale-run-recovered')
+          await refreshLibrarySyncState(profileId, true)
+          return
+        }
+
+        await refreshLibrarySyncState(profileId, false)
+      },
+      () => undefined,
+    )
+  }, delay)
+}
+
+async function refreshLibrarySyncState(
+  profileId: string,
+  scheduleIncompleteRun: boolean,
+): Promise<void> {
+  const meta = await catalogRepository.getMeta(profileId)
+  const incompleteSections: LibrarySection[] = []
+
+  for (const section of CATALOG_SYNC_SECTIONS) {
+    const manifest = await catalogRepository.getManifest(profileId, section)
+
+    if (manifest?.coverage.state !== 'complete') {
+      incompleteSections.push(section)
+    }
+  }
+
+  if (profile?.id !== profileId) {
+    return
+  }
+
+  const failedSections = CATALOG_SYNC_SECTIONS.filter(
+    (section) => Boolean(meta?.sync.sections?.[section]?.lastFailureAt),
+  )
+  const nextDueAt = meta?.nextDueAt
+  const syncInProgress = meta?.sync.inProgress === true
+  const outcome: LibrarySyncUiState['outcome'] = syncInProgress
+    ? 'running'
+    : incompleteSections.length && (meta?.sync.failureCount ?? 0) > 0
+      ? 'failed'
+      : incompleteSections.length && nextDueAt && nextDueAt > Date.now()
+        ? 'cooldown'
+        : incompleteSections.length
+          ? 'idle'
+          : 'completed'
+
+  librarySyncState = {
+    outcome,
+    incompleteSections,
+    currentSection: syncInProgress ? librarySyncState.currentSection : undefined,
+    itemsAcquired: syncInProgress ? librarySyncState.itemsAcquired : undefined,
+    nextDueAt,
+    failedSections,
+  }
+  updateLibrarySyncIndicator()
+
+  if (syncInProgress) {
+    armLibrarySyncStaleRecovery(profileId, meta?.sync.updatedAt)
+  } else {
+    clearLibrarySyncStaleTimer()
+  }
+
+  if (scheduleIncompleteRun && incompleteSections.length && !syncInProgress) {
+    scheduleCatalogSync(
+      nextDueAt && nextDueAt > Date.now()
+        ? catalogSyncRearmDelay(nextDueAt, Date.now())
+        : LIBRARY_SYNC_LAUNCH_DELAY_MS,
+    )
+  }
+}
+
+async function initializeLibrarySync(profileId: string): Promise<void> {
+  await catalogRepository.recoverStaleSync(profileId, CATALOG_SYNC_STALE_RUN_MS)
+  await refreshLibrarySyncState(profileId, true)
+}
+
 function renderHome(): void {
-  const connectionSummary = account ? 'Connected' : 'Ready to watch'
+  const accountAsOf = accountCapturedAt
+    ? `As of ${new Date(accountCapturedAt).toLocaleString()} · `
+    : ''
+  const connectionSummary = account
+    ? `${account.status || 'Connected'} · ${accountAsOf}`
+    : 'Ready to watch'
   const expiry = account?.expiresAt ? `Expires ${formatDate(account.expiresAt)} · ` : ''
   const continueEntries = continueWatching(resumeEntries)
     .filter((entry) => Boolean(entry.stream && visibleStream(entry.stream)))
@@ -1390,15 +1694,29 @@ function renderCatalog(): void {
   const results = catalogResultsFor(catalog)
   const visibleCategories = results.categories
   const filteredStreams = results.streams
-  const itemCount = catalog.category === null ? visibleCategories.length : filteredStreams.length
   const pageSize = catalogPageSize()
+  const windowedCategory =
+    catalog.category !== null &&
+    !catalog.isFavorites &&
+    catalog.windowedCategory === true &&
+    !catalog.query &&
+    catalog.sort === 'default'
+  const itemCount =
+    catalog.category === null
+      ? visibleCategories.length
+      : windowedCategory
+        ? catalog.totalStreamCount ?? filteredStreams.length
+        : filteredStreams.length
   const pageCount = Math.max(1, Math.ceil(itemCount / pageSize))
   catalog.page = Math.max(0, Math.min(catalog.page, pageCount - 1))
   const pageStart = catalog.page * pageSize
   const pageCategories = visibleCategories.slice(pageStart, pageStart + pageSize)
-  const pageStreams = filteredStreams.slice(pageStart, pageStart + pageSize)
+  const pageStreams = windowedCategory
+    ? filteredStreams
+    : filteredStreams.slice(pageStart, pageStart + pageSize)
   const activeCategory = catalog.category?.name ?? 'All categories'
   const catalogLabel = catalog.isFavorites ? 'Favorites' : labels[catalog.section]
+  const catalogSourceLabel = catalog.source === 'live' ? 'Live provider results' : catalogLabel
   const searchTarget = catalog.isFavorites
     ? 'favorites'
     : catalog.category === null
@@ -1412,7 +1730,7 @@ function renderCatalog(): void {
 
   renderShell(`
     <section class="catalog-heading">
-      <div><p class="eyebrow">${catalogLabel}</p><h1>${escape(activeCategory)}</h1></div>
+      <div><p class="eyebrow">${catalogSourceLabel}</p><h1>${escape(activeCategory)}</h1></div>
       <div class="catalog-tools">
         ${catalogNavigation}
         ${
@@ -1498,7 +1816,7 @@ function scheduleCatalogSearch(value: string): void {
     window.clearTimeout(searchDebounceTimer)
   }
 
-  searchDebounceTimer = window.setTimeout(() => {
+  searchDebounceTimer = window.setTimeout(async () => {
     searchDebounceTimer = null
 
     if (catalog !== targetCatalog || view !== 'catalog') {
@@ -1510,6 +1828,22 @@ function scheduleCatalogSearch(value: string): void {
     // tokenizes on whitespace, so only a token-level change alters results.
     if (normalizeQuery(catalog.query) === normalizeQuery(value)) {
       catalog.query = value
+      return
+    }
+
+    if (catalog.windowedCategory && normalizeQuery(value)) {
+      const materialized = await materializeCatalogCategory(catalog)
+
+      if (
+        !materialized ||
+        view !== 'catalog' ||
+        catalog?.category?.id !== targetCatalog.category?.id
+      ) {
+        return
+      }
+    }
+
+    if (!catalog) {
       return
     }
 
@@ -1595,7 +1929,9 @@ function cardRating(stream: StreamItem): string {
 }
 
 function suppressRemoteArtworkForLocalLibrary(): boolean {
-  return view === 'catalog' || view === 'search'
+  // Only Guide has a zero-network requirement. Browse and search may fetch
+  // artwork independently of provider API request/budget accounting.
+  return view === 'guide'
 }
 
 function isRemoteArtworkSource(source: string): boolean {
@@ -2287,34 +2623,68 @@ async function openFilmographyTitle(
 }
 
 function renderGuide(): void {
+  const visibleCategories = guide.categories.filter(
+    (category) => !settings.hideAdultContent || !isAdult(category.name),
+  )
+  const pageLabel =
+    guide.totalStreamCount > 0
+      ? `Page ${guide.page + 1} of ${guide.pageCount} · ${guide.totalStreamCount} channels`
+      : ''
+
   renderShell(`
     <section class="catalog-heading">
-      <div><p class="eyebrow">Live TV</p><h1>TV Guide</h1></div>
+      <div><p class="eyebrow">Live TV</p><h1>TV Guide</h1><p class="hint">${escape(pageLabel)}</p></div>
       <div class="catalog-tools">
         <button class="secondary-button" data-action="open-section" data-section="live" data-focus-id="guide-library">Channels</button>
-        <button class="secondary-button" data-action="refresh-guide" data-focus-id="guide-refresh">Refresh guide</button>
+        <button class="secondary-button" data-action="refresh-guide" data-focus-id="guide-refresh">Reload local guide</button>
       </div>
     </section>
+    ${
+      visibleCategories.length
+        ? `<section class="category-grid" data-nav-zone="guide-categories" aria-label="Guide categories">
+            ${visibleCategories
+              .map(
+                (category) =>
+                  `<button class="secondary-button ${category.id === guide.category?.id ? 'is-active' : ''}" data-action="select-guide-category" data-category-id="${escape(category.id)}" data-focus-id="guide-category-${escape(category.id)}">${escape(category.name)}</button>`,
+              )
+              .join('')}
+          </section>`
+        : ''
+    }
     <section class="guide-grid" aria-label="TV guide">
       ${
-        guideStreams.length
-          ? guideStreams
+        guide.streams.length
+          ? guide.streams
               .map((stream) => {
                 const nowNext = nowNextCache.get(streamLookupKey(stream))
                 return `
                   <button class="guide-row" data-action="select-stream" data-stream-key="${escape(streamLookupKey(stream))}" data-focus-id="guide-${escape(streamLookupKey(stream))}">
-                    <span class="guide-logo">${imageOrPlaceholder(stream.icon, stream.name, 'channel-logo')}</span>
+                    <span class="guide-logo">${imageOrPlaceholder(
+                      suppressRemoteArtworkForLocalLibrary() && stream.icon && isRemoteArtworkSource(stream.icon)
+                        ? undefined
+                        : stream.icon,
+                      stream.name,
+                      'channel-logo',
+                    )}</span>
                     <span class="guide-channel">${escape(stream.name)}</span>
                     <span class="guide-program"><strong>Now</strong><span data-guide-now-key="${escape(streamLookupKey(stream))}">${escape(nowNext?.now?.title ?? 'Loading schedule…')}</span></span>
                     <span class="guide-program"><strong>Next</strong><span data-guide-next-key="${escape(streamLookupKey(stream))}">${escape(nowNext?.next?.title ?? 'Schedule unavailable')}</span></span>
                   </button>`
               })
               .join('')
-          : '<div class="empty-state"><h2>Loading guide</h2><p>Fetching channels and current programmes…</p></div>'
+          : `<div class="empty-state"><h2>Library not downloaded yet</h2><p>${escape(guide.availabilityMessage ?? 'Refresh library before opening the guide.')}</p></div>`
       }
     </section>
+    ${
+      guide.pageCount > 1
+        ? `<nav class="catalog-pager" aria-label="Guide pages">
+            <button class="secondary-button" data-action="guide-prev" data-focus-id="guide-prev" ${guide.page === 0 ? 'disabled' : ''}>← Previous</button>
+            <span>${escape(pageLabel)}</span>
+            <button class="secondary-button" data-action="guide-next" data-focus-id="guide-next" ${guide.page >= guide.pageCount - 1 ? 'disabled' : ''}>Next →</button>
+          </nav>`
+        : ''
+    }
   `)
-
 }
 
 function globalSearchResultsForSection(section: LibrarySection): StreamItem[] {
@@ -2338,6 +2708,52 @@ function globalSearchCard(stream: StreamItem): string {
   return `<div data-global-search-card-key="${escape(key)}">${streamCard(stream)}</div>`
 }
 
+function globalSearchSourceLabel(section: LibrarySection): string {
+  const source = globalSearchSectionSource.get(section)
+
+  if (source === 'live-loading') {
+    return 'Live provider search'
+  }
+
+  if (source === 'live') {
+    return 'Live provider results'
+  }
+
+  if (source === 'live-unavailable') {
+    return 'Live provider unavailable'
+  }
+
+  return ''
+}
+
+function globalSearchEmptyState(section: LibrarySection): string {
+  const sectionResolved = globalSearchSectionAvailability.has(section)
+  const sectionAvailable = globalSearchSectionAvailability.get(section) === true
+  const source = globalSearchSectionSource.get(section)
+
+  if (!sectionResolved) {
+    return '<div class="empty-state"><h3>Searching downloaded library</h3><p>Loading local results…</p></div>'
+  }
+
+  if (source === 'live-loading') {
+    return '<div class="empty-state"><h3>Searching live provider</h3><p>Loading live results for this section…</p></div>'
+  }
+
+  if (source === 'live') {
+    return '<div class="empty-state"><h3>No matching live titles</h3><p>Try another search in the live provider results.</p></div>'
+  }
+
+  if (source === 'live-unavailable') {
+    return '<div class="empty-state"><h3>Live provider unavailable</h3><p>The downloaded library is still incomplete. Try again shortly.</p></div>'
+  }
+
+  if (sectionAvailable) {
+    return '<div class="empty-state"><h3>No matching titles</h3><p>Try another search in your downloaded library.</p></div>'
+  }
+
+  return '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Search this section’s live provider results instead.</p></div>'
+}
+
 function globalSearchSectionContent(section: LibrarySection): string {
   const results = globalSearchResultsForSection(section)
   const expanded = expandedGlobalSearchSections.has(section)
@@ -2347,18 +2763,14 @@ function globalSearchSectionContent(section: LibrarySection): string {
   const hiddenCount = Math.max(0, results.length - visibleResults.length)
   const hasMore = results.length > GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT
   const noun = globalSearchResultNoun(section, results.length)
-  const sectionResolved = globalSearchSectionAvailability.has(section)
-  const sectionAvailable = globalSearchSectionAvailability.get(section) === true
-  const emptyState = !sectionResolved
-    ? '<div class="empty-state"><h3>Searching downloaded library</h3><p>Loading local results…</p></div>'
-    : sectionAvailable
-      ? '<div class="empty-state"><h3>No matching titles</h3><p>Try another search in your downloaded library.</p></div>'
-      : '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Refresh library before searching this section.</p></div>'
+  const sourceLabel = globalSearchSourceLabel(section)
+  const emptyState = globalSearchEmptyState(section)
 
   return `
     <div class="global-search-group-heading">
       <div class="global-search-group-title">
         <h2>${escape(labels[section])}</h2>
+        ${sourceLabel ? `<span id="global-search-source-${section}" class="global-search-source">${escape(sourceLabel)}</span>` : ''}
         <span id="global-search-count-${section}" class="global-search-count" aria-label="${results.length} ${noun} found">
           <strong>${results.length}</strong><span>results</span>
         </span>
@@ -2394,9 +2806,22 @@ function renderGlobalSearchResults(): string {
 }
 
 function globalSearchControlsContent(): string {
+  const liveSections =
+    globalSearchQuery.trim().length >= MIN_GLOBAL_SEARCH_LENGTH
+      ? GLOBAL_SEARCH_SECTIONS.filter(
+          (section) => globalSearchSectionAvailability.get(section) === false,
+        )
+      : []
+
   return `
     ${globalSearchQuery ? '<button class="secondary-button" data-action="clear-global-search" data-focus-id="global-search-clear">Clear</button>' : ''}
-    <button class="primary-button" data-action="run-global-search" data-focus-id="global-search-run">Search local library</button>
+    <button class="primary-button" data-action="run-global-search" data-focus-id="global-search-run">Search downloaded library</button>
+    ${liveSections
+      .map(
+        (section) =>
+          `<button class="secondary-button" data-action="search-global-live-section" data-section="${section}" data-focus-id="global-search-live-${section}">Search ${escape(labels[section])} live</button>`,
+      )
+      .join('')}
   `
 }
 
@@ -2428,8 +2853,24 @@ function updateGlobalSearchSection(section: LibrarySection): void {
   const noun = globalSearchResultNoun(section, results.length)
   const hasMore = results.length > GLOBAL_SEARCH_COLLAPSED_RESULT_LIMIT
   const expanded = expandedGlobalSearchSections.has(section)
-  const sectionResolved = globalSearchSectionAvailability.has(section)
-  const sectionAvailable = globalSearchSectionAvailability.get(section) === true
+  const sourceLabel = globalSearchSourceLabel(section)
+  const title = group.querySelector<HTMLElement>('.global-search-group-title')
+  const source = group.querySelector<HTMLElement>(`#global-search-source-${section}`)
+
+  if (source) {
+    if (sourceLabel) {
+      source.textContent = sourceLabel
+    } else {
+      source.remove()
+    }
+  } else if (sourceLabel && title) {
+    title
+      .querySelector('h2')
+      ?.insertAdjacentHTML(
+        'afterend',
+        `<span id="global-search-source-${section}" class="global-search-source">${escape(sourceLabel)}</span>`,
+      )
+  }
 
   if (count) {
     count.setAttribute('aria-label', `${results.length} ${noun} found`)
@@ -2451,11 +2892,7 @@ function updateGlobalSearchSection(section: LibrarySection): void {
 
   if (!visibleResults.length) {
     content.className = 'global-search-empty'
-    content.innerHTML = !sectionResolved
-      ? '<div class="empty-state"><h3>Searching downloaded library</h3><p>Loading local results…</p></div>'
-      : sectionAvailable
-        ? '<div class="empty-state"><h3>No matching titles</h3><p>Try another search in your downloaded library.</p></div>'
-        : '<div class="empty-state"><h3>Library not downloaded yet</h3><p>Refresh library before searching this section.</p></div>'
+    content.innerHTML = globalSearchEmptyState(section)
     return
   }
 
@@ -2544,6 +2981,7 @@ function clearGlobalSearch(): void {
   globalSearchStatus = ''
   globalSearchSequence += 1
   globalSearchSectionAvailability.clear()
+  globalSearchSectionSource.clear()
   expandedGlobalSearchSections.clear()
   updateGlobalSearchView({ controls: true, fullResults: true })
   input?.focus({ preventScroll: true })
@@ -2559,6 +2997,7 @@ function leaveGlobalSearch(): void {
   globalSearchStatus = ''
   globalSearchSequence += 1
   globalSearchSectionAvailability.clear()
+  globalSearchSectionSource.clear()
   expandedGlobalSearchSections.clear()
   view =
     searchReturnView === 'catalog' && catalog
@@ -2659,6 +3098,7 @@ async function updateGlobalSearchFromLibrary(query: string): Promise<void> {
   globalSearchQuery = query
   globalSearchResults = []
   globalSearchSectionAvailability.clear()
+  globalSearchSectionSource.clear()
   expandedGlobalSearchSections.clear()
 
   if (!normalizedQuery) {
@@ -2699,7 +3139,89 @@ async function updateGlobalSearchFromLibrary(query: string): Promise<void> {
   globalSearchStatus = results.length
     ? `${results.length} local result${results.length === 1 ? '' : 's'}`
     : 'No matching titles in the downloaded library.'
-  updateGlobalSearchView({ controls: true, fullResults: true })
+
+  /*
+   * The search already incrementally rendered every resolved section. Keep
+   * those card nodes for the final status update so remote focus remains on
+   * the selected result while remaining sections complete.
+   */
+  updateGlobalSearchView({
+    controls: true,
+    fullResults: false,
+    sections: GLOBAL_SEARCH_SECTIONS,
+  })
+}
+
+async function searchGlobalLiveSection(section: LibrarySection): Promise<void> {
+  const activeClient = client
+  const query = globalSearchQuery.trim()
+  const sequence = globalSearchSequence
+
+  if (
+    !activeClient ||
+    query.length < MIN_GLOBAL_SEARCH_LENGTH ||
+    globalSearchSectionAvailability.get(section) !== false ||
+    globalSearchSectionSource.get(section) === 'live-loading'
+  ) {
+    return
+  }
+
+  globalSearchSectionSource.set(section, 'live-loading')
+  globalSearchStatus = `Searching live ${labels[section]}…`
+  updateGlobalSearchView({
+    controls: true,
+    fullResults: false,
+    sections: [section],
+  })
+
+  try {
+    const matches = await activeClient.searchStreams(section, query, {
+      limit: GLOBAL_SEARCH_SECTION_RESULT_LIMIT,
+    })
+
+    if (sequence !== globalSearchSequence || view !== 'search') {
+      return
+    }
+
+    const uniqueMatches = new Map<string, StreamItem>()
+
+    for (const stream of matches) {
+      if (stream.streamType !== 'episode' && visibleStream(stream)) {
+        uniqueMatches.set(streamLookupKey(stream), stream)
+      }
+    }
+
+    const liveResults = [...uniqueMatches.values()]
+    globalSearchResults = [
+      ...globalSearchResults.filter((stream) => stream.section !== section),
+      ...liveResults,
+    ]
+    rememberStreams(liveResults)
+    globalSearchSectionSource.set(section, 'live')
+    globalSearchStatus = `${liveResults.length} live ${globalSearchResultNoun(section, liveResults.length)} in ${labels[section]}.`
+    performanceTrace.event('search', 'global-search-live-complete', {
+      section,
+      queryLength: query.length,
+      resultCount: liveResults.length,
+    })
+  } catch {
+    if (sequence !== globalSearchSequence || view !== 'search') {
+      return
+    }
+
+    globalSearchSectionSource.set(section, 'live-unavailable')
+    globalSearchStatus = `Live ${labels[section]} search is unavailable right now.`
+    performanceTrace.event('search', 'global-search-live-failed', {
+      section,
+      queryLength: query.length,
+    })
+  }
+
+  updateGlobalSearchView({
+    controls: true,
+    fullResults: false,
+    sections: [section],
+  })
 }
 
 function scheduleGlobalSearch(query: string): void {
@@ -2755,10 +3277,8 @@ function renderSettings(): void {
       <section class="settings-panel">
         <p class="panel-kicker">Library</p>
         <h2>Downloaded library</h2>
-        <p class="hint">Refresh is manual so it can be observed and controlled. It never starts automatically when the app launches.</p>
+        <p class="hint">Downloads continue in the background while you browse. Refresh now checks the current download state.</p>
         <button class="secondary-button" data-action="refresh-library" data-focus-id="settings-refresh-library">Refresh downloaded library</button>
-        <button class="secondary-button" data-action="measure-vod-library" data-focus-id="settings-measure-vod-library">Measure VOD download</button>
-        <p class="hint">Uses one VOD-only sync request with a temporary 192 MiB discovery limit. It never refreshes Live TV or Series.</p>
       </section>
       <section class="settings-panel">
         <p class="panel-kicker">Library</p>
@@ -2791,6 +3311,10 @@ function renderPlayer(): void {
     view = 'home'
     render()
     return
+  }
+
+  if (libraryProbeEnabled) {
+    resetVideoSizingProbe()
   }
 
   const snapshot = snapshotFocus()
@@ -3150,6 +3674,7 @@ function renderPlayer(): void {
     }
 
     activeAttempt = attempt
+    recordVideoSizing('attempt-start', attempt.engine)
     performanceTrace.event(
       'playback',
       'attempt-start',
@@ -3496,6 +4021,7 @@ function renderPlayer(): void {
   }
 
   player.addEventListener('loadedmetadata', () => {
+    recordVideoSizing('loadedmetadata', activeAttempt?.engine ?? 'unknown')
     performanceTrace.event('playback', 'loadedmetadata', {
       videoWidth: player.videoWidth,
       videoHeight: player.videoHeight,
@@ -3576,6 +4102,7 @@ function renderPlayer(): void {
     }
   })
   player.addEventListener('playing', () => {
+    recordVideoSizing('playing', activeAttempt?.engine ?? 'unknown')
     performanceTrace.event('playback', 'playing', undefined, {
       interactionId: playbackInteractionId ?? undefined,
     })
@@ -3586,6 +4113,7 @@ function renderPlayer(): void {
     confirmPlaybackStarted()
   })
   player.addEventListener('resize', () => {
+    recordVideoSizing('resize', activeAttempt?.engine ?? 'unknown')
     confirmVisiblePlayback()
   })
   playerProgress.addEventListener('focus', () => {
@@ -4211,12 +4739,22 @@ async function handleAction(element: HTMLElement): Promise<void> {
   }
 
   if ((action === 'catalog-prev' || action === 'catalog-next') && catalog) {
-    catalog.page += action === 'catalog-next' ? 1 : -1
-    renderCatalog()
+    const nextPage = catalog.page + (action === 'catalog-next' ? 1 : -1)
+
+    if (catalog.windowedCategory) {
+      await loadWindowedCategoryPage(nextPage)
+    } else {
+      catalog.page = nextPage
+      renderCatalog()
+    }
     return
   }
 
   if (action === 'cycle-sort' && catalog) {
+    if (catalog.windowedCategory && !await materializeCatalogCategory(catalog)) {
+      return
+    }
+
     catalog.sort = nextSort(catalog.sort)
     catalog.page = 0
     renderCatalog()
@@ -4341,6 +4879,15 @@ async function handleAction(element: HTMLElement): Promise<void> {
     return
   }
 
+  if (action === 'search-global-live-section') {
+    const section = element.dataset.section as LibrarySection
+
+    if (GLOBAL_SEARCH_SECTIONS.includes(section)) {
+      await searchGlobalLiveSection(section)
+    }
+    return
+  }
+
   if (action === 'clear-global-search') {
     clearGlobalSearch()
     return
@@ -4372,6 +4919,20 @@ async function handleAction(element: HTMLElement): Promise<void> {
 
   if (action === 'refresh-guide') {
     await openGuide(true)
+    return
+  }
+
+  if (action === 'select-guide-category') {
+    await openGuide(false, element.dataset.categoryId, 0)
+    return
+  }
+
+  if (action === 'guide-prev' || action === 'guide-next') {
+    await openGuide(
+      false,
+      guide.category?.id,
+      guide.page + (action === 'guide-next' ? 1 : -1),
+    )
     return
   }
 
@@ -4592,9 +5153,17 @@ async function handleAction(element: HTMLElement): Promise<void> {
     if (result.status === 'completed') {
       showToast('Downloaded library refreshed.')
     } else if (result.status === 'cooldown') {
-      showToast('Downloaded library is already up to date.')
+      showToast(
+        librarySyncState.incompleteSections.length
+          ? `Downloaded library is incomplete. Next attempt ${formatSyncDueAt(librarySyncState.nextDueAt)}.`
+          : 'Downloaded library is already up to date.',
+      )
     } else if (result.status === 'deferred') {
-      showToast('Library refresh is deferred until the next provider sync window.')
+      showToast(
+        librarySyncState.incompleteSections.length
+          ? `Downloaded library is incomplete. Next attempt ${formatSyncDueAt(librarySyncState.nextDueAt)}.`
+          : 'Library refresh is deferred until the next provider sync window.',
+      )
     } else if (result.status === 'busy') {
       showToast('Library refresh is already running.')
     } else {
@@ -4603,7 +5172,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
     return
   }
 
-  if (action === 'measure-vod-library') {
+  if (action === 'measure-vod-library' && libraryProbeEnabled) {
     const result = await runCatalogSync({
       section: 'vod',
       maxResponseBytes: VOD_SYNC_MEASUREMENT_MAX_RESPONSE_BYTES,
@@ -4648,6 +5217,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
     client = null
     catalogSync = null
     account = null
+    accountCapturedAt = null
     favorites = new Map()
     resumeEntries = new Map()
     view = 'login'
@@ -4674,13 +5244,14 @@ async function handleAction(element: HTMLElement): Promise<void> {
         return
       }
 
-      account = nextAccount ?? null
+      setAccountSummary(nextAccount ?? null)
     } catch {
       if (!isCurrentNavigation(token)) {
         return
       }
 
       account = null
+      accountCapturedAt = null
     }
 
     if (isCurrentNavigation(token)) {
@@ -4704,6 +5275,7 @@ async function handleAction(element: HTMLElement): Promise<void> {
 
 async function openSection(section: LibrarySection): Promise<void> {
   const activeProfile = profile
+  const activeClient = client
 
   if (!activeProfile) {
     return
@@ -4711,8 +5283,8 @@ async function openSection(section: LibrarySection): Promise<void> {
 
   catalogReturnPoint = null
   pushRouteHistory()
-  const { token } = startNavigation()
-  renderLoading(`Opening downloaded ${labels[section].toLowerCase()}…`)
+  const { token, signal } = startNavigation()
+  renderLoading(`Opening ${labels[section].toLowerCase()}…`)
 
   const local = await catalogRepository.readCompleteSectionCategories(
     activeProfile.id,
@@ -4734,6 +5306,48 @@ async function openSection(section: LibrarySection): Promise<void> {
       page: 0,
       isFavorites: false,
       sort: 'default',
+      source: 'downloaded',
+    }
+  } else if (activeClient) {
+    try {
+      const categories = await activeClient.categories(section, signal)
+
+      if (!isCurrentNavigation(token)) {
+        return
+      }
+
+      rememberCategories(section, categories)
+      catalog = {
+        section,
+        category: null,
+        categories,
+        streams: [],
+        query: '',
+        page: 0,
+        isFavorites: false,
+        sort: 'default',
+        source: 'live',
+        availabilityMessage: categories.length
+          ? undefined
+          : 'The downloaded library is still incomplete and the provider returned no live categories.',
+      }
+    } catch {
+      if (!isCurrentNavigation(token)) {
+        return
+      }
+
+      catalog = {
+        section,
+        category: null,
+        categories: [],
+        streams: [],
+        query: '',
+        page: 0,
+        isFavorites: false,
+        sort: 'default',
+        source: 'live',
+        availabilityMessage: 'The downloaded library is still incomplete and live browsing is unavailable right now.',
+      }
     }
   } else {
     catalog = {
@@ -4745,10 +5359,7 @@ async function openSection(section: LibrarySection): Promise<void> {
       page: 0,
       isFavorites: false,
       sort: 'default',
-      availabilityMessage:
-        section === 'vod'
-          ? 'Movies have not been downloaded yet. Refresh library from Settings.'
-          : 'This library section is not available on this TV yet. Refresh library from Settings.',
+      availabilityMessage: 'The downloaded library is still incomplete.',
     }
   }
 
@@ -4758,6 +5369,7 @@ async function openSection(section: LibrarySection): Promise<void> {
 
 async function loadCategory(category: Category | null): Promise<void> {
   const activeProfile = profile
+  const activeClient = client
   const activeCatalog = catalog
 
   if (!activeProfile || !activeCatalog) {
@@ -4783,13 +5395,15 @@ async function loadCategory(category: Category | null): Promise<void> {
     focus: snapshotFocus(),
   }
   pushRouteHistory()
-  const { token } = startNavigation()
+  const { token, signal } = startNavigation()
   renderLoading(`Opening ${category.name}…`)
 
-  const local = await catalogRepository.readCompleteCategory(
+  const local = await catalogRepository.readCompleteCategoryPage(
     activeProfile.id,
     activeCatalog.section,
     category.id,
+    0,
+    catalogPageSize(),
   )
 
   if (!isCurrentNavigation(token)) {
@@ -4797,18 +5411,65 @@ async function loadCategory(category: Category | null): Promise<void> {
   }
 
   if (local.coverage === 'none') {
-    catalog = {
-      ...activeCatalog,
-      category,
-      streams: [],
-      query: '',
-      page: 0,
-      isFavorites: false,
-      availabilityMessage: 'This category is not available in the downloaded library.',
-      results: undefined,
+    if (!activeClient || activeCatalog.source !== 'live') {
+      catalog = {
+        ...activeCatalog,
+        category,
+        streams: [],
+        query: '',
+        page: 0,
+        isFavorites: false,
+        availabilityMessage: 'This category is not available in the downloaded library.',
+        results: undefined,
+      }
+      renderCatalog()
+      return
     }
-    renderCatalog()
-    return
+
+    try {
+      const streams = await activeClient.streams(activeCatalog.section, category.id, signal)
+
+      if (!isCurrentNavigation(token)) {
+        return
+      }
+
+      rememberStreams(streams)
+      cacheStreams(activeCatalog.section, category.id, streams)
+      if (activeCatalog.section === 'live') {
+        liveQueue = streams
+      }
+
+      catalog = {
+        ...activeCatalog,
+        category,
+        streams,
+        query: '',
+        page: 0,
+        isFavorites: false,
+        availabilityMessage: undefined,
+        totalStreamCount: streams.length,
+        results: undefined,
+      }
+      renderCatalog()
+      return
+    } catch {
+      if (!isCurrentNavigation(token)) {
+        return
+      }
+
+      catalog = {
+        ...activeCatalog,
+        category,
+        streams: [],
+        query: '',
+        page: 0,
+        isFavorites: false,
+        availabilityMessage: 'Live provider results are unavailable for this category right now.',
+        results: undefined,
+      }
+      renderCatalog()
+      return
+    }
   }
 
   const streams = local.items
@@ -4830,12 +5491,99 @@ async function loadCategory(category: Category | null): Promise<void> {
     category,
     streams,
     query: '',
-    page: 0,
+    page: local.page,
     isFavorites: false,
     availabilityMessage: undefined,
+    windowedCategory: true,
+    totalStreamCount: local.itemCount,
     results: undefined,
   }
   renderCatalog()
+}
+
+async function loadWindowedCategoryPage(page: number): Promise<void> {
+  const activeProfile = profile
+  const activeCatalog = catalog
+  const category = activeCatalog?.category
+
+  if (
+    !activeProfile ||
+    !activeCatalog ||
+    !category ||
+    !activeCatalog.windowedCategory ||
+    activeCatalog.isFavorites
+  ) {
+    return
+  }
+
+  const local = await catalogRepository.readCompleteCategoryPage(
+    activeProfile.id,
+    activeCatalog.section,
+    category.id,
+    page,
+    catalogPageSize(),
+  )
+
+  if (catalog !== activeCatalog || !local || local.coverage === 'none') {
+    if (catalog === activeCatalog) {
+      showToast('This category is not available in the downloaded library.')
+    }
+    return
+  }
+
+  rememberStreams(local.items)
+  cacheStreams(activeCatalog.section, category.id, local.items)
+
+  if (activeCatalog.section === 'live') {
+    liveQueue = local.items
+  }
+
+  catalog = {
+    ...activeCatalog,
+    streams: local.items,
+    page: local.page,
+    totalStreamCount: local.itemCount,
+    results: undefined,
+  }
+  renderCatalog()
+}
+
+async function materializeCatalogCategory(activeCatalog: CatalogState): Promise<boolean> {
+  const activeProfile = profile
+  const category = activeCatalog.category
+
+  if (!activeCatalog.windowedCategory || !activeProfile || !category) {
+    return true
+  }
+
+  const local = await catalogRepository.readCompleteCategory(
+    activeProfile.id,
+    activeCatalog.section,
+    category.id,
+  )
+
+  if (catalog !== activeCatalog || local.coverage === 'none') {
+    if (catalog === activeCatalog) {
+      showToast('This category is not available in the downloaded library.')
+    }
+    return false
+  }
+
+  rememberStreams(local.items)
+  cacheStreams(activeCatalog.section, category.id, local.items)
+
+  if (activeCatalog.section === 'live') {
+    liveQueue = local.items
+  }
+
+  catalog = {
+    ...activeCatalog,
+    streams: local.items,
+    windowedCategory: false,
+    totalStreamCount: undefined,
+    results: undefined,
+  }
+  return true
 }
 
 async function beginResumePlayback(stream: StreamItem): Promise<void> {
@@ -4949,9 +5697,10 @@ async function enrichSelectedTitle(
 
 async function openDetails(stream: StreamItem): Promise<void> {
   const activeClient = client
+  const activeProfile = profile
   detailReturnPoint = captureReturnPoint()
 
-  if (!activeClient) {
+  if (!activeProfile) {
     return
   }
 
@@ -4976,7 +5725,27 @@ async function openDetails(stream: StreamItem): Promise<void> {
 
   try {
     if (stream.section === 'series') {
-      const series = await activeClient.seriesInfo(stream.seriesId ?? stream.id, signal)
+      const seriesId = stream.seriesId ?? stream.id
+      let series = await catalogRepository.getDetails<SeriesDetails>(
+        activeProfile.id,
+        'series',
+        seriesId,
+      )
+
+      if (!series) {
+        if (!activeClient) {
+          throw new Error('Series details are not available offline yet.')
+        }
+
+        series = await activeClient.seriesInfo(seriesId, signal)
+        void catalogRepository.putDetails(
+          activeProfile.id,
+          'series',
+          seriesId,
+          series,
+          DETAIL_CACHE_TTL_MS,
+        )
+      }
 
       if (!isCurrentNavigation(token)) {
         return
@@ -5021,7 +5790,26 @@ async function openDetails(stream: StreamItem): Promise<void> {
 
       Object.values(episodes).forEach(rememberStreams)
     } else {
-      const vod = await activeClient.vodInfo(stream.id, signal)
+      let vod = await catalogRepository.getDetails<VodDetails>(
+        activeProfile.id,
+        'vod',
+        stream.id,
+      )
+
+      if (!vod) {
+        if (!activeClient) {
+          throw new Error('Movie details are not available offline yet.')
+        }
+
+        vod = await activeClient.vodInfo(stream.id, signal)
+        void catalogRepository.putDetails(
+          activeProfile.id,
+          'vod',
+          stream.id,
+          vod,
+          DETAIL_CACHE_TTL_MS,
+        )
+      }
 
       if (!isCurrentNavigation(token)) {
         return
@@ -5072,70 +5860,114 @@ function openFavorites(): void {
   render()
 }
 
-async function openGuide(refresh = false): Promise<void> {
-  const activeClient = client
+async function openGuide(
+  refresh = false,
+  requestedCategoryId?: string,
+  requestedPage = 0,
+): Promise<void> {
+  const activeProfile = profile
 
-  if (!activeClient) {
+  if (!activeProfile) {
     return
   }
 
   if (view !== 'guide') {
     pushRouteHistory()
   }
-  const { token, signal } = startNavigation()
-  let streams = refresh ? null : liveQueue.length ? liveQueue : null
 
-  if (!streams) {
-    const selectedCategory =
-      catalog?.section === 'live' && catalog.category && !catalog.isFavorites
-        ? catalog.category
-        : null
-    const cached = selectedCategory && !refresh
-      ? cachedStreams('live', selectedCategory.id)
-      : null
+  const { token } = startNavigation()
+  renderLoading('Opening downloaded guide…')
 
-    renderLoading('Loading channels for the guide…')
-
-    try {
-      if (cached) {
-        streams = cached
-      } else {
-        const categories = selectedCategory
-          ? [selectedCategory]
-          : await activeClient.categories('live', signal)
-
-        if (!selectedCategory) {
-          rememberCategories('live', categories)
-        }
-
-        const guideCategory =
-          categories.find((category) => !settings.hideAdultContent || !isAdult(category.name)) ??
-          categories[0]
-
-        if (!guideCategory) {
-          throw new Error('This provider did not return any live-TV categories for the guide.')
-        }
-
-        streams = await activeClient.streams('live', guideCategory.id, signal)
-        cacheStreams('live', guideCategory.id, streams)
-      }
-    } catch (reason) {
-      if (isCurrentNavigation(token)) {
-        renderError(reason, () => void openGuide(refresh))
-      }
-      return
-    }
-  }
+  const categoriesResult = await catalogRepository.readCompleteSectionCategories(
+    activeProfile.id,
+    'live',
+  )
 
   if (!isCurrentNavigation(token)) {
     return
   }
 
-  liveQueue = streams
+  if (categoriesResult.coverage === 'none') {
+    guide = {
+      categories: [],
+      category: null,
+      streams: [],
+      page: 0,
+      pageCount: 1,
+      totalStreamCount: 0,
+      availabilityMessage: 'Live TV has not been downloaded yet. Refresh library from Settings.',
+    }
+    view = 'guide'
+    render()
+    return
+  }
+
+  rememberCategories('live', categoriesResult.categories)
+  const visibleCategories = categoriesResult.categories.filter(
+    (category) => !settings.hideAdultContent || !isAdult(category.name),
+  )
+  const catalogCategory =
+    catalog?.section === 'live' && !catalog.isFavorites ? catalog.category : null
+  const selectedCategory =
+    visibleCategories.find((category) => category.id === requestedCategoryId) ??
+    visibleCategories.find((category) => category.id === guide.category?.id) ??
+    visibleCategories.find((category) => category.id === catalogCategory?.id) ??
+    visibleCategories[0]
+
+  if (!selectedCategory) {
+    guide = {
+      categories: categoriesResult.categories,
+      category: null,
+      streams: [],
+      page: 0,
+      pageCount: 1,
+      totalStreamCount: 0,
+      availabilityMessage: 'No visible live-TV categories are available with the current parental controls.',
+    }
+    view = 'guide'
+    render()
+    return
+  }
+
+  const local = await catalogRepository.readCompleteCategoryPage(
+    activeProfile.id,
+    'live',
+    selectedCategory.id,
+    refresh ? 0 : requestedPage,
+    catalogPageSize(),
+  )
+
+  if (!isCurrentNavigation(token)) {
+    return
+  }
+
+  if (local.coverage === 'none') {
+    guide = {
+      categories: categoriesResult.categories,
+      category: selectedCategory,
+      streams: [],
+      page: 0,
+      pageCount: 1,
+      totalStreamCount: 0,
+      availabilityMessage: 'This guide category is not available in the downloaded library.',
+    }
+    view = 'guide'
+    render()
+    return
+  }
+
+  const streams = local.items.filter(visibleStream)
   rememberStreams(streams)
-  guideStreams = streams
-    .filter(visibleStream)
-    .slice(0, 32)
+  cacheStreams('live', selectedCategory.id, streams)
+  liveQueue = streams
+  guide = {
+    categories: categoriesResult.categories,
+    category: selectedCategory,
+    streams,
+    page: local.page,
+    pageCount: local.pageCount,
+    totalStreamCount: local.itemCount,
+  }
   view = 'guide'
   render()
 }
@@ -5162,10 +5994,11 @@ async function runGlobalSearch(): Promise<void> {
 
 async function loadLiveDetails(stream: StreamItem): Promise<void> {
   const activeClient = client
+  const activeProfile = profile
   const token = navigationToken
   const signal = navigationController?.signal
 
-  if (!activeClient || selectedItem !== stream || !isCurrentNavigation(token)) {
+  if (!activeProfile || selectedItem !== stream || !isCurrentNavigation(token)) {
     return
   }
 
@@ -5183,11 +6016,34 @@ async function loadLiveDetails(stream: StreamItem): Promise<void> {
     return
   }
 
+  const durable = await catalogRepository.getEpg<NowNext>(
+    activeProfile.id,
+    stream.id,
+    'now-next',
+  )
+
+  if (durable && isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
+    cacheNowNext(cacheKey, durable)
+    panel.innerHTML = renderNowNext(durable)
+    return
+  }
+
+  if (!activeClient) {
+    return
+  }
+
   try {
     const nowNext = await activeClient.nowNext(stream.id, signal)
 
     if (isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
       cacheNowNext(cacheKey, nowNext)
+      void catalogRepository.putEpg(
+        activeProfile.id,
+        stream.id,
+        'now-next',
+        nowNext,
+        NOW_NEXT_CACHE_TTL_MS,
+      )
       panel.innerHTML = renderNowNext(nowNext)
     }
   } catch {
@@ -5218,18 +6074,43 @@ async function showEpg(
   signal = navigationController?.signal,
 ): Promise<void> {
   const activeClient = client
+  const activeProfile = profile
   const panel = document.querySelector<HTMLElement>('#epg-panel')
 
-  if (!activeClient || !panel || selectedItem !== stream || !isCurrentNavigation(token)) {
+  if (!activeProfile || !panel || selectedItem !== stream || !isCurrentNavigation(token)) {
     return
   }
 
   panel.innerHTML = '<div class="epg"><h2>Schedule</h2><p>Loading schedule…</p></div>'
+  const kind = showCatchupActions ? 'catchup' : 'schedule'
+  const durable = await catalogRepository.getEpg<Program[]>(
+    activeProfile.id,
+    stream.id,
+    kind,
+  )
+
+  if (durable && isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
+    panel.innerHTML = renderEpg(stream, durable, showCatchupActions)
+    bindEvents()
+    return
+  }
+
+  if (!activeClient) {
+    panel.innerHTML = '<div class="epg"><h2>Schedule</h2><p>Schedule information is unavailable for this channel.</p></div>'
+    return
+  }
 
   try {
     const programs = await activeClient.epg(stream.id, showCatchupActions ? 24 : 8, signal)
 
     if (isCurrentNavigation(token) && selectedItem === stream && panel.isConnected) {
+      void catalogRepository.putEpg(
+        activeProfile.id,
+        stream.id,
+        kind,
+        programs,
+        EPG_CACHE_TTL_MS,
+      )
       panel.innerHTML = renderEpg(stream, programs, showCatchupActions)
       bindEvents()
     }
@@ -5351,10 +6232,13 @@ function closePlayer(): void {
       token,
       signal,
     )
-    return
+  } else {
+    render()
   }
 
-  render()
+  if (profile) {
+    void refreshLibrarySyncState(profile.id, true)
+  }
 }
 
 function togglePlayback(): void {
@@ -5741,6 +6625,10 @@ function canRunCatalogSync(): boolean {
 }
 
 function scheduleCatalogSync(delayMs = LIBRARY_SYNC_IDLE_DELAY_MS): boolean {
+  if (catalogSyncDisabled) {
+    return false
+  }
+
   if (!canRunCatalogSync()) {
     return false
   }
@@ -5788,6 +6676,7 @@ async function inspectCatalogSyncStorage(): Promise<CatalogSyncStorageInspection
         lastAttemptAt: checkpoint?.lastAttemptAt ?? null,
         lastSuccessAt: checkpoint?.lastSuccessAt ?? null,
         lastFailureAt: checkpoint?.lastFailureAt ?? null,
+        lastFailureDetail: checkpoint?.lastFailureDetail ?? null,
       },
     }
   }
@@ -5800,9 +6689,135 @@ async function inspectCatalogSyncStorage(): Promise<CatalogSyncStorageInspection
   }
 }
 
-async function runCatalogSync(runOptions: CatalogSyncRunOptions = {}) {
+async function refreshCurrentLibraryViewAfterSync(profileId: string): Promise<void> {
+  if (profile?.id !== profileId) {
+    return
+  }
+
+  if (view === 'guide') {
+    await openGuide(false, guide.category?.id, guide.page)
+    return
+  }
+
+  if (view === 'search' && globalSearchQuery.trim().length >= MIN_GLOBAL_SEARCH_LENGTH) {
+    await updateGlobalSearchFromLibrary(globalSearchQuery)
+    return
+  }
+
+  const activeCatalog = catalog
+
+  if (
+    view !== 'catalog' ||
+    !activeCatalog ||
+    activeCatalog.isFavorites
+  ) {
+    return
+  }
+
+  if (!activeCatalog.category) {
+    const local = await catalogRepository.readCompleteSectionCategories(
+      profileId,
+      activeCatalog.section,
+    )
+
+    if (
+      profile?.id === profileId &&
+      view === 'catalog' &&
+      catalog === activeCatalog &&
+      local.coverage === 'complete'
+    ) {
+      rememberCategories(activeCatalog.section, local.categories)
+      catalog = {
+        ...activeCatalog,
+        categories: local.categories,
+        source: 'downloaded',
+        availabilityMessage: undefined,
+        results: undefined,
+      }
+      renderCatalog()
+    }
+    return
+  }
+
+  const local = await catalogRepository.readCompleteCategoryPage(
+    profileId,
+    activeCatalog.section,
+    activeCatalog.category.id,
+    activeCatalog.page,
+    catalogPageSize(),
+  )
+
+  if (
+    profile?.id === profileId &&
+    view === 'catalog' &&
+    catalog === activeCatalog &&
+    local.coverage !== 'none'
+  ) {
+    rememberStreams(local.items)
+    cacheStreams(activeCatalog.section, activeCatalog.category.id, local.items)
+    catalog = {
+      ...activeCatalog,
+      streams: local.items,
+      page: local.page,
+      source: 'downloaded',
+      availabilityMessage: undefined,
+      windowedCategory: true,
+      totalStreamCount: local.itemCount,
+      results: undefined,
+    }
+    renderCatalog()
+  }
+}
+
+async function applyCatalogSyncResult(
+  profileId: string,
+  result: CatalogSyncResult,
+): Promise<void> {
+  await refreshLibrarySyncState(profileId, false)
+
+  if (profile?.id !== profileId) {
+    return
+  }
+
+  if (result.status === 'deferred') {
+    librarySyncState = {
+      ...librarySyncState,
+      outcome: 'deferred',
+      nextDueAt: result.nextDueAt,
+    }
+  } else if (result.status === 'cancelled') {
+    librarySyncState = {
+      ...librarySyncState,
+      outcome: 'cancelled',
+      nextDueAt: result.nextDueAt,
+    }
+  }
+
+  updateLibrarySyncIndicator()
+
+  if (result.status === 'completed') {
+    await refreshCurrentLibraryViewAfterSync(profileId)
+  }
+
+  if (
+    librarySyncState.incompleteSections.length &&
+    result.nextDueAt !== undefined &&
+    !document.hidden &&
+    view !== 'player'
+  ) {
+    scheduleCatalogSync(catalogSyncRearmDelay(result.nextDueAt, Date.now()))
+  }
+}
+
+async function runCatalogSync(
+  runOptions: CatalogSyncRunOptions = {},
+): Promise<CatalogSyncResult | null> {
   const activeProfile = profile
   const activeSync = catalogSync
+
+  if (catalogSyncDisabled) {
+    return null
+  }
 
   if (!activeProfile || !activeSync || view === 'player' || document.hidden) {
     return null
@@ -5824,6 +6839,8 @@ async function runCatalogSync(runOptions: CatalogSyncRunOptions = {}) {
       section: runOptions.section ?? null,
       maxResponseBytes: runOptions.maxResponseBytes ?? null,
     })
+
+    await applyCatalogSyncResult(activeProfile.id, result)
 
     result.sections.forEach((section) => {
       performanceTrace.event('library', 'catalog-sync-section-result', {
@@ -5869,6 +6886,10 @@ function scheduleLocalSearchIndexMigration(profileId: string): void {
             (total, result) => total + result.legacyUntitledCount,
             0,
           ),
+          preMigrationZeroPrefixCount: completed.reduce(
+            (total, result) => total + result.preMigrationZeroPrefixCount,
+            0,
+          ),
           elapsedMs: completed.reduce((total, result) => total + result.elapsedMs, 0),
         })
       },
@@ -5879,6 +6900,7 @@ function scheduleLocalSearchIndexMigration(profileId: string): void {
           itemCount: 0,
           postingCount: 0,
           legacyUntitledCount: 0,
+          preMigrationZeroPrefixCount: 0,
           elapsedMs: null,
         })
       },
@@ -5896,9 +6918,7 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: ProviderBroker
   clearLibraryMemoryCaches()
   profile = nextProfile
   client = nextClient ?? new ProviderBroker(nextProfile)
-  catalogSync = new CatalogSyncCoordinator(client, catalogRepository, {
-    internalFaultDiagnostics: import.meta.env.VITE_ENABLE_LIBRARY_PROBE === 'true',
-  })
+  catalogSync = createCatalogSyncCoordinator(client)
   settings = loadSettings(nextProfile.id)
   favorites = loadFavorites(nextProfile.id)
   resumeEntries = loadResume(nextProfile.id)
@@ -5919,13 +6939,58 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: ProviderBroker
   personReturnPoint = null
   playerItem = null
   liveQueue = []
-  guideStreams = []
+  guide = {
+    categories: [],
+    category: null,
+    streams: [],
+    page: 0,
+    pageCount: 1,
+    totalStreamCount: 0,
+  }
   streamCache.clear()
   sectionCategories.clear()
   adultCategoryIds.clear()
   knownStreams.clear()
   nowNextCache.clear()
+  account = null
+  accountCapturedAt = null
+  void loadPersistedAccountSummary(nextProfile.id)
   scheduleLocalSearchIndexMigration(nextProfile.id)
+  void initializeLibrarySync(nextProfile.id)
+}
+
+function setAccountSummary(summary: AccountSummary | null): void {
+  const capturedAt = summary ? Date.now() : null
+  account = summary
+  accountCapturedAt = capturedAt
+
+  if (summary && profile && capturedAt !== null) {
+    void catalogRepository.putMeta(profile.id, {
+      account: {
+        summary,
+        capturedAt,
+      },
+    })
+  }
+}
+
+async function loadPersistedAccountSummary(profileId: string): Promise<void> {
+  const meta = await catalogRepository.getMeta(profileId)
+
+  if (
+    profile?.id !== profileId ||
+    !meta?.account ||
+    accountCapturedAt !== null
+  ) {
+    return
+  }
+
+  account = meta.account.summary
+  accountCapturedAt = meta.account.capturedAt
+
+  if (view === 'home') {
+    renderHome()
+  }
 }
 
 async function refreshAccount(silent = false): Promise<void> {
@@ -5934,7 +6999,7 @@ async function refreshAccount(silent = false): Promise<void> {
   }
 
   try {
-    account = await client.validate()
+    setAccountSummary(await client.validate())
 
     if (view === 'home') {
       renderHome()
@@ -6319,9 +7384,26 @@ function handleColorShortcut(event: KeyboardEvent): boolean {
       void openGuide()
     }
   } else if (color === 'yellow' && view === 'catalog' && catalog?.category) {
-    catalog.sort = nextSort(catalog.sort)
-    renderCatalog()
-    showToast(`Sort: ${SORT_LABELS[catalog.sort]}`)
+    const activeCatalog = catalog
+    void materializeCatalogCategory(activeCatalog).then((materialized) => {
+      if (
+        !materialized ||
+        view !== 'catalog' ||
+        catalog?.category?.id !== activeCatalog.category?.id
+      ) {
+        return
+      }
+
+      const currentCatalog = catalog
+
+      if (!currentCatalog) {
+        return
+      }
+
+      currentCatalog.sort = nextSort(currentCatalog.sort)
+      renderCatalog()
+      showToast(`Sort: ${SORT_LABELS[currentCatalog.sort]}`)
+    })
   } else if (color === 'blue') {
     pushRouteHistory()
     startNavigation()
@@ -6391,6 +7473,59 @@ function hideChannelNumberOverlay(): void {
   }
 }
 
+function resetVideoSizingProbe(): void {
+  videoSizingActiveEngine = 'unknown'
+  videoSizingHistory = []
+}
+
+function captureVideoSizing(
+  reason: VideoSizingSample['reason'],
+  activeEngine = videoSizingActiveEngine,
+): VideoSizingReport | null {
+  if (!libraryProbeEnabled) {
+    return null
+  }
+
+  const video = document.querySelector<HTMLVideoElement>('#video-player')
+  const playerContainer = document.querySelector<HTMLElement>('#player-surface')
+
+  if (!video || !playerContainer) {
+    return null
+  }
+
+  const box = playerContainer.getBoundingClientRect()
+  const sample: VideoSizingSample = {
+    observedAt: Date.now(),
+    reason,
+    activeEngine,
+    videoWidth: video.videoWidth,
+    videoHeight: video.videoHeight,
+    clientWidth: video.clientWidth,
+    clientHeight: video.clientHeight,
+    objectFit: window.getComputedStyle(video).objectFit,
+    playerContainer: {
+      x: box.x,
+      y: box.y,
+      width: box.width,
+      height: box.height,
+    },
+  }
+
+  videoSizingActiveEngine = activeEngine
+  videoSizingHistory = [...videoSizingHistory, sample].slice(-24)
+  return {
+    ...sample,
+    resolutionHistory: [...videoSizingHistory],
+  }
+}
+
+function recordVideoSizing(
+  reason: Exclude<VideoSizingSample['reason'], 'capture'>,
+  activeEngine: VideoSizingSample['activeEngine'],
+): void {
+  void captureVideoSizing(reason, activeEngine)
+}
+
 function showToast(message: string): void {
   let toast = document.querySelector<HTMLElement>('#remote-toast')
 
@@ -6401,6 +7536,7 @@ function showToast(message: string): void {
     document.body.append(toast)
   }
 
+  toast.classList.toggle('is-player-toast', view === 'player')
   toast.textContent = message
   toast.hidden = false
   window.setTimeout(() => {
@@ -6899,6 +8035,10 @@ document.addEventListener('visibilitychange', () => {
     cancelPlayerSeek()
     document.querySelector<HTMLVideoElement>('#video-player')?.pause()
   }
+
+  if (!document.hidden && profile) {
+    void initializeLibrarySync(profile.id)
+  }
 })
 
 if (
@@ -6939,13 +8079,21 @@ if (
         await deleteProbeDatabase(lastLibraryProbeDatabaseName)
       }
     },
+    videoSizing: {
+      capture() {
+        return captureVideoSizing('capture')
+      },
+      reset() {
+        resetVideoSizingProbe()
+      },
+    },
     catalogSync: {
       schedule(delayMs = LIBRARY_SYNC_IDLE_DELAY_MS) {
         return scheduleCatalogSync(delayMs)
       },
-      run() {
+      run(runOptions: CatalogSyncRunOptions = {}) {
         cancelScheduledCatalogSync()
-        return runCatalogSync()
+        return runCatalogSync(runOptions)
       },
       cancel() {
         cancelScheduledCatalogSync()
@@ -7015,6 +8163,38 @@ if (
         // provider or alter the broker's daily counters or refusal state.
         return true
       },
+      async simulateEviction() {
+        if (catalogSync?.isRunning || view === 'player') {
+          return false
+        }
+
+        cancelScheduledCatalogSync()
+        await catalogRepository.simulateEviction()
+        clearLibraryMemoryCaches()
+        streamCache.clear()
+        nowNextCache.clear()
+        catalog = null
+        guide = {
+          categories: [],
+          category: null,
+          streams: [],
+          page: 0,
+          pageCount: 1,
+          totalStreamCount: 0,
+        }
+        selectedItem = null
+        selectedSeries = null
+        selectedVod = null
+        account = null
+        accountCapturedAt = null
+
+        if (view === 'catalog' || view === 'guide' || view === 'search' || view === 'details') {
+          view = 'home'
+          render()
+        }
+
+        return true
+      },
       inspectBudget() {
         return client?.inspectBudget() ?? null
       },
@@ -7024,10 +8204,71 @@ if (
         // refusal/Retr-After block.
         return client?.resetBudgetsForProbe() ?? null
       },
+      /**
+       * Probe-only EPG UI demonstration. Opens the real live details view for a
+       * supplied live channel so now/next and the schedule render through the
+       * exact production path (loadLiveDetails -> nowNext, showEpg -> epg),
+       * without needing a downloaded live catalog. It reads the rendered panels
+       * back so a caller can confirm programme rows appeared. No catalog sync is
+       * involved.
+       */
+      async epgDemo(input: { id: string; name?: string; showSchedule?: boolean }) {
+        const stream: StreamItem = {
+          id: String(input.id),
+          name: input.name ?? 'EPG demo channel',
+          section: 'live',
+          categoryId: '',
+        }
+        await openDetails(stream)
+        if (input.showSchedule) {
+          await showEpg(stream, false)
+        }
+        const nowNextPanel = document.querySelector('#now-next-panel')?.textContent ?? ''
+        const epgPanel = document.querySelector('#epg-panel')?.textContent ?? ''
+        return {
+          view,
+          selectedIsLive: selectedItem?.section === 'live' && selectedItem.id === stream.id,
+          nowNextRendered: nowNextPanel.trim().length > 0,
+          nowNextRowCount: (document.querySelectorAll('#now-next-panel .now-next div') || []).length,
+          scheduleRendered: epgPanel.trim().length > 0,
+          scheduleRowCount: document.querySelectorAll('#epg-panel .epg .program').length,
+        }
+      },
     },
     publication: {
       run(options = {}) {
         return runPublicationProbe(options)
+      },
+    },
+    /**
+     * Reproduces a whole-section acquisition against a synthetic provider and a
+     * disposable database. It uses no provider request and cannot touch the real
+     * catalog cache, so a section-scale failure is repeatable for free.
+     */
+    syncSimulation: {
+      run(options = {}) {
+        /*
+         * Default the progress sink to the app's real persistent indicator so
+         * the on-device A/B actually drives the aria-live region through the
+         * legacy/in-place switch. A caller can still override onProgress.
+         */
+        return runSyncSimulationProbe({
+          onProgress: updateLibrarySyncProgress,
+          ...options,
+        })
+      },
+      cleanup(databaseName: string) {
+        return cleanupSyncSimulation(databaseName)
+      },
+      /*
+       * Probe-only: choose how the persistent DOM indicator updates during the
+       * A/B. 'legacy-replace' is the pre-fix destructive outerHTML path (A1);
+       * 'in-place' is the current cheap mutation (A2). Attach the real indicator
+       * and pair with syncSimulation.run({ progressThrottleMs: 0 }) for A1.
+       */
+      setIndicatorMode(mode: 'legacy-replace' | 'in-place') {
+        librarySyncIndicatorLegacyReplace = mode === 'legacy-replace'
+        return librarySyncIndicatorLegacyReplace
       },
     },
     flatSnapshot: {
@@ -7084,5 +8325,7 @@ initializeAppHistory()
 render()
 
 if (profile) {
+  void loadPersistedAccountSummary(profile.id)
   scheduleLocalSearchIndexMigration(profile.id)
+  void initializeLibrarySync(profile.id)
 }

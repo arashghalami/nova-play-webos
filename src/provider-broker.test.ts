@@ -464,6 +464,27 @@ describe('ProviderBroker', () => {
     expect(transport.fetch).toHaveBeenCalledTimes(2)
   })
 
+  it('routes one submitted section search through the interactive lane without consuming sync budget', async () => {
+    vi.stubGlobal('localStorage', new MemoryStorage())
+    const transport: ProviderTransport = {
+      fetch: vi.fn(async (url: string) =>
+        responseForAction(new URL(url).searchParams.get('action')),
+      ),
+    }
+    const broker = new ProviderBroker(profile, {
+      transport,
+      interactiveDailyRequestBudget: 2,
+      syncDailyRequestBudget: 6,
+    })
+
+    await expect(broker.searchStreams('vod', 'fixture')).resolves.toEqual([])
+    expect(transport.fetch).toHaveBeenCalledTimes(1)
+    expect(broker.inspectBudget()).toMatchObject({
+      interactive: { used: 1, remaining: 1 },
+      sync: { used: 0, remaining: 6 },
+    })
+  })
+
   it('migrates a legacy shared counter into interactive usage without consuming the new sync budget', () => {
     const storage = new MemoryStorage()
     vi.stubGlobal('localStorage', storage)

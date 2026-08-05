@@ -48,6 +48,37 @@ describe('XtreamClient global search', () => {
     expect(batches.flat()).toEqual(['1', '3'])
   })
 
+  it('normalizes the provider EPG channel identifier from a live stream record', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          {
+            stream_id: '10',
+            name: 'Mapped channel',
+            category_id: 'news',
+            num: '3',
+            epg_channel_id: 'BBCNews.uk',
+          },
+          {
+            stream_id: '11',
+            name: 'Unmapped channel',
+            category_id: 'news',
+            num: '4',
+          },
+        ]),
+        { status: 200 },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new XtreamClient(profile)
+
+    const streams = await client.streams('live', 'news')
+
+    expect(streams[0]).toMatchObject({ id: '10', epgChannelId: 'BBCNews.uk' })
+    // A channel with no mapping must not fabricate one.
+    expect(streams[1].epgChannelId).toBeUndefined()
+  })
+
   it('honors a caller-provided stream request timeout', async () => {
     vi.useFakeTimers()
     const fetchMock = vi.fn().mockImplementation(
@@ -115,18 +146,52 @@ describe('XtreamClient global search', () => {
     const received: string[] = []
     const client = new XtreamClient(profile)
 
-    await expect(
-      client.scanSection('vod', {
-        responseTimeoutMs: 15_000,
-        timeoutMs: 120_000,
-        onMatches: (batch) => received.push(...batch.map((stream) => stream.id)),
-      }),
-    ).resolves.toBeUndefined()
+    const statistics = await client.scanSection('vod', {
+      responseTimeoutMs: 15_000,
+      timeoutMs: 120_000,
+      onMatches: (batch) => received.push(...batch.map((stream) => stream.id)),
+    })
 
+    expect(statistics).toMatchObject({
+      rawItemCount: 2,
+      parsedItemCount: 2,
+      acceptedItemCount: 2,
+      missingIdentifierCount: 0,
+      arrayClosed: true,
+    })
     expect(received).toEqual(['1', '2'])
     const requestUrl = new URL(String(fetchMock.mock.calls[0][0]))
     expect(requestUrl.searchParams.get('action')).toBe('get_vod_streams')
     expect(requestUrl.searchParams.has('category_id')).toBe(false)
+  })
+
+  it('reports raw versus accepted counts when records close cleanly but lack identifiers', async () => {
+    // A closed array of records that all lack the section identifier (series
+    // needs series_id; a bare stream_id is not accepted for series).
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        '[{"stream_id":"1","name":"No series id"},{"stream_id":"2","name":"Also none"}]',
+        { status: 200 },
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const received: string[] = []
+    const client = new XtreamClient(profile)
+
+    const statistics = await client.scanSection('series', {
+      responseTimeoutMs: 15_000,
+      timeoutMs: 120_000,
+      onMatches: (batch) => received.push(...batch.map((stream) => stream.id)),
+    })
+
+    expect(statistics).toMatchObject({
+      rawItemCount: 2,
+      parsedItemCount: 2,
+      acceptedItemCount: 0,
+      missingIdentifierCount: 2,
+      arrayClosed: true,
+    })
+    expect(received).toEqual([])
   })
 
   it('rejects a truncated whole-section response after incremental records were delivered', async () => {

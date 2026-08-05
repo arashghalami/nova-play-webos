@@ -8,7 +8,12 @@ import {
   readProbeKeys,
   writeProbeBatch,
 } from './idb-probe'
-import type { CatalogSyncResult } from './catalog-sync'
+import type { CatalogSyncResult, CatalogSyncRunOptions } from './catalog-sync'
+import type { LibrarySyncSectionFailureDetail } from './catalog-repository'
+import type {
+  SyncSimulationOptions,
+  SyncSimulationReport,
+} from './sync-simulation-probe'
 import type { ProviderBudgetSnapshot } from '../provider-broker'
 import type { LibrarySection } from '../types'
 import type {
@@ -59,9 +64,31 @@ export type CatalogSyncStorageInspection = {
         lastAttemptAt: number | null
         lastSuccessAt: number | null
         lastFailureAt: number | null
+        lastFailureDetail: LibrarySyncSectionFailureDetail | null
       }
     }
   >
+}
+
+export type VideoSizingSample = {
+  observedAt: number
+  reason: 'attempt-start' | 'loadedmetadata' | 'playing' | 'resize' | 'capture'
+  activeEngine: 'native' | 'hls' | 'mpegts' | 'dash' | 'unknown'
+  videoWidth: number
+  videoHeight: number
+  clientWidth: number
+  clientHeight: number
+  objectFit: string
+  playerContainer: {
+    x: number
+    y: number
+    width: number
+    height: number
+  }
+}
+
+export type VideoSizingReport = VideoSizingSample & {
+  resolutionHistory: VideoSizingSample[]
 }
 
 export type LibraryCapabilityProbeApi = {
@@ -70,6 +97,16 @@ export type LibraryCapabilityProbeApi = {
   cleanup(): Promise<void>
   publication: {
     run(options?: PublicationProbeOptions): Promise<PublicationProbeReport>
+  }
+  /**
+   * Reproduces a whole-section acquisition through the production coordinator
+   * against a synthetic provider and a disposable database. No provider request,
+   * no effect on the real catalog cache.
+   */
+  syncSimulation: {
+    run(options?: SyncSimulationOptions): Promise<SyncSimulationReport>
+    cleanup(databaseName: string): Promise<void>
+    setIndicatorMode(mode: 'legacy-replace' | 'in-place'): boolean
   }
   flatSnapshot: {
     run(options?: FlatSnapshotProbeOptions): Promise<FlatSnapshotProbeReport>
@@ -82,9 +119,13 @@ export type LibraryCapabilityProbeApi = {
       startFromResume(): Promise<boolean>
     }
   }
+  videoSizing: {
+    capture(): VideoSizingReport | null
+    reset(): void
+  }
   catalogSync: {
     schedule(delayMs?: number): boolean
-    run(): Promise<CatalogSyncResult | null>
+    run(runOptions?: CatalogSyncRunOptions): Promise<CatalogSyncResult | null>
     cancel(): void
     isRunning(): boolean
     inspectState(): Promise<CatalogSyncStorageInspection | null>
@@ -100,8 +141,26 @@ export type LibraryCapabilityProbeApi = {
      * publication proof. It never sends a provider request or alters budgets.
      */
     clearFailedCheckpointsForProbe(): Promise<boolean>
+    /**
+     * Deletes the complete local library database for eviction-recovery checks.
+     * It never calls the provider and leaves localStorage user state intact.
+     */
+    simulateEviction(): Promise<boolean>
     inspectBudget(): ProviderBudgetSnapshot | null
     resetBudget(): ProviderBudgetSnapshot | null
+    /**
+     * Probe-only EPG UI demonstration: opens the real live details view for a
+     * channel so now/next and the schedule render through the production path,
+     * without a downloaded live catalog. Returns whether the panels rendered.
+     */
+    epgDemo(input: { id: string; name?: string; showSchedule?: boolean }): Promise<{
+      view: string
+      selectedIsLive: boolean
+      nowNextRendered: boolean
+      nowNextRowCount: number
+      scheduleRendered: boolean
+      scheduleRowCount: number
+    }>
   }
 }
 
