@@ -35,10 +35,52 @@ export type ScheduleResult = {
   source: EpgSource
 } | null
 
-/** True when a channel carries a usable guide identifier. */
-export function hasEpgIdentifier(stream: Pick<StreamItem, 'epgChannelId'>): boolean {
+/**
+ * Three-state classification of a channel's guide identifier. This distinction
+ * is load-bearing: treating a missing field as an authoritative negative (the
+ * original two-state bug) silently suppressed EPG for every record stored before
+ * `epg_channel_id` capture existed.
+ *
+ *   - `populated`: a real identifier. Request provider EPG (by stream id) and,
+ *     on a non-serving host, the public source (by identifier).
+ *   - `blank`: an empty string or the literal `"null"`. The provider itself
+ *     declared no guide mapping for this channel — an authoritative negative, so
+ *     no request is ever issued.
+ *   - `absent`: the field is missing entirely. The stored generation predates
+ *     capture, so mapping is UNKNOWN, not negative. A provider probe is allowed
+ *     (the provider EPG endpoints key on stream id, not the identifier); it is
+ *     cheap, cached, and only fires for a channel the user opens or a visible
+ *     guide row. The public source cannot run (there is no identifier to key on).
+ */
+export type EpgIdentifierState = 'populated' | 'blank' | 'absent'
+
+export function epgIdentifierState(
+  stream: Pick<StreamItem, 'epgChannelId'>,
+): EpgIdentifierState {
   const value = stream.epgChannelId
-  return typeof value === 'string' && value.trim().length > 0 && value.trim().toLowerCase() !== 'null'
+  if (value === undefined || value === null) {
+    return 'absent'
+  }
+  const trimmed = String(value).trim()
+  if (trimmed.length === 0 || trimmed.toLowerCase() === 'null') {
+    return 'blank'
+  }
+  return 'populated'
+}
+
+/**
+ * True only for a `populated` identifier. Retained for callers that need the
+ * strict "has a usable identifier" meaning (e.g. public-source keying). It is
+ * NOT the request gate — use {@link epgIdentifierState} so an `absent`
+ * (pre-capture) record is not mistaken for an authoritative negative.
+ */
+export function hasEpgIdentifier(stream: Pick<StreamItem, 'epgChannelId'>): boolean {
+  return epgIdentifierState(stream) === 'populated'
+}
+
+/** True unless the identifier is a `blank` authoritative negative. */
+export function epgRequestAllowed(stream: Pick<StreamItem, 'epgChannelId'>): boolean {
+  return epgIdentifierState(stream) !== 'blank'
 }
 
 export function normalizedEpgIdentifier(
@@ -121,10 +163,11 @@ export async function resolveNowNext(
   provider: EpgProvider | null,
   signal?: AbortSignal,
 ): Promise<NowNextResult> {
-  const identifier = normalizedEpgIdentifier(stream)
+  const idState = epgIdentifierState(stream)
 
-  // Authoritative negative: no identifier means no schedule anywhere.
-  if (!identifier) {
+  // Authoritative negative: the provider explicitly declared no mapping.
+  // `absent` (pre-capture) is NOT negative and still allows a provider probe.
+  if (idState === 'blank') {
     return null
   }
 
@@ -133,6 +176,7 @@ export async function resolveNowNext(
     return { nowNext: cached, source: 'cache' }
   }
 
+  // Provider EPG keys on stream id, so it works for `populated` and `absent`.
   if (capability !== 'unavailable' && provider) {
     try {
       const nowNext = await provider.nowNext(stream.id, signal)
@@ -148,7 +192,9 @@ export async function resolveNowNext(
     }
   }
 
-  if (capability === 'unavailable' && config.publicSource) {
+  // The public source is keyed on the identifier, so it needs a populated one.
+  const identifier = normalizedEpgIdentifier(stream)
+  if (capability === 'unavailable' && identifier && config.publicSource) {
     const nowNext = await config.publicSource.nowNext(identifier, signal)
     if (nowNextHasData(nowNext)) {
       await config.cache.putEpg(profileId, stream.id, 'now-next', nowNext, config.nowNextTtlMs)
@@ -173,9 +219,10 @@ export async function resolveSchedule(
   options: { limit: number; kind: Extract<LibraryEpgKind, 'schedule' | 'catchup'> },
   signal?: AbortSignal,
 ): Promise<ScheduleResult> {
-  const identifier = normalizedEpgIdentifier(stream)
+  const idState = epgIdentifierState(stream)
 
-  if (!identifier) {
+  // Authoritative negative only for a provider-declared blank mapping.
+  if (idState === 'blank') {
     return null
   }
 
@@ -184,6 +231,7 @@ export async function resolveSchedule(
     return { programs: rehydratePrograms(cached), source: 'cache' }
   }
 
+  // Provider schedule keys on stream id, so it works for `populated` and `absent`.
   if (capability !== 'unavailable' && provider) {
     try {
       const programs = await provider.epg(stream.id, options.limit, signal)
@@ -198,7 +246,8 @@ export async function resolveSchedule(
     }
   }
 
-  if (capability === 'unavailable' && config.publicSource) {
+  const identifier = normalizedEpgIdentifier(stream)
+  if (capability === 'unavailable' && identifier && config.publicSource) {
     const programs = await config.publicSource.schedule(identifier, options.limit, signal)
     if (programs && programs.length) {
       await config.cache.putEpg(profileId, stream.id, options.kind, programs, config.scheduleTtlMs)

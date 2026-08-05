@@ -91,12 +91,24 @@ describe('local-first catalog regressions', () => {
     // The banned fan-out (prefetchNowNext) must never return in any form.
     expect(mainSource).not.toMatch(/prefetchNowNext/)
     expect(mainSource).toMatch(/new LruTtlCache<NowNext>\(\s*MAX_NOW_NEXT_ENTRIES,\s*NOW_NEXT_CACHE_TTL_MS,/)
-    // Guide list hydration is bounded to the visible page and skips unmapped
-    // channels before any request is formed.
+    // Guide list hydration is bounded to the visible page and gates on the
+    // three-state identifier: eligible = not a provider-declared blank.
     expect(mainSource).toMatch(/streams\.slice\(0, GUIDE_VISIBLE_NOW_NEXT_LIMIT\)/)
-    expect(mainSource).toMatch(/visible\.filter\(\(stream\) => hasEpgIdentifier\(stream\)\)/)
-    // A blank identifier is an authoritative negative: no request is issued.
-    expect(mainSource).toMatch(/if \(!hasEpgIdentifier\(stream\)\) \{/)
+    expect(mainSource).toMatch(/visible\.filter\(\(stream\) => epgRequestAllowed\(stream\)\)/)
+    // Only a blank identifier is an authoritative negative: no request is issued.
+    expect(mainSource).toMatch(/if \(!epgRequestAllowed\(stream\)\) \{/)
+  })
+
+  it('gates EPG on the three-state identifier so pre-capture records are not suppressed', () => {
+    const epgServiceSource = sources['./epg-service.ts']
+    // The gate distinguishes absent (probe), blank (suppress), populated (probe).
+    expect(epgServiceSource).toMatch(/export type EpgIdentifierState =\s*'populated' \| 'blank' \| 'absent'/)
+    expect(epgServiceSource).toMatch(/function epgIdentifierState\(/)
+    expect(epgServiceSource).toMatch(/function epgRequestAllowed\(/)
+    // resolveNowNext/resolveSchedule suppress only the blank state.
+    expect(epgServiceSource).toMatch(/if \(idState === 'blank'\) \{\s*return null/)
+    // A missing field is 'absent', never the negative that suppresses requests.
+    expect(epgServiceSource).toMatch(/value === undefined \|\| value === null/)
   })
 
   it('starts incomplete background acquisition, reports truthful cooldown state, and gates production diagnostics', () => {

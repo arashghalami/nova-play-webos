@@ -129,8 +129,8 @@ import {
 } from './library/catalog-repository'
 import {
   capabilityIsFresh,
-  hasEpgIdentifier,
-  normalizedEpgIdentifier,
+  epgIdentifierState,
+  epgRequestAllowed,
   resolveNowNext as resolveNowNextData,
   resolveSchedule as resolveScheduleData,
   type EpgProvider,
@@ -2721,7 +2721,9 @@ function renderGuide(): void {
  * request will ever be made for them.
  */
 function guideRowPlaceholder(stream: StreamItem): string {
-  if (!hasEpgIdentifier(stream)) {
+  // Only a provider-declared blank is definitively unmapped. An `absent`
+  // (pre-capture) record is still probeable, so it shows the loading state.
+  if (epgIdentifierState(stream) === 'blank') {
     return 'No guide for this channel'
   }
   if (epgCapability === 'unavailable') {
@@ -2744,22 +2746,26 @@ async function hydrateVisibleGuideRows(streams: StreamItem[]): Promise<void> {
 
   const token = navigationToken
   const visible = streams.slice(0, GUIDE_VISIBLE_NOW_NEXT_LIMIT)
-  const mapped = visible.filter((stream) => hasEpgIdentifier(stream))
+  // Eligible = anything not a provider-declared blank. This includes `absent`
+  // (pre-capture) records, which are UNKNOWN not negative, so an upgraded
+  // install whose stored records lack the field still gets a guide.
+  const eligible = visible.filter((stream) => epgRequestAllowed(stream))
 
-  // Mark unmapped rows definitively; they will never be requested.
+  // Only a blank (authoritative-negative) row is labelled unmapped up front;
+  // it will never be requested.
   for (const stream of visible) {
-    if (!hasEpgIdentifier(stream)) {
+    if (!epgRequestAllowed(stream)) {
       writeGuideRow(stream, null, 'unmapped')
     }
   }
 
-  if (!mapped.length) {
+  if (!eligible.length) {
     return
   }
 
-  // Fold capability detection into the first mapped row when still unknown.
+  // Fold capability detection into the first eligible row when still unknown.
   if (epgCapability === 'unknown') {
-    await detectEpgCapability(activeProfile.id, mapped[0])
+    await detectEpgCapability(activeProfile.id, eligible[0])
     if (!isCurrentNavigation(token) || view !== 'guide' || profile?.id !== activeProfile.id) {
       return
     }
@@ -2767,13 +2773,13 @@ async function hydrateVisibleGuideRows(streams: StreamItem[]): Promise<void> {
 
   if (epgCapability === 'unavailable' && !metadataServiceConfigured()) {
     // No provider guide and no public fallback: label the rows, issue nothing.
-    for (const stream of mapped) {
+    for (const stream of eligible) {
       writeGuideRow(stream, null, 'unavailable')
     }
     return
   }
 
-  for (const stream of mapped) {
+  for (const stream of eligible) {
     if (!isCurrentNavigation(token) || view !== 'guide' || profile?.id !== activeProfile.id) {
       return
     }
@@ -6307,10 +6313,11 @@ async function loadPersistedEpgCapability(profileId: string): Promise<void> {
 
 /**
  * Detects whether the active host serves guide data and persists the result per
- * profile. Detection is a SINGLE request against one channel that carries a
- * populated identifier — never a fan-out. `sampleStream` should be a channel
- * already known to the caller (e.g. the first mapped guide row); when none is
- * supplied or none is mapped, capability stays 'unknown' and is retried later.
+ * profile. Detection is a SINGLE request against one channel — never a fan-out.
+ * The provider EPG endpoints key on stream id, so the sample channel only needs
+ * to be non-blank (a `populated` or pre-capture `absent` record); a `blank`
+ * channel is skipped because it would legitimately answer empty. When no usable
+ * sample is supplied, capability stays 'unknown' and is retried later.
  *
  * A populated schedule => available. A clean empty answer from a reachable host
  * => unavailable. A network failure leaves capability 'unknown' so a transient
@@ -6341,9 +6348,9 @@ async function detectEpgCapability(
     }
   }
 
-  const identifier = sampleStream ? normalizedEpgIdentifier(sampleStream) : null
-  if (!sampleStream || !identifier) {
-    // Cannot probe without a mapped channel; leave undetermined for a later try.
+  if (!sampleStream || !epgRequestAllowed(sampleStream)) {
+    // A blank channel would answer empty for a legitimate reason; skip it and
+    // leave capability undetermined for a later, non-blank sample.
     return epgCapability
   }
 
@@ -6448,9 +6455,9 @@ async function loadLiveDetails(stream: StreamItem): Promise<void> {
     return
   }
 
-  // Authoritative negative: a channel with no guide identifier has no schedule
-  // anywhere, so no provider request is issued and the UI says so plainly.
-  if (!hasEpgIdentifier(stream)) {
+  // Authoritative negative only for a provider-declared blank mapping. An
+  // `absent` (pre-capture) record is still probeable by stream id.
+  if (!epgRequestAllowed(stream)) {
     panel.innerHTML = renderNowNextUnavailable(stream)
     return
   }
@@ -6491,9 +6498,9 @@ function renderNowNextUnavailable(stream: StreamItem): string {
   const reason =
     epgCapability === 'unavailable'
       ? 'This account’s current server provides no guide data.'
-      : hasEpgIdentifier(stream)
-        ? 'No guide is available for this channel right now.'
-        : 'This channel has no guide mapping from your provider.'
+      : epgIdentifierState(stream) === 'blank'
+        ? 'This channel has no guide mapping from your provider.'
+        : 'No guide is available for this channel right now.'
   return `<section class="now-next"><h2>Now &amp; Next</h2><p class="hint">${escape(reason)}</p></section>`
 }
 
@@ -6530,8 +6537,9 @@ async function showEpg(
     return
   }
 
-  // No identifier => no schedule anywhere; never issue a request.
-  if (!hasEpgIdentifier(stream)) {
+  // Provider-declared blank => no schedule anywhere; never issue a request.
+  // `absent` (pre-capture) records are still probeable by stream id.
+  if (!epgRequestAllowed(stream)) {
     panel.innerHTML = renderEpgUnavailable(stream, showCatchupActions)
     return
   }
@@ -6573,9 +6581,9 @@ function renderEpgUnavailable(stream: StreamItem, showCatchupActions: boolean): 
   const reason =
     epgCapability === 'unavailable'
       ? 'This account’s current server provides no guide data. You can add a server that does in Settings.'
-      : hasEpgIdentifier(stream)
-        ? 'Schedule information is unavailable for this channel right now.'
-        : 'Your provider supplies no guide mapping for this channel.'
+      : epgIdentifierState(stream) === 'blank'
+        ? 'Your provider supplies no guide mapping for this channel.'
+        : 'Schedule information is unavailable for this channel right now.'
   return `<div class="epg"><h2>${heading}</h2><p>${escape(reason)}</p></div>`
 }
 

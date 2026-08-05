@@ -106,6 +106,44 @@ if (bundledEngine) {
   )
 }
 
+// A normal package must never ship the diagnostic probe surface or the metered-
+// connection sync kill switch. These are only compiled in under the explicit
+// VITE_ENABLE_LIBRARY_PROBE / VITE_DISABLE_CATALOG_SYNC build flags. Assert their
+// absence here so inertness is enforced by the build, not by convention.
+//
+// The check is skipped when a probe/diagnostic build is deliberately requested.
+const probeBuildRequested =
+  process.env.VITE_ENABLE_LIBRARY_PROBE === 'true' ||
+  process.env.VITE_DISABLE_CATALOG_SYNC === 'true'
+
+if (!probeBuildRequested) {
+  const forbiddenProbeMarkers = [
+    '__NOVA_LIBRARY_PROBE__',
+    'epgDemo',
+    'detectCapability',
+    'runLibraryCapabilityProbe',
+  ]
+  const leakedProbe = forbiddenProbeMarkers.filter((marker) => source.includes(marker))
+
+  if (leakedProbe.length) {
+    throw new Error(
+      `The normal webOS bundle leaked probe-only symbols: ${leakedProbe.join(', ')}. ` +
+        'These must be excluded unless VITE_ENABLE_LIBRARY_PROBE is set.',
+    )
+  }
+
+  // The catalog-sync scheduler must retain its real body in a normal build; the
+  // kill switch is inert unless VITE_DISABLE_CATALOG_SYNC is set. A folded
+  // `function scheduleCatalogSync(...) { return false }` proves the switch was
+  // compiled in, which must never happen in a shipped package.
+  if (/function scheduleCatalogSync\([^)]*\)\s*\{\s*return\s+false\s*[;}]/.test(source)) {
+    throw new Error(
+      'The normal webOS bundle folded scheduleCatalogSync to a no-op, meaning the ' +
+        'VITE_DISABLE_CATALOG_SYNC kill switch was compiled into a shipped build.',
+    )
+  }
+}
+
 console.log(
   `Verified ${bundlePath} has no prohibited post-ES2015 globals and loads Dash.js, Hls.js, and MPEG-TS outside the application IIFE.`,
 )

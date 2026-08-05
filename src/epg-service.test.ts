@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   capabilityIsFresh,
+  epgIdentifierState,
+  epgRequestAllowed,
   hasEpgIdentifier,
   normalizedEpgIdentifier,
   resolveNowNext,
@@ -68,19 +70,122 @@ function config(cache: EpgDurableCache, publicSource?: EpgPublicSource): EpgServ
   return { cache, nowNextTtlMs: 60_000, scheduleTtlMs: 60_000, publicSource }
 }
 
-describe('EPG identifier predicate', () => {
-  it('treats blank, null-literal, and whitespace identifiers as unmapped', () => {
+describe('EPG identifier three-state classification', () => {
+  it('classifies absent (undefined/null) as absent, not a negative', () => {
+    expect(epgIdentifierState(channel('1'))).toBe('absent')
+    expect(epgIdentifierState({ ...channel('1'), epgChannelId: null as unknown as undefined })).toBe(
+      'absent',
+    )
+  })
+
+  it('classifies empty string and the literal "null" as blank', () => {
+    expect(epgIdentifierState(channel('1', ''))).toBe('blank')
+    expect(epgIdentifierState(channel('1', '   '))).toBe('blank')
+    expect(epgIdentifierState(channel('1', 'null'))).toBe('blank')
+    expect(epgIdentifierState(channel('1', 'NULL'))).toBe('blank')
+  })
+
+  it('classifies a real value as populated', () => {
+    expect(epgIdentifierState(channel('1', 'NPO.1.nl'))).toBe('populated')
+  })
+
+  it('allows a request for absent and populated, and suppresses only blank', () => {
+    expect(epgRequestAllowed(channel('1'))).toBe(true) // absent (pre-capture)
+    expect(epgRequestAllowed(channel('1', 'NPO.1.nl'))).toBe(true) // populated
+    expect(epgRequestAllowed(channel('1', ''))).toBe(false) // blank negative
+    expect(epgRequestAllowed(channel('1', 'null'))).toBe(false)
+  })
+
+  it('keeps hasEpgIdentifier/normalizedEpgIdentifier strict to populated only', () => {
     expect(hasEpgIdentifier(channel('1'))).toBe(false)
     expect(hasEpgIdentifier(channel('1', ''))).toBe(false)
-    expect(hasEpgIdentifier(channel('1', '   '))).toBe(false)
     expect(hasEpgIdentifier(channel('1', 'null'))).toBe(false)
     expect(hasEpgIdentifier(channel('1', 'NPO.1.nl'))).toBe(true)
+    expect(normalizedEpgIdentifier(channel('1'))).toBeNull()
     expect(normalizedEpgIdentifier(channel('1', ' NPO.1.nl '))).toBe('NPO.1.nl')
   })
 })
 
+describe('three-state EPG request gate (the shipped-defect regression)', () => {
+  it('does NOT suppress a pre-capture stored record (absent field) — it probes by stream id', async () => {
+    // A record written before epg_channel_id capture reads `undefined`. The old
+    // two-state gate suppressed it forever; the fix must probe the provider.
+    const cache = new MemoryCache()
+    const provider: EpgProvider = {
+      nowNext: vi.fn().mockResolvedValue(nowNextFixture()),
+      epg: vi.fn(),
+    }
+
+    const result = await resolveNowNext(config(cache), 'p', channel('legacy'), 'available', provider)
+
+    expect(provider.nowNext).toHaveBeenCalledTimes(1)
+    expect(provider.nowNext).toHaveBeenCalledWith('legacy', undefined)
+    expect(result?.source).toBe('provider')
+  })
+
+  it('probes a populated channel', async () => {
+    const cache = new MemoryCache()
+    const provider: EpgProvider = {
+      nowNext: vi.fn().mockResolvedValue(nowNextFixture()),
+      epg: vi.fn(),
+    }
+    const result = await resolveNowNext(config(cache), 'p', channel('1', 'NPO.1.nl'), 'available', provider)
+    expect(provider.nowNext).toHaveBeenCalledTimes(1)
+    expect(result?.source).toBe('provider')
+  })
+
+  it('suppresses a blank channel as an authoritative negative', async () => {
+    const cache = new MemoryCache()
+    const provider: EpgProvider = { nowNext: vi.fn(), epg: vi.fn() }
+    const result = await resolveNowNext(config(cache), 'p', channel('1', ''), 'available', provider)
+    expect(result).toBeNull()
+    expect(provider.nowNext).not.toHaveBeenCalled()
+  })
+
+  it('applies the same three states to resolveSchedule', async () => {
+    const cache = new MemoryCache()
+    const provider: EpgProvider = {
+      nowNext: vi.fn(),
+      epg: vi.fn().mockResolvedValue(programFixture()),
+    }
+    // absent -> probes
+    await resolveSchedule(config(cache), 'p', channel('legacy'), 'available', provider, {
+      limit: 8,
+      kind: 'schedule',
+    })
+    expect((provider.epg as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1)
+    // blank -> suppressed
+    const blank = await resolveSchedule(config(cache), 'p', channel('1', 'null'), 'available', provider, {
+      limit: 8,
+      kind: 'schedule',
+    })
+    expect(blank).toBeNull()
+    expect((provider.epg as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1)
+  })
+
+  it('does not use the public source for an absent channel (no identifier to key on)', async () => {
+    const cache = new MemoryCache()
+    const provider: EpgProvider = { nowNext: vi.fn().mockRejectedValue({ kind: 'not-found' }), epg: vi.fn() }
+    const publicSource: EpgPublicSource = {
+      nowNext: vi.fn().mockResolvedValue(nowNextFixture()),
+      schedule: vi.fn(),
+    }
+    // Host unavailable + absent identifier: provider is skipped (unavailable),
+    // and the public source cannot run without an identifier.
+    const result = await resolveNowNext(
+      config(cache, publicSource),
+      'p',
+      channel('legacy'),
+      'unavailable',
+      provider,
+    )
+    expect(result).toBeNull()
+    expect(publicSource.nowNext).not.toHaveBeenCalled()
+  })
+})
+
 describe('resolveNowNext request discipline', () => {
-  it('issues no provider request for an unmapped channel', async () => {
+  it('issues no provider request for a blank (authoritative-negative) channel', async () => {
     const cache = new MemoryCache()
     const provider: EpgProvider = {
       nowNext: vi.fn(),
@@ -90,7 +195,7 @@ describe('resolveNowNext request discipline', () => {
     const result = await resolveNowNext(
       config(cache),
       'p',
-      channel('1'),
+      channel('1', ''),
       'available',
       provider,
     )
@@ -162,25 +267,26 @@ describe('full guide page hydration discipline', () => {
       nowNext: vi.fn().mockResolvedValue(nowNextFixture()),
       epg: vi.fn(),
     }
-    // 24-row page: 15 mapped, 9 unmapped, interleaved.
+    // 24-row page: 15 eligible (populated), 9 blank-negative, interleaved. Blank
+    // identifiers are the authoritative negatives that must never be requested.
     const page: StreamItem[] = Array.from({ length: 24 }, (_, index) =>
       index % 8 === 0 || index % 5 === 0
-        ? channel(`s${index}`)
+        ? channel(`s${index}`, '')
         : channel(`s${index}`, `id.${index}.uk`),
     )
-    const mapped = page.filter((stream) => hasEpgIdentifier(stream))
-    const unmapped = page.filter((stream) => !hasEpgIdentifier(stream))
-    expect(mapped.length + unmapped.length).toBe(24)
-    expect(unmapped.length).toBeGreaterThan(0)
+    const eligible = page.filter((stream) => epgRequestAllowed(stream))
+    const suppressed = page.filter((stream) => !epgRequestAllowed(stream))
+    expect(eligible.length + suppressed.length).toBe(24)
+    expect(suppressed.length).toBeGreaterThan(0)
 
     // Drive the same serial, cache-first loop the guide uses.
     for (const stream of page) {
       await resolveNowNext(config(cache), 'p', stream, 'available', provider)
     }
 
-    // One request per mapped row, none for unmapped rows.
-    expect((provider.nowNext as ReturnType<typeof vi.fn>).mock.calls.length).toBe(mapped.length)
-    for (const stream of unmapped) {
+    // One request per eligible row, none for the blank-negative rows.
+    expect((provider.nowNext as ReturnType<typeof vi.fn>).mock.calls.length).toBe(eligible.length)
+    for (const stream of suppressed) {
       expect(
         (provider.nowNext as ReturnType<typeof vi.fn>).mock.calls.some(
           (call) => call[0] === stream.id,
@@ -195,7 +301,7 @@ describe('full guide page hydration discipline', () => {
       nowNext: vi.fn().mockResolvedValue(nowNextFixture()),
       epg: vi.fn(),
     }
-    const page = [channel('a', 'a.uk'), channel('b', 'b.uk'), channel('c')]
+    const page = [channel('a', 'a.uk'), channel('b', 'b.uk'), channel('c', '')]
 
     for (const stream of page) {
       await resolveNowNext(config(cache), 'p', stream, 'available', provider)
@@ -246,13 +352,13 @@ describe('resolveSchedule', () => {
     expect((provider.epg as ReturnType<typeof vi.fn>).mock.calls.length).toBe(2)
   })
 
-  it('returns null for an unmapped channel without requesting', async () => {
+  it('returns null for a blank (authoritative-negative) channel without requesting', async () => {
     const cache = new MemoryCache()
     const provider: EpgProvider = { nowNext: vi.fn(), epg: vi.fn() }
     const result = await resolveSchedule(
       config(cache),
       'p',
-      channel('1'),
+      channel('1', 'null'),
       'available',
       provider,
       { limit: 8, kind: 'schedule' },
