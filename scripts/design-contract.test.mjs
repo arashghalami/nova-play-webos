@@ -126,8 +126,19 @@ const spread = (rgb) => Math.max(...rgb) - Math.min(...rgb)
  * Literals are allowed a slight cool cast so neutral surfaces do not read as
  * dead flat grey, but nothing beyond that. Anything genuinely hued must be a
  * token.
+ *
+ * The measure is deliberately RELATIVE, not an absolute channel spread. An
+ * absolute threshold is meaningless in the dark end of the range, which is where
+ * a TV app spends most of its pixels: `rgb(5 15 29)` — the login field
+ * background — has a spread of only 24 yet is plainly navy, because its blue
+ * channel is nearly six times its red. Dividing by the brightest channel judges
+ * dark and light colours on the same footing. The floor keeps near-black values
+ * from dividing by almost nothing.
  */
-const LITERAL_TINT_TOLERANCE = 24
+const MAX_RELATIVE_TINT = 0.25
+const RELATIVE_TINT_FLOOR = 12
+
+const relativeTint = (rgb) => spread(rgb) / Math.max(Math.max(...rgb), RELATIVE_TINT_FLOOR)
 
 /** Every literal colour in a declaration value, hex and rgb()/rgba() alike. */
 function literalColours(value) {
@@ -220,9 +231,9 @@ describe('Cinema design contract: colour', () => {
         }
 
         for (const colour of literalColours(declaration.value)) {
-          if (spread(colour.rgb) > LITERAL_TINT_TOLERANCE) {
+          if (relativeTint(colour.rgb) > MAX_RELATIVE_TINT) {
             tinted.push(
-              `style.css:${declaration.line} ${declaration.property}: ${colour.text} (spread ${spread(colour.rgb)})`,
+              `style.css:${declaration.line} ${declaration.property}: ${colour.text} (tint ${relativeTint(colour.rgb).toFixed(2)})`,
             )
           }
         }

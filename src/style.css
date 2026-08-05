@@ -690,7 +690,7 @@ h3 {
   background: #f5f9fe;
   border: 1px solid rgb(25 26 29 / 15%);
   border-radius: 0.45rem;
-  box-shadow: 0 0.2rem 0.6rem rgb(11 12 15 / 20%);
+  box-shadow: 0 0.2rem 0.6rem rgb(12 12 13 / 20%);
 }
 
 .live-channel-logo {
@@ -818,7 +818,7 @@ h3 {
   max-width: calc(100% - 3.45rem);
   padding: 0.34rem 0.5rem;
   overflow: hidden;
-  color: #171009;
+  color: #111112;
   background: var(--accent-gold);
   border-radius: 0.38rem;
   font-size: var(--fs-micro);
@@ -1048,7 +1048,7 @@ h3 {
   min-height: 3.2rem;
   padding: 0 0.9rem;
   color: #f6fbff;
-  background: rgb(11 12 15 / 65%);
+  background: rgb(12 12 13 / 65%);
   border: 1px solid rgb(202 203 206 / 23%);
   border-radius: 0.55rem;
 }
@@ -1279,7 +1279,7 @@ h3 {
   justify-content: center;
   padding: 0.8rem;
   color: #b4b5b8;
-  background: rgb(3 11 23 / 86%);
+  background: rgb(10 10 11 / 86%);
   font-size: var(--fs-caption);
 }
 
@@ -2024,7 +2024,7 @@ select:focus,
   z-index: 8;
   min-height: 5.7rem;
   border-bottom-color: rgb(223 224 227 / 8%);
-  background: linear-gradient(90deg, rgb(7 17 31 / 96%), rgb(20 21 24 / 88%));
+  background: linear-gradient(90deg, rgb(16 16 17 / 96%), rgb(20 21 24 / 88%));
   box-shadow: 0 0.75rem 2rem rgb(0 0 0 / 10%);
 }
 
@@ -2265,7 +2265,7 @@ select:focus,
 }
 
 .hub-card.favorites {
-  background: linear-gradient(145deg, rgb(60 61 64 / 92%), rgb(35 29 22 / 96%));
+  background: linear-gradient(145deg, rgb(60 61 64 / 92%), rgb(30 30 31 / 96%));
 }
 
 .hub-card:hover {
@@ -2369,7 +2369,7 @@ select:focus,
 }
 
 .category-card:focus .category-card-icon {
-  color: #07121e;
+  color: #111112;
   background: var(--focus);
 }
 
@@ -2451,7 +2451,7 @@ select:focus,
 
 .favorite-button {
   color: var(--text-secondary);
-  background: rgb(5 16 29 / 78%);
+  background: rgb(15 15 16 / 78%);
   border-color: rgb(242 243 246 / 12%);
   box-shadow: 0 0.35rem 0.9rem rgb(0 0 0 / 22%);
 }
@@ -2488,8 +2488,8 @@ select:focus,
   bottom: 0;
   left: 0;
   background:
-    linear-gradient(90deg, rgb(7 16 29 / 98%) 3%, rgb(7 16 29 / 88%) 38%, rgb(7 16 29 / 43%) 78%, rgb(7 16 29 / 78%)),
-    linear-gradient(0deg, rgb(7 16 29 / 95%), transparent 52%);
+    linear-gradient(90deg, rgb(15 15 16 / 98%) 3%, rgb(15 15 16 / 88%) 38%, rgb(15 15 16 / 43%) 78%, rgb(15 15 16 / 78%)),
+    linear-gradient(0deg, rgb(15 15 16 / 95%), transparent 52%);
   content: '';
 }
 
@@ -2652,7 +2652,7 @@ select:focus,
 }
 
 .login-form input {
-  background: rgb(5 15 29 / 76%);
+  background: rgb(14 14 15 / 76%);
   border-color: var(--edge-subtle);
   border-radius: var(--radius-sm);
   transition: transform var(--motion-focus) var(--motion-ease);
@@ -2735,7 +2735,7 @@ select:focus,
 
 .setting-row select,
 .setting-row input:not([type='checkbox']) {
-  background: rgb(5 16 29 / 68%);
+  background: rgb(15 15 16 / 68%);
   border-color: var(--edge-subtle);
   border-radius: 999px;
 }
@@ -2804,7 +2804,7 @@ select:focus,
   right: calc(var(--tv-safe-inline) + 1rem);
   left: calc(var(--tv-safe-inline) + 1rem);
   padding: 0.65rem 0.9rem;
-  background: linear-gradient(90deg, rgb(4 12 22 / 88%), rgb(14 15 18 / 58%));
+  background: linear-gradient(90deg, rgb(11 11 12 / 88%), rgb(14 15 18 / 58%));
   border: 1px solid rgb(238 239 242 / 10%);
   border-radius: 1.1rem;
   box-shadow: 0 1rem 3rem rgb(0 0 0 / 28%);
@@ -2820,7 +2820,7 @@ select:focus,
 }
 
 .player-title span {
-  color: #05101d;
+  color: #0f0f10;
   background: var(--focus);
   border-radius: 999px;
 }
@@ -2830,7 +2830,7 @@ select:focus,
   bottom: calc(var(--tv-safe-block) + 1.25rem);
   left: calc(var(--tv-safe-inline) + 1.5rem);
   padding: 0.85rem 1rem;
-  background: linear-gradient(90deg, rgb(3 11 21 / 78%), rgb(3 11 21 / 42%));
+  background: linear-gradient(90deg, rgb(10 10 11 / 78%), rgb(10 10 11 / 42%));
   border-radius: var(--radius-md);
 }
 
@@ -2842,7 +2842,7 @@ select:focus,
   top: calc(var(--tv-safe-block) + 5.5rem);
   right: var(--tv-safe-inline);
   padding: 1.2rem;
-  background: rgb(7 17 31 / 96%);
+  background: rgb(16 16 17 / 96%);
   border-color: rgb(203 204 207 / 23%);
   border-radius: var(--radius-lg);
 }
@@ -2885,7 +2885,7 @@ select:focus,
 .helpbar {
   padding: 0.65rem 1.2rem;
   color: var(--text-muted);
-  background: linear-gradient(90deg, rgb(5 14 26 / 96%), rgb(17 18 21 / 93%));
+  background: linear-gradient(90deg, rgb(13 13 14 / 96%), rgb(17 18 21 / 93%));
   border-top: 1px solid rgb(226 227 230 / 7%);
 }
 
@@ -3346,7 +3346,7 @@ kbd {
 .episode-state {
   flex: 0 0 auto;
   padding: 0.16rem 0.42rem;
-  color: #102416;
+  color: #1f1f20;
   background: var(--success);
   border-radius: 999px;
   font-size: var(--fs-micro);
