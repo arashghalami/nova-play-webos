@@ -5,6 +5,16 @@
     <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Nova Play</title>
+    <!--
+      Start the font fetch at parse time rather than when the stylesheet first
+      matches it to text. Measured on the OLED55G1RLA: bundling the face cost
+      +264 ms on `load` without a preload, because the fetch did not begin until
+      the CSS was applied. `domContentLoaded` was unaffected either way.
+
+      Deliberately no `crossorigin`: the packaged app runs from a file:// origin,
+      where a CORS-flagged font preload is not reliably reused.
+    -->
+    <link rel="preload" href="./inter-variable-latin.woff2" as="font" type="font/woff2" />
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
