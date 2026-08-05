@@ -1,6 +1,30 @@
+/*
+ * Inter Variable, latin subset, copied verbatim from @fontsource-variable/inter
+ * into `public/` so Vite emits it beside the stylesheet. It deliberately does
+ * NOT go through the asset pipeline: `rollupOptions.output.assetFileNames` is
+ * pinned to the literal `style.css` for the packaged single-sheet build, and any
+ * second asset routed through it would be emitted under that same name.
+ *
+ * `font-family: Inter` was declared on :root for the life of the project with no
+ * face behind it, so every TV silently rendered LG's system font instead. The
+ * face is therefore named `Inter` — the existing family stack resolves to it
+ * unchanged, and `scripts/design-contract.test.mjs` now fails if a first-choice
+ * family is ever named again without being shipped.
+ *
+ * One variable face covers the whole 400-900 scale, so there is no second file
+ * and no synthesized bold (`font-synthesis: none`, below).
+ */
+@font-face {
+  font-family: Inter;
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/inter-variable-latin.woff2') format('woff2');
+}
+
 :root {
   color: #f7fbff;
-  background: #06101f;
+  background: #08080A;
   font-family:
     Inter, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   font-synthesis: none;
@@ -25,31 +49,55 @@
   --icon-lg: 2rem;          /* 32px - accent glyphs (hub tiles) */
   --control-size: 3.25rem;  /* 52px - icon-button focus target (>=48px) */
   --control-size-sm: 2.75rem; /* 44px - poster favorite target (>=40px) */
-  --canvas: #07111f;
-  --surface: #101d2e;
-  --surface-raised: #17273b;
-  --surface-focus: #213d57;
-  --text-primary: #f4f8ff;
-  --text-secondary: #a9bed5;
-  --text-muted: #7790aa;
-  --focus: #6ce5ff;
-  --focus-strong: #b5f4ff;
-  --accent: #5fd8ff;
-  --accent-violet: #b38cff;
-  --accent-teal: #5de5c9;
-  --accent-gold: #ffcf67;
-  --success: #83e9ae;
-  --danger: #ff8994;
-  --edge-subtle: rgb(194 224 255 / 10%);
-  --edge-strong: rgb(183 230 255 / 28%);
-  --shadow-soft: 0 1rem 2.8rem rgb(0 0 0 / 24%);
-  --shadow-focus: 0 1.3rem 3.4rem rgb(0 0 0 / 38%), 0 0 0 2px rgb(108 229 255 / 76%);
+  /* ---- Surfaces. Neutral by contract: `design-contract.test.mjs` fails if any
+     of these carries a channel spread above 10, because a tint here tints the
+     whole app and is what made the product read as a dashboard. Elevation is
+     lightness, not hue. ---- */
+  --canvas: #08080a;
+  --surface: #121215;
+  --surface-raised: #1a1a1f;
+  --surface-focus: #24242b;
+  --text-primary: #f5f5f7;
+  --text-secondary: #a8a8b0;
+  --text-muted: #75757e;
+
+  /* ---- Focus is light, not a hue. A saturated ring reads as a web control at
+     viewing distance; white plus scale plus sibling dimming reads as a TV. ---- */
+  --focus: #ffffff;
+  --focus-strong: #ffffff;
+  --accent: #f5f5f7;
+
+  /* ---- The one retained hue. Brand identity and "this is live" only: the
+     brand mark, playback/resume progress, and the live-provider badge. It is
+     deliberately never a focus colour. ---- */
+  --brand: #4cc2ff;
+
+  /* ---- Semantic state. These are not decoration: the library sync indicator
+     distinguishes running/failed/completed by colour alone, so they stay
+     mutually distinguishable at 10 feet. ---- */
+  --accent-gold: #f5c14e;
+  --success: #5fd68a;
+  --danger: #ff6b75;
+
+  --edge-subtle: rgb(255 255 255 / 8%);
+  --edge-strong: rgb(255 255 255 / 22%);
+  --shadow-soft: 0 1rem 2.8rem rgb(0 0 0 / 45%);
+  /*
+   * Applied on :focus, never transitioned. A static shadow repaints one element
+   * once per D-pad press; a transitioned shadow repaints it every frame for the
+   * duration, which is what `check-css-motion.mjs` now rejects.
+   */
+  --shadow-focus: 0 1.4rem 3.4rem rgb(0 0 0 / 55%), 0 0 0 3px var(--focus);
   --radius-sm: 0.65rem;
   --radius-md: 1rem;
   --radius-lg: 1.45rem;
-  --motion-fast: 140ms;
-  --motion: 200ms;
-  --motion-ease: cubic-bezier(.2, .8, .2, 1);
+  /* Slower than a pointer UI on purpose: 140ms reads as cheap on a 55" panel. */
+  --motion-fast: 180ms;
+  --motion: 280ms;
+  --motion-slow: 420ms;
+  --motion-ease: cubic-bezier(.22, 1, .36, 1);
+  /* Focus must land fast enough to feel connected to the remote. */
+  --motion-focus: 200ms;
   /* Keep fixed TV chrome away from overscan-prone display edges. */
   --tv-safe-inline: max(5vw, env(safe-area-inset-left, 0px));
   --tv-safe-block: max(5vh, env(safe-area-inset-bottom, 0px));
@@ -80,10 +128,7 @@ body {
   overscroll-behavior-y: contain;
   font-size: var(--fs-body);
   line-height: 1.5;
-  background:
-    radial-gradient(circle at 82% -8%, #183e6e 0, transparent 32rem),
-    radial-gradient(circle at -4% 96%, #123b45 0, transparent 36rem),
-    #06101f;
+  background: #08080a;
 }
 
 button,
@@ -108,8 +153,8 @@ button {
   align-items: center;
   gap: 2rem;
   padding: 1rem 4.5rem;
-  border-bottom: 1px solid rgb(202 226 255 / 14%);
-  background: rgb(6 16 31 / 72%);
+  border-bottom: 1px solid rgb(221 222 225 / 14%);
+  background: rgb(13 14 17 / 72%);
 }
 
 .brand {
@@ -129,7 +174,7 @@ button {
 
 .brand strong,
 .login-brand strong {
-  color: #43d7ff;
+  color: var(--focus);
   font-weight: 700;
 }
 
@@ -138,16 +183,16 @@ button {
   height: 2.5rem;
   display: inline-grid;
   place-content: center;
-  color: #05101e;
-  background: linear-gradient(135deg, #5cdbff, #4985ff);
+  color: #0d0e11;
+  background: linear-gradient(135deg, var(--brand), var(--brand));
   border-radius: 0.7rem;
   font-size: var(--fs-subtitle);
   font-weight: 900;
-  box-shadow: 0 0 2rem rgb(67 215 255 / 40%);
+  box-shadow: 0 0 2rem rgb(184 185 188 / 40%);
 }
 
 .crumb {
-  color: #acc1db;
+  color: #bcbdc0;
   font-size: var(--fs-label);
   overflow: hidden;
   white-space: nowrap;
@@ -177,11 +222,11 @@ button {
   display: block;
   padding: 0;
   line-height: 0;
-  color: #dbeaff;
-  background: rgb(170 208 255 / 12%);
-  border: 1px solid rgb(185 222 255 / 18%);
+  color: #e6e7ea;
+  background: rgb(201 202 205 / 12%);
+  border: 1px solid rgb(215 216 219 / 18%);
   border-radius: 0.65rem;
-  transition: background 160ms ease, transform 160ms ease;
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .icon-button .app-icon {
@@ -195,8 +240,8 @@ button {
 
 .icon-button:hover,
 .icon-button:focus {
-  color: #06101f;
-  background: #7ce3ff;
+  color: #0d0e11;
+  background: var(--focus);
   transform: translateY(-1px);
 }
 
@@ -222,7 +267,7 @@ button {
 
 .eyebrow {
   margin: 0 0 0.65rem;
-  color: #5cdbff;
+  color: var(--brand);
   font-size: var(--fs-caption);
   font-weight: 800;
   letter-spacing: var(--tracking-eyebrow);
@@ -254,7 +299,7 @@ h3 {
 
 .hero p:not(.eyebrow),
 .catalog-heading p:not(.eyebrow) {
-  color: #acc1db;
+  color: #bcbdc0;
 }
 
 .primary-button,
@@ -262,20 +307,20 @@ h3 {
   min-height: 3.15rem;
   padding: 0.75rem 1.25rem;
   border-radius: 0.6rem;
-  font-weight: 750;
-  transition: transform 160ms ease, background 160ms ease;
+  font-weight: 700;
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .primary-button {
-  color: #05101e;
-  background: linear-gradient(135deg, #56dcff, #6c9eff);
-  box-shadow: 0 0.8rem 2.3rem rgb(57 184 255 / 22%);
+  color: #0d0e11;
+  background: linear-gradient(135deg, var(--focus), var(--brand));
+  box-shadow: 0 0.8rem 2.3rem rgb(160 161 164 / 22%);
 }
 
 .secondary-button {
-  color: #e4f2ff;
-  background: rgb(186 217 255 / 11%);
-  border: 1px solid rgb(186 217 255 / 22%);
+  color: #eeeff2;
+  background: rgb(211 212 215 / 11%);
+  border: 1px solid rgb(211 212 215 / 22%);
 }
 
 .primary-button:hover,
@@ -301,11 +346,11 @@ h3 {
   align-items: flex-start;
   padding: 1.8rem;
   color: #f8fcff;
-  background: linear-gradient(145deg, rgb(27 55 91 / 95%), rgb(15 31 54 / 95%));
-  border: 1px solid rgb(159 210 255 / 16%);
+  background: linear-gradient(145deg, rgb(50 51 54 / 95%), rgb(27 28 31 / 95%));
+  border: 1px solid rgb(200 201 204 / 16%);
   border-radius: 1.1rem;
   text-align: left;
-  transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+  transition: transform var(--motion) var(--motion-ease);
   scroll-margin-block: 3.5rem;
 }
 
@@ -314,20 +359,20 @@ h3 {
 }
 
 .hub-card.live {
-  background: linear-gradient(145deg, #203e65, #12243e);
+  background: linear-gradient(145deg, #38393c, #202124);
 }
 
 .hub-card.vod {
-  background: linear-gradient(145deg, #442d65, #231c40);
+  background: linear-gradient(145deg, #343538, #1e1f22);
 }
 
 .hub-card.series {
-  background: linear-gradient(145deg, #244d52, #153136);
+  background: linear-gradient(145deg, #434447, #292a2d);
 }
 
 .hub-card:hover,
 .hub-card:focus {
-  border-color: #68dcff;
+  border-color: var(--focus);
   box-shadow: 0 1.2rem 3rem rgb(0 0 0 / 28%);
   transform: translateY(-0.4rem);
 }
@@ -337,8 +382,8 @@ h3 {
   height: 3.5rem;
   display: grid;
   place-content: center;
-  color: #8fe9ff;
-  background: rgb(151 228 255 / 12%);
+  color: var(--focus);
+  background: rgb(212 213 216 / 12%);
   border-radius: 1rem;
 }
 
@@ -348,7 +393,7 @@ h3 {
 }
 
 .favorite-icon {
-  color: #ffd867;
+  color: var(--accent-gold);
 }
 
 .hub-label {
@@ -358,7 +403,7 @@ h3 {
 }
 
 .hub-description {
-  color: #bbd1e9;
+  color: #cccdd0;
   font-size: var(--fs-body);
   line-height: 1.45;
 }
@@ -377,9 +422,9 @@ h3 {
   min-width: 20rem;
   display: block;
   padding: 0;
-  color: #96b1cf;
-  background: rgb(181 218 255 / 10%);
-  border: 1px solid rgb(181 218 255 / 18%);
+  color: #abacaf;
+  background: rgb(211 212 215 / 10%);
+  border: 1px solid rgb(211 212 215 / 18%);
   border-radius: 0.6rem;
 }
 
@@ -390,7 +435,7 @@ h3 {
   z-index: 1;
   width: var(--icon-sm);
   height: var(--icon-sm);
-  color: #7ecfea;
+  color: var(--focus);
   pointer-events: none;
   transform: translateY(-50%);
 }
@@ -413,8 +458,8 @@ h3 {
   overflow: auto;
   margin-top: -1.7rem;
   padding: 0.65rem;
-  background: #11243d;
-  border: 1px solid rgb(164 216 255 / 28%);
+  background: #202124;
+  border: 1px solid rgb(206 207 210 / 28%);
   border-radius: 0.85rem;
   box-shadow: 0 1.5rem 3rem rgb(0 0 0 / 42%);
 }
@@ -430,8 +475,8 @@ h3 {
 
 .category-menu button:hover,
 .category-menu button:focus {
-  color: #06101f;
-  background: #72e0ff;
+  color: #0d0e11;
+  background: var(--focus);
 }
 
 .category-grid {
@@ -446,10 +491,10 @@ h3 {
   align-items: center;
   padding: 1.25rem;
   color: #eaf7ff;
-  background: linear-gradient(145deg, rgb(27 55 91 / 95%), rgb(15 31 54 / 95%));
-  border: 1px solid rgb(159 210 255 / 16%);
+  background: linear-gradient(145deg, rgb(50 51 54 / 95%), rgb(27 28 31 / 95%));
+  border: 1px solid rgb(200 201 204 / 16%);
   border-radius: 0.85rem;
-  font-weight: 750;
+  font-weight: 700;
   text-align: left;
   scroll-margin-block: 3.5rem;
 }
@@ -460,9 +505,9 @@ h3 {
 
 .category-card:hover,
 .category-card:focus {
-  color: #06101f;
-  background: #72e0ff;
-  border-color: #72e0ff;
+  color: #0d0e11;
+  background: var(--focus);
+  border-color: var(--focus);
 }
 
 .category-card-icon {
@@ -471,8 +516,8 @@ h3 {
   display: grid;
   flex: 0 0 auto;
   place-content: center;
-  color: #8fe9ff;
-  background: rgb(151 228 255 / 12%);
+  color: var(--focus);
+  background: rgb(212 213 216 / 12%);
   border-radius: 0.65rem;
 }
 
@@ -483,8 +528,8 @@ h3 {
 
 .category-card:hover .category-card-icon,
 .category-card:focus .category-card-icon {
-  color: #06101f;
-  background: rgb(6 16 31 / 12%);
+  color: #0d0e11;
+  background: rgb(13 14 17 / 12%);
 }
 
 .catalog-pager {
@@ -492,7 +537,7 @@ h3 {
   justify-content: center;
   align-items: center;
   margin-top: 2rem;
-  color: #acc1db;
+  color: #bcbdc0;
 }
 
 .catalog-pager > * + * {
@@ -521,17 +566,17 @@ h3 {
   padding: 0;
   overflow: hidden;
   color: #eff8ff;
-  background: #12233c;
-  border: 1px solid rgb(178 218 255 / 14%);
+  background: #1f2023;
+  border: 1px solid rgb(210 211 214 / 14%);
   border-radius: 0.85rem;
   text-align: left;
-  transition: transform 160ms ease, border-color 160ms ease;
+  transition: transform var(--motion-focus) var(--motion-ease);
   scroll-margin-block: 3.5rem;
 }
 
 .media-select:hover,
 .media-select:focus {
-  border-color: #61ddff;
+  border-color: var(--focus);
   transform: translateY(-0.15rem);
   box-shadow: 0 1rem 2rem rgb(0 0 0 / 23%);
 }
@@ -548,7 +593,7 @@ h3 {
   height: 15rem;
   display: block;
   overflow: hidden;
-  background: #193352;
+  background: #2e2f32;
 }
 
 .poster,
@@ -567,8 +612,8 @@ h3 {
   display: block;
   overflow: hidden;
   background:
-    radial-gradient(circle at 75% 15%, rgb(109 220 255 / 34%), transparent 30%),
-    linear-gradient(145deg, #284f7b, #132843);
+    radial-gradient(circle at 75% 15%, rgb(197 198 201 / 34%), transparent 30%),
+    linear-gradient(145deg, #48494c, #232427);
 }
 
 .poster-artwork .poster {
@@ -588,12 +633,12 @@ h3 {
   left: 0;
   display: none;
   place-content: center;
-  color: #e6f8ff;
+  color: #f3f4f7;
   background:
-    radial-gradient(circle at 50% 32%, rgb(127 228 255 / 28%), transparent 28%),
-    linear-gradient(145deg, #285484, #16304f 64%, #0e2038);
+    radial-gradient(circle at 50% 32%, rgb(206 207 210 / 28%), transparent 28%),
+    linear-gradient(145deg, #4c4d50, #2b2c2f 64%, #1c1d20);
   font-size: clamp(2rem, 4vw, 4rem);
-  font-weight: 850;
+  font-weight: 800;
   text-shadow: 0 0.25rem 0.8rem rgb(0 0 0 / 28%);
 }
 
@@ -616,8 +661,8 @@ h3 {
   height: 8.5rem;
   display: block;
   background:
-    radial-gradient(circle at 82% 16%, rgb(96 224 255 / 38%), transparent 28%),
-    linear-gradient(135deg, #235281, #142b50 58%, #0d203b);
+    radial-gradient(circle at 82% 16%, rgb(197 198 201 / 38%), transparent 28%),
+    linear-gradient(135deg, #494a4d, #27282b 58%, #1c1d20);
 }
 
 .live-channel-artwork {
@@ -630,7 +675,7 @@ h3 {
 }
 
 .live-channel-artwork.has-provider-logo {
-  background: linear-gradient(135deg, #eaf2fa, #b9cbe0);
+  background: linear-gradient(135deg, #eaf2fa, #c7c8cb);
 }
 
 .live-logo-frame {
@@ -643,9 +688,9 @@ h3 {
   display: block;
   overflow: hidden;
   background: #f5f9fe;
-  border: 1px solid rgb(9 29 54 / 15%);
+  border: 1px solid rgb(25 26 29 / 15%);
   border-radius: 0.45rem;
-  box-shadow: 0 0.2rem 0.6rem rgb(2 15 31 / 20%);
+  box-shadow: 0 0.2rem 0.6rem rgb(12 12 13 / 20%);
 }
 
 .live-channel-logo {
@@ -686,8 +731,8 @@ h3 {
 .channel-artwork-language {
   align-self: start;
   padding: 0.22rem 0.36rem;
-  color: #07182b;
-  background: #76e1ff;
+  color: #141518;
+  background: #cacbce;
   border-radius: 0.28rem;
   font-size: var(--fs-micro);
   font-weight: 900;
@@ -700,8 +745,8 @@ h3 {
   display: grid;
   grid-row: 1 / span 2;
   place-content: center;
-  color: #06172c;
-  background: linear-gradient(135deg, #b3f3ff, #62c3ff);
+  color: #131417;
+  background: linear-gradient(135deg, #e4e5e8, #b1b2b5);
   border: 2px solid rgb(255 255 255 / 42%);
   border-radius: 1rem;
   box-shadow: 0 0.6rem 1.5rem rgb(0 0 0 / 24%);
@@ -713,9 +758,9 @@ h3 {
 .channel-artwork-title {
   align-self: end;
   overflow: hidden;
-  color: #dff6ff;
+  color: #f0f1f4;
   font-size: var(--fs-micro);
-  font-weight: 850;
+  font-weight: 800;
   line-height: 1.1;
   text-overflow: ellipsis;
   text-shadow: 0 1px 0 rgb(0 0 0 / 30%);
@@ -727,8 +772,8 @@ h3 {
   height: 100%;
   display: grid;
   place-content: center;
-  color: #bce9ff;
-  background: linear-gradient(140deg, #285485, #1c3153);
+  color: #dfe0e3;
+  background: linear-gradient(140deg, #4c4d50, #2d2e31);
   font-size: 3rem;
   font-weight: 800;
 }
@@ -755,13 +800,13 @@ h3 {
 
 .media-subtitle {
   margin-top: 0.18rem;
-  color: #d5e8f8;
+  color: #e3e4e7;
   font-size: var(--fs-label);
 }
 
 .media-meta {
   margin-top: 0.35rem;
-  color: #9db9d5;
+  color: #b3b4b7;
   font-size: var(--fs-label);
 }
 
@@ -773,11 +818,11 @@ h3 {
   max-width: calc(100% - 3.45rem);
   padding: 0.34rem 0.5rem;
   overflow: hidden;
-  color: #171009;
-  background: #f5c842;
+  color: #111112;
+  background: var(--accent-gold);
   border-radius: 0.38rem;
   font-size: var(--fs-micro);
-  font-weight: 850;
+  font-weight: 800;
   line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -795,7 +840,7 @@ h3 {
   padding: 0;
   line-height: 0;
   color: #eff8ff;
-  background: rgb(4 17 33 / 86%);
+  background: rgb(13 14 17 / 86%);
   border: 1px solid rgb(235 249 255 / 20%);
   border-radius: 50%;
   box-shadow: 0 0.3rem 0.8rem rgb(0 0 0 / 28%);
@@ -811,7 +856,7 @@ h3 {
 }
 
 .favorite-button.is-favorite {
-  color: #ffdb63;
+  color: var(--accent-gold);
 }
 
 .detail-layout {
@@ -825,7 +870,7 @@ h3 {
 .detail-art {
   height: 33rem;
   overflow: hidden;
-  background: #1a3153;
+  background: #2d2e31;
   border-radius: 1rem;
   box-shadow: 0 1.4rem 3rem rgb(0 0 0 / 30%);
 }
@@ -836,13 +881,13 @@ h3 {
 }
 
 .metadata {
-  color: #72e0ff;
+  color: var(--focus);
   font-weight: 700;
 }
 
 .plot {
   max-width: 52rem;
-  color: #c3d6e9;
+  color: #d1d2d5;
   font-size: var(--fs-body-lg);
   line-height: 1.65;
 }
@@ -860,13 +905,13 @@ h3 {
 }
 
 .hint {
-  color: #bcd3e8;
+  color: #cecfd2;
 }
 
 .epg {
   padding: 1.75rem;
-  background: rgb(154 204 255 / 7%);
-  border: 1px solid rgb(167 210 255 / 12%);
+  background: rgb(195 196 199 / 7%);
+  border: 1px solid rgb(202 203 206 / 12%);
   border-radius: 1rem;
 }
 
@@ -888,18 +933,18 @@ h3 {
 .episode-summary,
 .resume-detail-status {
   margin: 0;
-  color: #9db9d5;
+  color: #b3b4b7;
   font-size: var(--fs-label);
 }
 
 .resume-detail-status {
   margin-top: 1.2rem;
-  color: #7ddfff;
+  color: #cacbce;
   font-weight: 700;
 }
 
 .resume-detail-status.is-watched {
-  color: #7ff0b0;
+  color: var(--success);
 }
 
 .resume-detail-progress {
@@ -908,7 +953,7 @@ h3 {
   display: block;
   margin-top: 0.55rem;
   overflow: hidden;
-  background: rgb(182 221 255 / 18%);
+  background: rgb(213 214 217 / 18%);
   border-radius: 999px;
 }
 
@@ -916,20 +961,20 @@ h3 {
   width: var(--resume-progress);
   height: 100%;
   display: block;
-  background: linear-gradient(90deg, #5bdbff, #6e9dff);
+  background: linear-gradient(90deg, var(--brand), var(--brand));
   border-radius: inherit;
   content: '';
 }
 
 .episode-number {
   margin-right: 0.55rem;
-  color: #77e1ff;
+  color: #cbcccf;
   font-size: var(--fs-label);
   letter-spacing: 0.04em;
 }
 
 .program small {
-  color: #a7bfd8;
+  color: #babbbe;
 }
 
 .epg {
@@ -941,7 +986,7 @@ h3 {
   grid-template-columns: 5.5rem 1fr;
   gap: 0.5rem 1rem;
   padding: 0.85rem 0;
-  border-top: 1px solid rgb(185 224 255 / 13%);
+  border-top: 1px solid rgb(216 217 220 / 13%);
 }
 
 .program small {
@@ -959,8 +1004,8 @@ h3 {
 .login-panel {
   width: min(44rem, 100%);
   padding: 3rem;
-  background: linear-gradient(145deg, rgb(25 50 81 / 96%), rgb(10 24 43 / 96%));
-  border: 1px solid rgb(173 220 255 / 19%);
+  background: linear-gradient(145deg, rgb(45 46 49 / 96%), rgb(20 21 24 / 96%));
+  border: 1px solid rgb(211 212 215 / 19%);
   border-radius: 1.35rem;
   box-shadow: 0 2rem 5rem rgb(0 0 0 / 35%);
 }
@@ -983,7 +1028,7 @@ h3 {
 
 .lead,
 .fine-print {
-  color: #b6cce4;
+  color: #c7c8cb;
 }
 
 .login-form {
@@ -995,7 +1040,7 @@ h3 {
 .login-form label {
   display: grid;
   gap: 0.5rem;
-  color: #d7e7f8;
+  color: #e3e4e7;
   font-weight: 700;
 }
 
@@ -1003,8 +1048,8 @@ h3 {
   min-height: 3.2rem;
   padding: 0 0.9rem;
   color: #f6fbff;
-  background: rgb(4 14 29 / 65%);
-  border: 1px solid rgb(163 211 255 / 23%);
+  background: rgb(12 12 13 / 65%);
+  border: 1px solid rgb(202 203 206 / 23%);
   border-radius: 0.55rem;
 }
 
@@ -1017,7 +1062,7 @@ h3 {
 .form-error {
   min-height: 1.25rem;
   margin: 0;
-  color: #ff9da4;
+  color: #b0b1b4;
 }
 
 .fine-print {
@@ -1032,15 +1077,15 @@ h3 {
 
 .status-page p {
   max-width: 36rem;
-  color: #c0d4e7;
+  color: #cfd0d3;
 }
 
 .spinner {
   width: 3.5rem;
   height: 3.5rem;
   margin: 0 auto 1.4rem;
-  border: 0.35rem solid rgb(136 225 255 / 18%);
-  border-top-color: #69dfff;
+  border: 0.35rem solid rgb(206 207 210 / 18%);
+  border-top-color: var(--focus);
   border-radius: 50%;
   animation: spin 750ms linear infinite;
 }
@@ -1052,7 +1097,7 @@ h3 {
   place-content: center;
   margin: 0 auto 1.4rem;
   color: #fff;
-  background: #ed5e68;
+  background: var(--danger);
   border-radius: 50%;
   font-size: 2rem;
   font-weight: 900;
@@ -1111,7 +1156,7 @@ h3 {
   display: flex;
   align-items: center;
   font-size: var(--fs-subtitle);
-  font-weight: 750;
+  font-weight: 700;
 }
 
 .player-title > * + * {
@@ -1120,8 +1165,8 @@ h3 {
 
 .player-title span {
   padding: 0.25rem 0.45rem;
-  color: #06101f;
-  background: #72e0ff;
+  color: #0d0e11;
+  background: var(--focus);
   border-radius: 0.25rem;
   font-size: var(--fs-micro);
   letter-spacing: 0.1em;
@@ -1151,7 +1196,7 @@ h3 {
 
 #player-progress {
   width: 100%;
-  accent-color: #5cdfff;
+  accent-color: var(--brand);
 }
 
 .player-message,
@@ -1164,8 +1209,8 @@ h3 {
   max-width: 35rem;
   padding: 1rem 1.3rem;
   color: #f4fbff;
-  background: rgb(8 20 38 / 88%);
-  border: 1px solid rgb(169 221 255 / 24%);
+  background: rgb(17 18 21 / 88%);
+  border: 1px solid rgb(210 211 214 / 24%);
   border-radius: 0.65rem;
   text-align: center;
   transform: translate(-50%, -50%);
@@ -1178,9 +1223,9 @@ h3 {
   z-index: 3;
   width: min(42rem, calc(100vw - 4rem));
   padding: 1rem 1.25rem;
-  color: #dbeeff;
-  background: rgb(5 17 33 / 92%);
-  border: 1px solid rgb(133 216 255 / 33%);
+  color: #e9eaed;
+  background: rgb(14 15 18 / 92%);
+  border: 1px solid rgb(199 200 203 / 33%);
   border-radius: 0.7rem;
   box-shadow: 0 1.2rem 3rem rgb(0 0 0 / 45%);
   font-size: var(--fs-label);
@@ -1190,7 +1235,7 @@ h3 {
 
 .player-diagnostics p {
   margin: 0 0 0.55rem;
-  color: #78e2ff;
+  color: #cccdd0;
   font-weight: 800;
 }
 
@@ -1202,7 +1247,7 @@ h3 {
 }
 
 .player-diagnostics li {
-  color: #b9d6e9;
+  color: #cfd0d3;
 }
 
 .player-diagnostic-actions {
@@ -1233,8 +1278,8 @@ h3 {
   display: flex;
   justify-content: center;
   padding: 0.8rem;
-  color: #9fbad4;
-  background: rgb(3 11 23 / 86%);
+  color: #b4b5b8;
+  background: rgb(10 10 11 / 86%);
   font-size: var(--fs-caption);
 }
 
@@ -1244,8 +1289,8 @@ h3 {
 
 kbd {
   padding: 0.12rem 0.32rem;
-  color: #d9efff;
-  background: #173150;
+  color: #e9eaed;
+  background: #2c2d30;
   border-radius: 0.2rem;
   font-family: inherit;
 }
@@ -1336,7 +1381,7 @@ button:focus,
 input:focus,
 select:focus,
 [data-focus-id]:focus {
-  outline: 4px solid #42d7ff;
+  outline: 4px solid var(--focus);
   outline-offset: 4px;
 }
 
@@ -1399,7 +1444,7 @@ select:focus,
   display: block;
   margin-top: 0.65rem;
   overflow: hidden;
-  background: rgb(182 221 255 / 18%);
+  background: rgb(213 214 217 / 18%);
   border-radius: 999px;
 }
 
@@ -1407,7 +1452,7 @@ select:focus,
   width: var(--resume-progress);
   height: 100%;
   display: block;
-  background: linear-gradient(90deg, #5bdbff, #6e9dff);
+  background: linear-gradient(90deg, var(--brand), var(--brand));
   border-radius: inherit;
   content: '';
 }
@@ -1418,7 +1463,7 @@ select:focus,
 
 .media-card.is-watched .media-name::after {
   margin-left: 0.4rem;
-  color: #7ff0b0;
+  color: var(--success);
   content: '✓';
 }
 
@@ -1430,7 +1475,7 @@ select:focus,
   /* -0.45rem absorbs the last wrapped row's child margin-bottom. */
   margin: 0.85rem 0 -0.45rem;
   padding: 0;
-  color: #d9e9f6;
+  color: #e5e6e9;
   background: transparent;
   border: 0;
   border-radius: 0.55rem;
@@ -1445,31 +1490,31 @@ select:focus,
 
 .content-guidance-value {
   padding: 0.28rem 0.55rem;
-  background: rgb(10 28 45 / 66%);
-  border: 1px solid rgb(161 213 245 / 24%);
+  background: rgb(23 24 27 / 66%);
+  border: 1px solid rgb(202 203 206 / 24%);
   border-radius: 0.45rem;
 }
 
 .content-guidance-separator {
-  color: #86dcff;
+  color: var(--focus);
   font-weight: 800;
 }
 
 .content-guidance strong {
-  color: #86dcff;
+  color: var(--focus);
 }
 
 .content-guidance-provenance {
   display: none;
   width: 100%;
   padding: 0.2rem 0.55rem;
-  color: #b8d9ec;
+  color: #d1d2d5;
   font-size: var(--fs-caption);
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .content-guidance:focus {
-  outline: 3px solid #42d7ff;
+  outline: 3px solid var(--focus);
   outline-offset: 0.3rem;
 }
 
@@ -1481,7 +1526,7 @@ select:focus,
   display: grid;
   gap: 0.4rem;
   margin-top: 1.3rem;
-  color: #bdd3e7;
+  color: #cecfd2;
 }
 
 .rich-metadata p {
@@ -1493,8 +1538,8 @@ select:focus,
   gap: 0.9rem;
   margin-top: 2rem;
   padding: 1.5rem 1.75rem;
-  background: linear-gradient(120deg, rgb(52 112 158 / 20%), rgb(24 47 83 / 20%));
-  border: 1px solid rgb(129 220 255 / 24%);
+  background: linear-gradient(120deg, rgb(101 102 105 / 20%), rgb(43 44 47 / 20%));
+  border: 1px solid rgb(201 202 205 / 24%);
   border-radius: 1rem;
 }
 
@@ -1506,11 +1551,11 @@ select:focus,
   display: grid;
   grid-template-columns: 10rem 1fr;
   gap: 1rem;
-  color: #d8eafa;
+  color: #e5e6e9;
 }
 
 .now-next strong {
-  color: #70dfff;
+  color: var(--focus);
 }
 
 .program-catchup {
@@ -1532,16 +1577,16 @@ select:focus,
   min-height: 5.5rem;
   padding: 0.7rem 1rem;
   color: #e8f6ff;
-  background: rgb(31 60 96 / 65%);
-  border: 1px solid rgb(159 210 255 / 16%);
+  background: rgb(54 55 58 / 65%);
+  border: 1px solid rgb(200 201 204 / 16%);
   border-radius: 0.75rem;
   text-align: left;
 }
 
 .guide-row:hover,
 .guide-row:focus {
-  color: #06101f;
-  background: #72e0ff;
+  color: #0d0e11;
+  background: var(--focus);
 }
 
 .guide-logo {
@@ -1567,16 +1612,16 @@ select:focus,
   display: grid;
   gap: 0.3rem;
   min-width: 0;
-  color: #c1d6e9;
+  color: #d1d2d5;
 }
 
 .guide-row:hover .guide-program,
 .guide-row:focus .guide-program {
-  color: #14324d;
+  color: #2c2d30;
 }
 
 .guide-program strong {
-  color: #72dfff;
+  color: #c8c9cc;
   font-size: var(--fs-caption);
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1611,7 +1656,7 @@ select:focus,
   align-items: end;
   margin-bottom: 0.9rem;
   padding-bottom: 0.85rem;
-  border-bottom: 1px solid rgb(159 210 255 / 15%);
+  border-bottom: 1px solid rgb(200 201 204 / 15%);
 }
 
 .global-search-group-heading > * + * {
@@ -1656,7 +1701,7 @@ select:focus,
   display: inline-flex;
   align-items: baseline;
   margin-left: 0.7rem;
-  color: #92b4d1;
+  color: #adaeb1;
   font-size: var(--fs-caption);
   line-height: 1;
   white-space: nowrap;
@@ -1682,9 +1727,9 @@ select:focus,
   display: flex;
   align-items: center;
   padding: 1rem 1.15rem;
-  color: #9db9d5;
-  background: rgb(23 49 82 / 56%);
-  border: 1px solid rgb(159 210 255 / 12%);
+  color: #b3b4b7;
+  background: rgb(44 45 48 / 56%);
+  border: 1px solid rgb(200 201 204 / 12%);
   border-radius: 0.75rem;
 }
 
@@ -1714,8 +1759,8 @@ select:focus,
   gap: 1rem;
   align-content: start;
   padding: 1.7rem;
-  background: rgb(154 204 255 / 7%);
-  border: 1px solid rgb(167 210 255 / 15%);
+  background: rgb(195 196 199 / 7%);
+  border: 1px solid rgb(202 203 206 / 15%);
   border-radius: 1rem;
 }
 
@@ -1729,8 +1774,8 @@ select:focus,
   align-items: center;
   min-height: 3.25rem;
   padding: 0.65rem 0;
-  color: #d8e9f9;
-  border-bottom: 1px solid rgb(177 220 255 / 12%);
+  color: #e5e6e9;
+  border-bottom: 1px solid rgb(211 212 215 / 12%);
 }
 
 .setting-row > * + * {
@@ -1744,7 +1789,7 @@ select:focus,
 }
 
 .setting-row small {
-  color: #9bb9d7;
+  color: #b3b4b7;
   font-size: var(--fs-caption);
   font-weight: 400;
 }
@@ -1752,7 +1797,7 @@ select:focus,
 .setting-row input[type='checkbox'] {
   width: var(--icon-sm);
   height: var(--icon-sm);
-  accent-color: #58dfff;
+  accent-color: var(--brand);
 }
 
 .setting-row select,
@@ -1761,8 +1806,8 @@ select:focus,
   min-height: 2.6rem;
   padding: 0 0.7rem;
   color: #eff9ff;
-  background: #0d213a;
-  border: 1px solid rgb(163 211 255 / 26%);
+  background: #1d1e21;
+  border: 1px solid rgb(202 203 206 / 26%);
   border-radius: 0.45rem;
 }
 
@@ -1776,8 +1821,8 @@ select:focus,
   justify-content: space-between;
   align-items: center;
   padding: 0.8rem;
-  color: #dceeff;
-  background: rgb(180 220 255 / 8%);
+  color: #e9eaed;
+  background: rgb(212 213 216 / 8%);
   border: 1px solid transparent;
   border-radius: 0.6rem;
 }
@@ -1787,7 +1832,7 @@ select:focus,
 }
 
 .profile-row.is-active {
-  border-color: #5fdfff;
+  border-color: var(--brand);
 }
 
 .profile-row > div {
@@ -1799,8 +1844,8 @@ select:focus,
 }
 
 .danger-button {
-  color: #ffd6d8;
-  border-color: rgb(255 145 151 / 32%);
+  color: var(--danger);
+  border-color: rgb(167 168 171 / 32%);
 }
 
 .player-aspect-contain #video-player {
@@ -1822,15 +1867,15 @@ select:focus,
   gap: 0.3rem;
   overflow: auto;
   padding: 1rem;
-  background: rgb(5 16 30 / 94%);
-  border: 1px solid rgb(131 221 255 / 31%);
+  background: rgb(13 14 17 / 94%);
+  border: 1px solid rgb(202 203 206 / 31%);
   border-radius: 0.9rem;
   box-shadow: 0 1.5rem 3.5rem rgb(0 0 0 / 55%);
 }
 
 .channel-overlay h2 {
   margin: 0 0 0.5rem;
-  color: #70dfff;
+  color: var(--focus);
 }
 
 .channel-overlay button {
@@ -1847,19 +1892,19 @@ select:focus,
 .channel-overlay button:hover,
 .channel-overlay button:focus,
 .channel-overlay button.is-current {
-  color: #06101f;
-  background: #72e0ff;
+  color: #0d0e11;
+  background: var(--focus);
 }
 
 .channel-overlay button span {
-  color: #76e0ff;
+  color: #cacbce;
   font-variant-numeric: tabular-nums;
 }
 
 .channel-overlay button:hover span,
 .channel-overlay button:focus span,
 .channel-overlay button.is-current span {
-  color: #0c344c;
+  color: #2b2c2f;
 }
 
 .channel-number-overlay {
@@ -1869,8 +1914,8 @@ select:focus,
   z-index: 5;
   min-width: 6rem;
   padding: 0.7rem 1.2rem;
-  color: #06101f;
-  background: #72e0ff;
+  color: #0d0e11;
+  background: var(--focus);
   border-radius: 0.65rem;
   font-size: 2rem;
   font-weight: 900;
@@ -1886,8 +1931,8 @@ select:focus,
   max-width: min(32rem, calc(100vw - (var(--tv-safe-inline) * 2)));
   padding: 0.85rem 1.1rem;
   color: #ebfaff;
-  background: rgb(8 25 45 / 94%);
-  border: 1px solid rgb(117 218 255 / 38%);
+  background: rgb(21 22 25 / 94%);
+  border: 1px solid rgb(197 198 201 / 38%);
   border-radius: 0.65rem;
   box-shadow: 0 1rem 2.5rem rgb(0 0 0 / 35%);
 }
@@ -1941,12 +1986,14 @@ select:focus,
   color-scheme: dark;
 }
 
+/*
+ * Flat canvas. The two radial washes that used to live here repainted on every
+ * scroll of a full-height document and were the loudest "dashboard" cue in the
+ * product; `design-contract.test.mjs` now fails if a body gradient returns.
+ */
 body {
   color: var(--text-primary);
-  background:
-    radial-gradient(72rem 44rem at 88% -18%, rgb(41 103 163 / 35%), transparent 62%),
-    radial-gradient(48rem 38rem at -10% 106%, rgb(39 135 139 / 20%), transparent 66%),
-    var(--canvas);
+  background: var(--canvas);
 }
 
 button,
@@ -1976,8 +2023,8 @@ select:focus,
   top: 0;
   z-index: 8;
   min-height: 5.7rem;
-  border-bottom-color: rgb(203 229 255 / 8%);
-  background: linear-gradient(90deg, rgb(7 17 31 / 96%), rgb(10 24 42 / 88%));
+  border-bottom-color: rgb(223 224 227 / 8%);
+  background: linear-gradient(90deg, rgb(16 16 17 / 96%), rgb(20 21 24 / 88%));
   box-shadow: 0 0.75rem 2rem rgb(0 0 0 / 10%);
 }
 
@@ -1993,17 +2040,17 @@ select:focus,
 }
 
 .brand:focus .brand-mark {
-  box-shadow: 0 0 0 3px rgb(108 229 255 / 34%), 0 0 2rem rgb(67 215 255 / 45%);
+  box-shadow: 0 0 0 3px rgb(203 204 207 / 34%), 0 0 2rem rgb(184 185 188 / 45%);
 }
 
 .brand-mark {
   border-radius: 0.85rem;
-  box-shadow: 0 0.7rem 1.8rem rgb(67 215 255 / 26%);
+  box-shadow: 0 0.7rem 1.8rem rgb(184 185 188 / 26%);
 }
 
 .crumb {
   color: var(--text-muted);
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: 0.015em;
 }
 
@@ -2020,23 +2067,21 @@ select:focus,
   border: 0;
   border-radius: 50%;
   transition:
-    color var(--motion-fast) var(--motion-ease),
-    background var(--motion-fast) var(--motion-ease),
-    box-shadow var(--motion-fast) var(--motion-ease),
-    transform var(--motion-fast) var(--motion-ease);
+    color var(--motion-focus) var(--motion-ease),
+    transform var(--motion-focus) var(--motion-ease);
 }
 
 .icon-button:hover {
   color: var(--text-primary);
-  background: rgb(185 222 255 / 10%);
+  background: rgb(215 216 219 / 10%);
   transform: none;
 }
 
 .icon-button:focus {
   outline: 0;
-  color: #04121f;
+  color: #0e0f12;
   background: var(--focus);
-  box-shadow: 0 0 0 3px rgb(108 229 255 / 28%), 0 0.7rem 1.8rem rgb(0 0 0 / 28%);
+  box-shadow: 0 0 0 3px rgb(203 204 207 / 28%), 0 0.7rem 1.8rem rgb(0 0 0 / 28%);
   transform: scale(1.04);
 }
 
@@ -2058,26 +2103,23 @@ select:focus,
   min-height: 3.3rem;
   border: 1px solid transparent;
   border-radius: 999px;
-  font-weight: 780;
+  font-weight: 700;
   letter-spacing: 0.01em;
   transition:
-    color var(--motion-fast) var(--motion-ease),
-    background var(--motion-fast) var(--motion-ease),
-    border-color var(--motion-fast) var(--motion-ease),
-    box-shadow var(--motion-fast) var(--motion-ease),
-    transform var(--motion-fast) var(--motion-ease);
+    color var(--motion-focus) var(--motion-ease),
+    transform var(--motion-focus) var(--motion-ease);
 }
 
 .primary-button {
-  color: #061521;
-  background: linear-gradient(135deg, #7ae8ff, #6eabff);
-  box-shadow: 0 0.7rem 1.8rem rgb(67 177 255 / 25%);
+  color: #111215;
+  background: var(--focus);
+  box-shadow: 0 0.7rem 1.8rem rgb(157 158 161 / 25%);
 }
 
 .secondary-button {
-  color: #dcecff;
-  background: rgb(169 208 255 / 8%);
-  border-color: rgb(193 224 255 / 14%);
+  color: #e8e9ec;
+  background: rgb(201 202 205 / 8%);
+  border-color: rgb(218 219 222 / 14%);
 }
 
 .primary-button:hover,
@@ -2107,8 +2149,8 @@ select:focus,
   padding: clamp(2rem, 5vw, 4.5rem);
   overflow: hidden;
   background:
-    linear-gradient(105deg, rgb(11 24 42 / 92%) 0%, rgb(13 31 53 / 75%) 52%, rgb(18 62 92 / 37%) 100%),
-    radial-gradient(circle at 82% 18%, rgb(87 204 255 / 38%), transparent 27%);
+    linear-gradient(105deg, rgb(21 22 25 / 92%) 0%, rgb(27 28 31 / 75%) 52%, rgb(53 54 57 / 37%) 100%),
+    radial-gradient(circle at 82% 18%, rgb(181 182 185 / 38%), transparent 27%);
   border: 1px solid var(--edge-subtle);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-soft);
@@ -2127,7 +2169,7 @@ select:focus,
   right: -8rem;
   width: 30rem;
   height: 30rem;
-  background: rgb(84 207 255 / 10%);
+  background: rgb(182 183 186 / 10%);
 }
 
 .hero-cinematic::after {
@@ -2135,7 +2177,7 @@ select:focus,
   bottom: -15rem;
   width: 22rem;
   height: 22rem;
-  background: rgb(126 111 255 / 12%);
+  background: rgb(123 124 127 / 12%);
 }
 
 .hero-copy,
@@ -2169,7 +2211,7 @@ select:focus,
   height: 0.55rem;
   background: var(--success);
   border-radius: 50%;
-  box-shadow: 0 0 0 0.35rem rgb(131 233 174 / 12%);
+  box-shadow: 0 0 0 0.35rem rgb(205 206 209 / 12%);
 }
 
 .rail-heading {
@@ -2191,14 +2233,11 @@ select:focus,
   padding: 1.75rem;
   overflow: hidden;
   color: var(--text-primary);
-  background: linear-gradient(145deg, rgb(27 48 75 / 92%), rgb(13 26 44 / 96%));
+  background: linear-gradient(145deg, rgb(43 44 47 / 92%), rgb(23 24 27 / 96%));
   border: 1px solid var(--edge-subtle);
   border-radius: var(--radius-lg);
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 3%);
-  transition:
-    background var(--motion) var(--motion-ease),
-    box-shadow var(--motion) var(--motion-ease),
-    transform var(--motion) var(--motion-ease);
+  transition: transform var(--motion) var(--motion-ease);
 }
 
 .hub-card::after {
@@ -2207,26 +2246,26 @@ select:focus,
   bottom: -6rem;
   width: 13rem;
   height: 13rem;
-  background: rgb(107 220 255 / 11%);
+  background: rgb(197 198 201 / 11%);
   border-radius: 50%;
   content: '';
   transition: transform var(--motion) var(--motion-ease), opacity var(--motion) var(--motion-ease);
 }
 
 .hub-card.live {
-  background: linear-gradient(145deg, rgb(26 72 111 / 95%), rgb(12 31 57 / 96%));
+  background: linear-gradient(145deg, rgb(63 64 67 / 95%), rgb(27 28 31 / 96%));
 }
 
 .hub-card.vod {
-  background: linear-gradient(145deg, rgb(71 43 103 / 93%), rgb(28 23 56 / 96%));
+  background: linear-gradient(145deg, rgb(51 52 55 / 93%), rgb(24 25 28 / 96%));
 }
 
 .hub-card.series {
-  background: linear-gradient(145deg, rgb(24 85 88 / 93%), rgb(13 42 52 / 96%));
+  background: linear-gradient(145deg, rgb(70 71 74 / 93%), rgb(35 36 39 / 96%));
 }
 
 .hub-card.favorites {
-  background: linear-gradient(145deg, rgb(75 61 35 / 92%), rgb(35 29 22 / 96%));
+  background: linear-gradient(145deg, rgb(60 61 64 / 92%), rgb(30 30 31 / 96%));
 }
 
 .hub-card:hover {
@@ -2269,8 +2308,8 @@ select:focus,
    * because the converted rule deliberately does not outrank child margins.
    */
   margin-top: 1.3rem;
-  background: rgb(218 244 255 / 11%);
-  border: 1px solid rgb(220 245 255 / 10%);
+  background: rgb(237 238 241 / 11%);
+  border: 1px solid rgb(238 239 242 / 10%);
   border-radius: 1.15rem;
 }
 
@@ -2280,20 +2319,20 @@ select:focus,
 
 .hub-description {
   max-width: 19rem;
-  color: #b7cbe0;
+  color: #c6c7ca;
 }
 
 .search {
-  background: rgb(15 30 49 / 78%);
+  background: rgb(26 27 30 / 78%);
   border-color: var(--edge-subtle);
   border-radius: 999px;
-  transition: border-color var(--motion-fast) var(--motion-ease), box-shadow var(--motion-fast) var(--motion-ease), background var(--motion-fast) var(--motion-ease);
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .search:focus-within {
-  background: rgb(23 48 73 / 94%);
+  background: rgb(42 43 46 / 94%);
   border-color: var(--focus);
-  box-shadow: 0 0 0 3px rgb(108 229 255 / 16%);
+  box-shadow: 0 0 0 3px rgb(203 204 207 / 16%);
 }
 
 .search input:focus {
@@ -2307,11 +2346,11 @@ select:focus,
 .category-card {
   position: relative;
   min-height: 7.75rem;
-  background: rgb(18 34 54 / 78%);
+  background: rgb(30 31 34 / 78%);
   border-color: var(--edge-subtle);
   border-radius: var(--radius-md);
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 2%);
-  transition: background var(--motion-fast) var(--motion-ease), box-shadow var(--motion-fast) var(--motion-ease), transform var(--motion-fast) var(--motion-ease);
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .category-card:hover {
@@ -2330,12 +2369,12 @@ select:focus,
 }
 
 .category-card:focus .category-card-icon {
-  color: #07121e;
+  color: #111112;
   background: var(--focus);
 }
 
 .category-card-icon {
-  background: rgb(153 228 255 / 10%);
+  background: rgb(212 213 216 / 10%);
   border-radius: 0.85rem;
 }
 
@@ -2347,7 +2386,7 @@ select:focus,
   background: transparent;
   border: 0;
   border-radius: var(--radius-md);
-  transition: transform var(--motion-fast) var(--motion-ease), box-shadow var(--motion-fast) var(--motion-ease);
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .media-select:hover {
@@ -2356,23 +2395,24 @@ select:focus,
   transform: translateY(-0.12rem);
 }
 
+/*
+ * One transform, on one element. The card scales; nothing inside it does.
+ *
+ * The previous model animated the card AND its poster on a single focus change,
+ * which the webOS 6 compositor rendered as two staggered steps — the reason the
+ * device override at the end of this sheet disabled focus transforms outright.
+ * The ring is static: `--shadow-focus` is applied here, never transitioned.
+ */
 .media-select:focus {
   outline: 0;
   box-shadow: var(--shadow-focus);
-  transform: translateY(-0.25rem) scale(1.01);
-}
-
-.media-select:focus .artwork {
-  box-shadow: 0 0 0 2px var(--focus);
-}
-
-.media-select:focus .poster {
-  transform: scale(1.04);
+  transform: scale(1.045);
 }
 
 .media-card.is-live .media-select:focus {
   box-shadow: var(--shadow-focus);
-  transform: translateY(-0.18rem);
+  /* Live tiles are wider, so the same ratio would travel much further. */
+  transform: scale(1.03);
 }
 
 .artwork {
@@ -2386,9 +2426,10 @@ select:focus,
   border-radius: inherit;
 }
 
-.poster {
-  transition: transform 280ms var(--motion-ease);
-}
+/*
+ * The poster deliberately declares no transform and no transition. It is the
+ * inner half of the two-transform focus change that staggered on webOS 6.
+ */
 
 .live-artwork {
   border-radius: var(--radius-md);
@@ -2401,7 +2442,7 @@ select:focus,
 
 .media-name {
   color: var(--text-primary);
-  font-weight: 750;
+  font-weight: 700;
 }
 
 .media-meta {
@@ -2410,8 +2451,8 @@ select:focus,
 
 .favorite-button {
   color: var(--text-secondary);
-  background: rgb(5 16 29 / 78%);
-  border-color: rgb(230 247 255 / 12%);
+  background: rgb(15 15 16 / 78%);
+  border-color: rgb(242 243 246 / 12%);
   box-shadow: 0 0.35rem 0.9rem rgb(0 0 0 / 22%);
 }
 
@@ -2436,8 +2477,8 @@ select:focus,
   left: 0;
   overflow: hidden;
   background:
-    radial-gradient(circle at 75% 18%, rgb(73 194 255 / 30%), transparent 33%),
-    linear-gradient(120deg, #0c1b2e, #142b48);
+    radial-gradient(circle at 75% 18%, rgb(171 172 175 / 30%), transparent 33%),
+    linear-gradient(120deg, #17181b, #26272a);
 }
 
 .detail-backdrop::after {
@@ -2447,8 +2488,8 @@ select:focus,
   bottom: 0;
   left: 0;
   background:
-    linear-gradient(90deg, rgb(7 16 29 / 98%) 3%, rgb(7 16 29 / 88%) 38%, rgb(7 16 29 / 43%) 78%, rgb(7 16 29 / 78%)),
-    linear-gradient(0deg, rgb(7 16 29 / 95%), transparent 52%);
+    linear-gradient(90deg, rgb(15 15 16 / 98%) 3%, rgb(15 15 16 / 88%) 38%, rgb(15 15 16 / 43%) 78%, rgb(15 15 16 / 78%)),
+    linear-gradient(0deg, rgb(15 15 16 / 95%), transparent 52%);
   content: '';
 }
 
@@ -2489,16 +2530,16 @@ select:focus,
 .detail-chips span,
 .profile-state {
   padding: 0.34rem 0.62rem;
-  color: #d7efff;
-  background: rgb(183 224 255 / 12%);
-  border: 1px solid rgb(193 230 255 / 12%);
+  color: #e9eaed;
+  background: rgb(216 217 220 / 12%);
+  border: 1px solid rgb(222 223 226 / 12%);
   border-radius: 999px;
   font-size: var(--fs-caption);
   font-weight: 700;
 }
 
 .plot {
-  color: #d2dfed;
+  color: #dbdcdf;
 }
 
 .rich-metadata {
@@ -2508,7 +2549,7 @@ select:focus,
 .epg,
 .now-next,
 .settings-panel {
-  background: rgb(16 31 49 / 72%);
+  background: rgb(27 28 31 / 72%);
   border-color: var(--edge-subtle);
   border-radius: var(--radius-lg);
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 2%);
@@ -2521,10 +2562,10 @@ select:focus,
 .guide-row {
   position: relative;
   overflow: hidden;
-  background: rgb(16 30 48 / 76%);
+  background: rgb(26 27 30 / 76%);
   border-color: transparent;
   border-radius: var(--radius-md);
-  transition: background var(--motion-fast) var(--motion-ease), box-shadow var(--motion-fast) var(--motion-ease);
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .guide-row::before {
@@ -2540,14 +2581,14 @@ select:focus,
 
 .guide-row:hover {
   color: var(--text-primary);
-  background: rgb(35 57 79 / 85%);
+  background: rgb(52 53 56 / 85%);
 }
 
 .guide-row:focus {
   outline: 0;
   color: var(--text-primary);
-  background: rgb(35 65 91 / 94%);
-  box-shadow: 0 0 0 1px rgb(108 229 255 / 28%), 0 0.8rem 1.8rem rgb(0 0 0 / 23%);
+  background: rgb(58 59 62 / 94%);
+  box-shadow: 0 0 0 1px rgb(203 204 207 / 28%), 0 0.8rem 1.8rem rgb(0 0 0 / 23%);
 }
 
 .guide-row:focus::before {
@@ -2556,7 +2597,7 @@ select:focus,
 
 .guide-row:focus .guide-program,
 .guide-row:hover .guide-program {
-  color: #d8e9f7;
+  color: #e4e5e8;
 }
 
 .guide-program strong {
@@ -2575,7 +2616,7 @@ select:focus,
 .global-search-empty,
 .empty-state {
   color: var(--text-secondary);
-  background: rgb(18 34 54 / 58%);
+  background: rgb(30 31 34 / 58%);
   border: 1px solid var(--edge-subtle);
   border-radius: var(--radius-md);
 }
@@ -2583,7 +2624,7 @@ select:focus,
 .login-page,
 .status-page {
   background:
-    radial-gradient(circle at 80% 8%, rgb(64 155 224 / 23%), transparent 35rem),
+    radial-gradient(circle at 80% 8%, rgb(139 140 143 / 23%), transparent 35rem),
     var(--canvas);
 }
 
@@ -2591,7 +2632,7 @@ select:focus,
 .status-card {
   position: relative;
   overflow: hidden;
-  background: linear-gradient(145deg, rgb(21 40 65 / 95%), rgb(9 20 36 / 98%));
+  background: linear-gradient(145deg, rgb(36 37 40 / 95%), rgb(17 18 21 / 98%));
   border-color: var(--edge-subtle);
   border-radius: var(--radius-lg);
   box-shadow: 0 2rem 5rem rgb(0 0 0 / 35%);
@@ -2604,24 +2645,24 @@ select:focus,
   right: -7rem;
   width: 17rem;
   height: 17rem;
-  background: rgb(95 216 255 / 8%);
+  background: rgb(191 192 195 / 8%);
   border-radius: 50%;
   content: '';
   pointer-events: none;
 }
 
 .login-form input {
-  background: rgb(5 15 29 / 76%);
+  background: rgb(14 14 15 / 76%);
   border-color: var(--edge-subtle);
   border-radius: var(--radius-sm);
-  transition: background var(--motion-fast) var(--motion-ease), border-color var(--motion-fast) var(--motion-ease), box-shadow var(--motion-fast) var(--motion-ease);
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .login-form input:focus {
   outline: 0;
-  background: rgb(17 40 62 / 95%);
+  background: rgb(35 36 39 / 95%);
   border-color: var(--focus);
-  box-shadow: 0 0 0 3px rgb(108 229 255 / 15%);
+  box-shadow: 0 0 0 3px rgb(203 204 207 / 15%);
 }
 
 .status-card {
@@ -2652,8 +2693,8 @@ select:focus,
   display: grid;
   place-content: center;
   margin: 0 auto 1.5rem;
-  background: rgb(108 229 255 / 9%);
-  border: 1px solid rgb(108 229 255 / 18%);
+  background: rgb(203 204 207 / 9%);
+  border: 1px solid rgb(203 204 207 / 18%);
   border-radius: 50%;
 }
 
@@ -2662,7 +2703,7 @@ select:focus,
 }
 
 .status-card-error .error-icon {
-  box-shadow: 0 0 0 0.6rem rgb(255 137 148 / 10%);
+  box-shadow: 0 0 0 0.6rem rgb(161 162 165 / 10%);
 }
 
 .settings-panel {
@@ -2687,14 +2728,14 @@ select:focus,
   margin-left: -0.7rem;
   padding-right: 0.7rem;
   padding-left: 0.95rem;
-  background: rgb(72 112 143 / 26%);
+  background: rgb(104 105 108 / 26%);
   border-radius: var(--radius-sm);
   box-shadow: inset 0.22rem 0 var(--focus);
 }
 
 .setting-row select,
 .setting-row input:not([type='checkbox']) {
-  background: rgb(5 16 29 / 68%);
+  background: rgb(15 15 16 / 68%);
   border-color: var(--edge-subtle);
   border-radius: 999px;
 }
@@ -2703,7 +2744,7 @@ select:focus,
 .setting-row input:not([type='checkbox']):focus {
   outline: 0;
   border-color: var(--focus);
-  box-shadow: 0 0 0 3px rgb(108 229 255 / 14%);
+  box-shadow: 0 0 0 3px rgb(203 204 207 / 14%);
 }
 
 .setting-row input[type='checkbox'] {
@@ -2712,41 +2753,41 @@ select:focus,
   -webkit-appearance: none;
   appearance: none;
   cursor: pointer;
-  background: rgb(128 153 181 / 30%);
-  border: 1px solid rgb(196 225 255 / 17%);
+  background: rgb(148 149 152 / 30%);
+  border: 1px solid rgb(219 220 223 / 17%);
   border-radius: 999px;
   box-shadow: inset -1.05rem 0 0 0.22rem #e7f4ff;
-  transition: background var(--motion-fast) var(--motion-ease), box-shadow var(--motion-fast) var(--motion-ease);
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .setting-row input[type='checkbox']:checked {
-  background: rgb(83 216 255 / 52%);
-  box-shadow: inset 1.05rem 0 0 0.22rem #f2fdff;
+  background: rgb(189 190 193 / 52%);
+  box-shadow: inset 1.05rem 0 0 0.22rem var(--focus);
 }
 
 .setting-row input[type='checkbox']:focus {
   outline: 0;
-  box-shadow: inset 1.05rem 0 0 0.22rem #f2fdff, 0 0 0 3px rgb(108 229 255 / 35%);
+  box-shadow: inset 1.05rem 0 0 0.22rem var(--focus), 0 0 0 3px rgb(203 204 207 / 35%);
 }
 
 .setting-row input[type='checkbox']:not(:checked):focus {
-  box-shadow: inset -1.05rem 0 0 0.22rem #f2fdff, 0 0 0 3px rgb(108 229 255 / 35%);
+  box-shadow: inset -1.05rem 0 0 0.22rem var(--focus), 0 0 0 3px rgb(203 204 207 / 35%);
 }
 
 .profile-row {
-  background: rgb(174 215 255 / 6%);
+  background: rgb(207 208 211 / 6%);
   border-color: var(--edge-subtle);
   border-radius: var(--radius-md);
 }
 
 .profile-row.is-active {
-  border-color: rgb(108 229 255 / 48%);
+  border-color: rgb(203 204 207 / 48%);
   box-shadow: inset 0.22rem 0 var(--focus);
 }
 
 .profile-name {
   color: var(--text-primary);
-  font-weight: 750;
+  font-weight: 700;
 }
 
 .profile-row > div {
@@ -2755,7 +2796,7 @@ select:focus,
 
 .profile-state {
   color: var(--focus);
-  background: rgb(108 229 255 / 9%);
+  background: rgb(203 204 207 / 9%);
 }
 
 .player-control-dock {
@@ -2763,8 +2804,8 @@ select:focus,
   right: calc(var(--tv-safe-inline) + 1rem);
   left: calc(var(--tv-safe-inline) + 1rem);
   padding: 0.65rem 0.9rem;
-  background: linear-gradient(90deg, rgb(4 12 22 / 88%), rgb(6 18 31 / 58%));
-  border: 1px solid rgb(220 245 255 / 10%);
+  background: linear-gradient(90deg, rgb(11 11 12 / 88%), rgb(14 15 18 / 58%));
+  border: 1px solid rgb(238 239 242 / 10%);
   border-radius: 1.1rem;
   box-shadow: 0 1rem 3rem rgb(0 0 0 / 28%);
 }
@@ -2779,7 +2820,7 @@ select:focus,
 }
 
 .player-title span {
-  color: #05101d;
+  color: #0f0f10;
   background: var(--focus);
   border-radius: 999px;
 }
@@ -2789,7 +2830,7 @@ select:focus,
   bottom: calc(var(--tv-safe-block) + 1.25rem);
   left: calc(var(--tv-safe-inline) + 1.5rem);
   padding: 0.85rem 1rem;
-  background: linear-gradient(90deg, rgb(3 11 21 / 78%), rgb(3 11 21 / 42%));
+  background: linear-gradient(90deg, rgb(10 10 11 / 78%), rgb(10 10 11 / 42%));
   border-radius: var(--radius-md);
 }
 
@@ -2801,8 +2842,8 @@ select:focus,
   top: calc(var(--tv-safe-block) + 5.5rem);
   right: var(--tv-safe-inline);
   padding: 1.2rem;
-  background: rgb(7 17 31 / 96%);
-  border-color: rgb(108 229 255 / 23%);
+  background: rgb(16 16 17 / 96%);
+  border-color: rgb(203 204 207 / 23%);
   border-radius: var(--radius-lg);
 }
 
@@ -2814,7 +2855,7 @@ select:focus,
 .channel-overlay button:hover,
 .channel-overlay button.is-current {
   color: var(--text-primary);
-  background: rgb(94 159 199 / 20%);
+  background: rgb(146 147 150 / 20%);
 }
 
 .channel-overlay button.is-current::before {
@@ -2831,8 +2872,8 @@ select:focus,
 .channel-overlay button:focus {
   outline: 0;
   color: var(--text-primary);
-  background: rgb(50 90 121 / 88%);
-  box-shadow: inset 0.22rem 0 var(--focus), 0 0 0 1px rgb(108 229 255 / 34%);
+  background: rgb(82 83 86 / 88%);
+  box-shadow: inset 0.22rem 0 var(--focus), 0 0 0 1px rgb(203 204 207 / 34%);
 }
 
 .channel-overlay button:hover span,
@@ -2844,8 +2885,8 @@ select:focus,
 .helpbar {
   padding: 0.65rem 1.2rem;
   color: var(--text-muted);
-  background: linear-gradient(90deg, rgb(5 14 26 / 96%), rgb(8 21 37 / 93%));
-  border-top: 1px solid rgb(204 232 255 / 7%);
+  background: linear-gradient(90deg, rgb(13 13 14 / 96%), rgb(17 18 21 / 93%));
+  border-top: 1px solid rgb(226 227 230 / 7%);
 }
 
 .helpbar > * + * {
@@ -2854,9 +2895,9 @@ select:focus,
 
 kbd {
   padding: 0.16rem 0.42rem;
-  color: #ccf2ff;
-  background: rgb(144 208 255 / 10%);
-  border: 1px solid rgb(190 230 255 / 12%);
+  color: #e9eaed;
+  background: rgb(196 197 200 / 10%);
+  border: 1px solid rgb(221 222 225 / 12%);
   border-radius: 999px;
   font-size: 0.84em;
 }
@@ -2864,9 +2905,9 @@ kbd {
 .remote-toast {
   right: var(--tv-safe-inline);
   bottom: calc(var(--tv-safe-block) + 5.25rem);
-  color: #dff6ff;
-  background: rgb(8 22 39 / 96%);
-  border-color: rgb(108 229 255 / 25%);
+  color: #f0f1f4;
+  background: rgb(18 19 22 / 96%);
+  border-color: rgb(203 204 207 / 25%);
   border-radius: 999px;
   box-shadow: 0 1rem 2.8rem rgb(0 0 0 / 38%);
 }
@@ -2886,8 +2927,8 @@ kbd {
   margin: 0.85rem auto 0;
   padding: 0.7rem 1rem;
   color: var(--text-secondary);
-  background: rgb(13 33 55 / 88%);
-  border: 1px solid rgb(150 214 255 / 16%);
+  background: rgb(28 29 32 / 88%);
+  border: 1px solid rgb(201 202 205 / 16%);
   border-radius: var(--radius-md);
   box-shadow: 0 0.7rem 1.7rem rgb(0 0 0 / 16%);
 }
@@ -2917,7 +2958,7 @@ kbd {
   height: 0.65rem;
   background: var(--accent);
   border-radius: 50%;
-  box-shadow: 0 0 0 0.22rem rgb(95 216 255 / 14%);
+  box-shadow: 0 0 0 0.22rem rgb(191 192 195 / 14%);
 }
 
 .library-sync-status.is-running .library-sync-status-dot {
@@ -2936,7 +2977,6 @@ kbd {
 @keyframes library-sync-pulse {
   to {
     transform: scale(1.25);
-    box-shadow: 0 0 0 0.5rem rgb(255 207 103 / 6%);
   }
 }
 
@@ -2945,8 +2985,13 @@ kbd {
   align-items: center;
   min-height: 1.45rem;
   padding: 0.1rem 0.5rem;
-  color: #07111f;
-  background: var(--accent-teal);
+  color: #08080a;
+  /*
+   * The live-provider badge. `--brand` is the correct token here precisely
+   * because this badge means "these results came from the provider, live" while
+   * a section is still acquiring locally.
+   */
+  background: var(--brand);
   border-radius: 999px;
   font-size: var(--fs-micro);
   font-weight: 800;
@@ -2955,14 +3000,13 @@ kbd {
 
 #player-progress-wrap {
   transition:
-    opacity 220ms ease,
-    transform 160ms var(--motion-ease),
-    background 160ms var(--motion-ease);
+    opacity var(--motion-focus) var(--motion-ease),
+    transform var(--motion-focus) var(--motion-ease);
 }
 
 #player-preview-time {
   color: var(--focus);
-  font-weight: 750;
+  font-weight: 700;
 }
 
 #player-progress {
@@ -2976,14 +3020,14 @@ kbd {
 }
 
 #player-progress-wrap:focus-within {
-  background: linear-gradient(90deg, rgb(7 25 42 / 94%), rgb(7 25 42 / 68%));
-  box-shadow: 0 0 0 2px rgb(108 229 255 / 62%), 0 1rem 2.8rem rgb(0 0 0 / 32%);
+  background: linear-gradient(90deg, rgb(20 21 24 / 94%), rgb(20 21 24 / 68%));
+  box-shadow: 0 0 0 2px rgb(203 204 207 / 62%), 0 1rem 2.8rem rgb(0 0 0 / 32%);
   transform: translateY(-0.2rem);
 }
 
 #player-progress::-webkit-slider-runnable-track {
   height: 0.42rem;
-  background: linear-gradient(90deg, var(--focus) 0 var(--timeline-progress, 0%), rgb(218 239 255 / 24%) var(--timeline-progress, 0%) 100%);
+  background: linear-gradient(90deg, var(--focus) 0 var(--timeline-progress, 0%), rgb(234 235 238 / 24%) var(--timeline-progress, 0%) 100%);
   border-radius: 999px;
 }
 
@@ -3001,7 +3045,7 @@ kbd {
 
 #player-progress:focus::-webkit-slider-thumb {
   transform: scale(1.25);
-  box-shadow: 0 0 0 0.3rem rgb(108 229 255 / 26%), 0 0.25rem 0.85rem rgb(0 0 0 / 48%);
+  box-shadow: 0 0 0 0.3rem rgb(203 204 207 / 26%), 0 0.25rem 0.85rem rgb(0 0 0 / 48%);
 }
 
 @media (max-width: 1050px) {
@@ -3099,7 +3143,7 @@ kbd {
   max-width: 80rem;
   margin: 0 auto 3rem;
   padding: clamp(1.25rem, 2vw, 2rem);
-  background: linear-gradient(145deg, rgb(18 35 55 / 92%), rgb(11 24 40 / 88%));
+  background: linear-gradient(145deg, rgb(31 32 35 / 92%), rgb(20 21 24 / 88%));
   border: 1px solid var(--edge-subtle);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-soft);
@@ -3121,8 +3165,8 @@ kbd {
 .episode-summary {
   padding: 0.38rem 0.7rem;
   color: var(--focus);
-  background: rgb(108 229 255 / 9%);
-  border: 1px solid rgb(108 229 255 / 14%);
+  background: rgb(203 204 207 / 9%);
+  border: 1px solid rgb(203 204 207 / 14%);
   border-radius: 999px;
   font-weight: 700;
 }
@@ -3146,12 +3190,12 @@ kbd {
   align-items: center;
   padding: 0.45rem 0.85rem;
   color: var(--text-secondary);
-  background: rgb(175 216 255 / 6%);
+  background: rgb(208 209 212 / 6%);
   border: 1px solid var(--edge-subtle);
   border-radius: 999px;
   font-size: var(--fs-label);
-  font-weight: 750;
-  transition: color var(--motion-fast) var(--motion-ease), background var(--motion-fast) var(--motion-ease), box-shadow var(--motion-fast) var(--motion-ease);
+  font-weight: 700;
+  transition: color var(--motion-focus) var(--motion-ease), transform var(--motion-focus) var(--motion-ease);
 }
 
 .season-pill > * + * {
@@ -3162,7 +3206,7 @@ kbd {
   min-width: 1.5rem;
   padding: 0.05rem 0.32rem;
   color: var(--text-muted);
-  background: rgb(201 232 255 / 9%);
+  background: rgb(225 226 229 / 9%);
   border-radius: 999px;
   font-size: var(--fs-micro);
   text-align: center;
@@ -3171,22 +3215,22 @@ kbd {
 .season-pill:hover,
 .season-pill.is-active {
   color: var(--text-primary);
-  background: rgb(71 126 166 / 38%);
-  border-color: rgb(108 229 255 / 34%);
+  background: rgb(115 116 119 / 38%);
+  border-color: rgb(203 204 207 / 34%);
 }
 
 .season-pill:focus {
   outline: 0;
-  color: #051520;
+  color: #101114;
   background: var(--focus);
   border-color: var(--focus-strong);
-  box-shadow: 0 0 0 3px rgb(108 229 255 / 22%);
+  box-shadow: 0 0 0 3px rgb(203 204 207 / 22%);
 }
 
 .season-pill:focus span,
 .season-pill.is-active span {
   color: inherit;
-  background: rgb(5 25 39 / 12%);
+  background: rgb(20 21 24 / 12%);
 }
 
 .episode-list {
@@ -3203,11 +3247,11 @@ kbd {
   padding: 0;
   overflow: hidden;
   color: var(--text-primary);
-  background: rgb(149 202 247 / 5%);
+  background: rgb(192 193 196 / 5%);
   border: 1px solid transparent;
   border-radius: var(--radius-md);
   text-align: left;
-  transition: background var(--motion-fast) var(--motion-ease), border-color var(--motion-fast) var(--motion-ease), box-shadow var(--motion-fast) var(--motion-ease);
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .episode-card::before {
@@ -3222,15 +3266,15 @@ kbd {
 }
 
 .episode-card:hover {
-  background: rgb(112 169 210 / 12%);
+  background: rgb(158 159 162 / 12%);
   border-color: var(--edge-subtle);
 }
 
 .episode-card:focus {
   outline: 0;
-  background: rgb(48 83 112 / 82%);
-  border-color: rgb(108 229 255 / 43%);
-  box-shadow: 0 0 0 2px rgb(108 229 255 / 68%), 0 0.85rem 2rem rgb(0 0 0 / 25%);
+  background: rgb(76 77 80 / 82%);
+  border-color: rgb(203 204 207 / 43%);
+  box-shadow: 0 0 0 2px rgb(203 204 207 / 68%), 0 0.85rem 2rem rgb(0 0 0 / 25%);
 }
 
 .episode-card:focus::before,
@@ -3242,7 +3286,7 @@ kbd {
   min-height: 100%;
   display: block;
   overflow: hidden;
-  background: linear-gradient(145deg, #1f476d, #102641);
+  background: linear-gradient(145deg, #3f4043, #212225);
 }
 
 .episode-image {
@@ -3255,12 +3299,12 @@ kbd {
 .episode-image-fallback {
   display: grid;
   place-items: center;
-  color: #c8efff;
+  color: #e6e7ea;
   background:
-    radial-gradient(circle at 75% 20%, rgb(110 225 255 / 28%), transparent 34%),
-    linear-gradient(145deg, #285b8d, #163554);
+    radial-gradient(circle at 75% 20%, rgb(201 202 205 / 28%), transparent 34%),
+    linear-gradient(145deg, #525356, #2f3033);
   font-size: var(--fs-subtitle);
-  font-weight: 850;
+  font-weight: 800;
 }
 
 .episode-card-copy {
@@ -3302,7 +3346,7 @@ kbd {
 .episode-state {
   flex: 0 0 auto;
   padding: 0.16rem 0.42rem;
-  color: #102416;
+  color: #1f1f20;
   background: var(--success);
   border-radius: 999px;
   font-size: var(--fs-micro);
@@ -3325,14 +3369,14 @@ kbd {
 
 .episode-meta span + span::before {
   margin-right: 0.7rem;
-  color: rgb(192 222 247 / 36%);
+  color: rgb(215 216 219 / 36%);
   content: '•';
 }
 
 .episode-story {
   display: -webkit-box;
   overflow: hidden;
-  color: #c8d8e7;
+  color: #d4d5d8;
   font-size: var(--fs-label);
   line-height: 1.38;
   -webkit-box-orient: vertical;
@@ -3350,14 +3394,14 @@ kbd {
   left: 0;
   height: 0.24rem;
   overflow: hidden;
-  background: rgb(201 232 255 / 12%);
+  background: rgb(225 226 229 / 12%);
 }
 
 .episode-card-progress::after {
   width: var(--resume-progress);
   height: 100%;
   display: block;
-  background: linear-gradient(90deg, var(--focus), #759cff);
+  background: var(--brand);
   content: '';
 }
 
@@ -3519,12 +3563,12 @@ kbd {
   left: 0;
   display: grid;
   place-items: center;
-  color: #c8efff;
+  color: #e6e7ea;
   background:
-    radial-gradient(circle at 75% 20%, rgb(110 225 255 / 28%), transparent 34%),
-    linear-gradient(145deg, #285b8d, #163554);
+    radial-gradient(circle at 75% 20%, rgb(201 202 205 / 28%), transparent 34%),
+    linear-gradient(145deg, #525356, #2f3033);
   font-size: var(--fs-subtitle);
-  font-weight: 850;
+  font-weight: 800;
 }
 
 .episode-art .episode-image + .episode-image-fallback {
@@ -3667,18 +3711,18 @@ kbd {
   gap: 0.45rem;
   padding: 0.4rem;
   color: var(--text-primary);
-  background: rgb(13 34 59 / 68%);
-  border: 1px solid rgb(146 210 255 / 16%);
+  background: rgb(29 30 33 / 68%);
+  border: 1px solid rgb(198 199 202 / 16%);
   border-radius: var(--radius-sm);
   text-align: left;
 }
 
 .person-card:focus,
 .metadata-title-card:focus {
-  outline: 0.2rem solid #77ddff;
+  outline: 0.2rem solid var(--focus);
   outline-offset: 0.15rem;
-  border-color: #77ddff;
-  background: rgb(26 72 112 / 88%);
+  border-color: var(--focus);
+  background: rgb(63 64 67 / 88%);
 }
 
 /*
@@ -3700,7 +3744,7 @@ kbd {
   height: 0;
   padding-top: 150%; /* 2 / 3 */
   overflow: hidden;
-  background: #132b48;
+  background: #26272a;
   border-radius: calc(var(--radius-sm) - 0.15rem);
 }
 
@@ -3747,7 +3791,7 @@ kbd {
 
 .detail-tagline {
   margin: 0.5rem 0;
-  color: #d5eaff;
+  color: #e5e6e9;
   font-style: italic;
 }
 
@@ -3773,7 +3817,7 @@ kbd {
   height: 0;
   padding-top: 150%; /* 2 / 3 */
   overflow: hidden;
-  background: #132b48;
+  background: #26272a;
   border-radius: var(--radius-md);
 }
 
@@ -3826,8 +3870,8 @@ kbd {
   flex-direction: column;
   min-width: min(22rem, 80vw);
   padding: 1.6rem 1.4rem;
-  background: rgb(5 16 30 / 96%);
-  border: 1px solid rgb(131 221 255 / 24%);
+  background: rgb(13 14 17 / 96%);
+  border: 1px solid rgb(202 203 206 / 24%);
   border-radius: 0.9rem;
   box-shadow: 0 2rem 4rem rgb(0 0 0 / 60%);
 }
@@ -3839,10 +3883,10 @@ kbd {
 .continue-menu-title {
   margin: 0 0 0.35rem;
   padding-bottom: 0.5rem;
-  color: #70dfff;
+  color: var(--focus);
   font-size: 1rem;
   font-weight: 600;
-  border-bottom: 1px solid rgb(131 221 255 / 14%);
+  border-bottom: 1px solid rgb(202 203 206 / 14%);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3859,30 +3903,44 @@ kbd {
   border: 1px solid transparent;
   border-radius: 0.45rem;
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .continue-menu-button:hover,
 .continue-menu-button:focus {
   outline: 0;
-  color: #06101f;
-  background: #72e0ff;
-  border-color: #72e0ff;
+  color: #0d0e11;
+  background: var(--focus);
+  border-color: var(--focus);
 }
 
 .continue-menu-button.danger-button {
-  color: #ffd6d8;
+  color: var(--danger);
 }
 
 .continue-menu-button.danger-button:hover,
 .continue-menu-button.danger-button:focus {
-  color: #340608;
-  background: #ff8a90;
-  border-color: #ff8a90;
+  color: #0e0f12;
+  background: var(--danger);
+  border-color: var(--danger);
 }
 
-/* The webOS 6 compositor visibly staggers separate card and poster transforms
- * under remote navigation. Keep focus feedback immediate and static on TV. */
+/*
+ * The webOS 6 compositor visibly staggered separate card AND poster transforms
+ * under remote navigation, so focus feedback was made immediate and static here.
+ *
+ * The Cinema focus model removed the inner half of that pair: no poster, artwork
+ * or other descendant transforms on focus anywhere in the sheet, so a focus
+ * change now authors exactly one transform on one element. That is very likely
+ * what the compositor could always afford, but "likely" is how this codebase
+ * acquired three shipped visual defects, so the override stays in force and the
+ * card scale remains disabled on the device until it has been measured.
+ *
+ * To evaluate enabling it, follow the procedure in the Phase 1 report: with
+ * `Emulation.setFocusEmulationEnabled` on, compare `spatial-painted` timings
+ * across 20 D-pad moves with this block present and with the two `transform`
+ * rules below removed. Delete them only if the device shows no added frame cost.
+ */
 html[data-webos-runtime='true'] .hub-card,
 html[data-webos-runtime='true'] .hub-card::after,
 html[data-webos-runtime='true'] .category-card,
@@ -3922,6 +3980,57 @@ html[data-webos-runtime='true'] .media-select:focus .artwork {
 
 html[data-webos-runtime='true'] .media-select:focus .poster {
   transform: none;
+}
+
+/* ---------------------------------------------------------------------------
+ * Cinema focus model: sibling dimming
+ *
+ * Three cues compose, ordered by the distance they read from:
+ *   1. sibling dimming - tells you which row you are in from across the room;
+ *   2. a white ring    - static, applied on :focus, never transitioned;
+ *   3. a single scale  - one transform, on one element, per focus change.
+ *
+ * Dimming is expressed with `:focus-within` (Chromium 60, comfortably inside the
+ * Chromium 79 baseline) rather than a JS-applied class, so the focus hot path
+ * mutates no DOM whatsoever. Replacing markup on a hot path is what starved this
+ * renderer once already; a selector cannot do that.
+ *
+ * The dimmed element is the card wrapper, not the focusable button, so the ring
+ * and the label of the focused card stay at full strength.
+ * ------------------------------------------------------------------------- */
+
+.content-grid:focus-within .media-card,
+.category-grid:focus-within .category-card,
+.hub-grid:focus-within .hub-card,
+.guide-grid:focus-within .guide-row {
+  opacity: 0.55;
+  transition: opacity var(--motion-focus) var(--motion-ease);
+}
+
+.content-grid:focus-within .media-card:focus-within,
+.category-grid:focus-within .category-card:focus,
+.hub-grid:focus-within .hub-card:focus,
+.guide-grid:focus-within .guide-row:focus {
+  opacity: 1;
+}
+
+/* The focused card paints above its neighbours so the ring is never clipped. */
+.content-grid:focus-within .media-card:focus-within {
+  position: relative;
+  z-index: 2;
+}
+
+/*
+ * On the TV the dim lands instantly. Animating opacity across up to 24 cards at
+ * once is the single part of this model with no device measurement behind it, and
+ * an instant dim is both cheaper and, at 55 inches, indistinguishable. The
+ * transition above therefore applies to browser and emulator only.
+ */
+html[data-webos-runtime='true'] .content-grid:focus-within .media-card,
+html[data-webos-runtime='true'] .category-grid:focus-within .category-card,
+html[data-webos-runtime='true'] .hub-grid:focus-within .hub-card,
+html[data-webos-runtime='true'] .guide-grid:focus-within .guide-row {
+  transition: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
