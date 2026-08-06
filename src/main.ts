@@ -4700,11 +4700,36 @@ function scheduleDeferredImageLoads(): void {
       return
     }
 
-    const pending = Array.from(
+    const queued = Array.from(
       app.querySelectorAll<HTMLImageElement>(
         'img[data-deferred-src]:not([data-deferred-loading="true"])',
       ),
     )
+
+    /*
+     * Release the geometry trigger as soon as there is nothing left to admit.
+     *
+     * Measured on the OLED55G1RLA: an observer holding 36 targets costs roughly
+     * +10 ms on the median D-pad move and quadruples the moves over 60 ms (7-8
+     * of 20, against 2 of 20 with the same observer disconnected in the same
+     * view). It is not callback cost - the observer delivered one callback per
+     * twenty moves. Chromium 79 recomputes intersection geometry for every
+     * observed target synchronously in the post-layout lifecycle, and focus
+     * movement runs layout, so the price is paid per frame regardless of
+     * delivery.
+     *
+     * Observing therefore has to be scoped to the interval where it can pay for
+     * itself: while artwork is still waiting. An image that is queued but fails
+     * the nearby predicate keeps the observer alive on purpose - that is exactly
+     * the case the trigger exists to serve - so the test is an empty queue with
+     * nothing in flight, not an empty `pending`.
+     */
+    if (!queued.length && deferredImageLoads === 0) {
+      deferredImageAdmissionTrigger.teardown()
+      return
+    }
+
+    const pending = queued
       .filter(deferredImageIsNearby)
       .sort((left, right) => {
         const leftDistance = Math.abs(left.getBoundingClientRect().top)
