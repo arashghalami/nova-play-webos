@@ -62,6 +62,7 @@ import { isRemoteBack, remoteDirection } from './remote-input'
 import { foldText, matchesQuery, normalizeQuery, queryTokens } from './search'
 import { LruTtlCache } from './lru-ttl-cache'
 import { focusScrollDelta } from './focus-scroll'
+import { createAdmissionTrigger } from './image-admission-trigger'
 import { episodeDisplayTitle, episodeThumbnailSources, seasonLabel } from './series-presentation'
 import { dashMediaPlayerFactory } from './dash-player'
 import {
@@ -4634,6 +4635,57 @@ function deferredImageConcurrency(): number {
     : DEFERRED_IMAGE_CONCURRENCY
 }
 
+/*
+ * The fifth admission trigger. The other four - the end of bindEvents(), the
+ * window `scroll` and `resize` listeners, and the per-image settle continuation -
+ * all require either a re-render or the WINDOW to scroll. Nothing re-runs
+ * admission when content moves inside a scrolling container or under a
+ * transform, and the settle continuation halts as soon as a pass admits nothing.
+ *
+ * This is inert on the current grid layout, where the window does scroll: it can
+ * only ask for a pass the scheduler would already have been asked for, and the
+ * scheduler is rAF-coalesced. It exists so that teaching `deferredImageIsNearby`
+ * about the horizontal axis does not make container-revealed artwork permanently
+ * unloadable.
+ *
+ * It observes each pending image's ARTWORK CONTAINER rather than the image
+ * itself. A src-less img can compute to a zero-area box, and Chromium 79 reports
+ * a zero-area target as intersecting with a ratio of 1 regardless of where it
+ * actually sits, which would make the trigger fire for everything at once. The
+ * containers are CSS-sized independently of load state.
+ */
+const deferredImageAdmissionTrigger = createAdmissionTrigger<Element>({
+  createObserver: (onIntersect) => {
+    if (typeof IntersectionObserver !== 'function') {
+      return null
+    }
+
+    const observer = new IntersectionObserver(() => onIntersect(), {
+      root: null,
+      // px only: Chromium 79 resolves a percentage rootMargin against the root's
+      // HEIGHT for every side, which the current spec does not.
+      rootMargin: `${DEFERRED_IMAGE_PREFETCH_PX}px`,
+      threshold: 0,
+    })
+
+    return {
+      observe: (target) => observer.observe(target),
+      disconnect: () => observer.disconnect(),
+    }
+  },
+  requestAdmission: () => scheduleDeferredImageLoads(),
+})
+
+function registerDeferredImageAdmissionTargets(): void {
+  const targets: Element[] = []
+
+  app.querySelectorAll<HTMLImageElement>('img[data-deferred-src]').forEach((image) => {
+    targets.push(deferredImageContainer(image) ?? image)
+  })
+
+  deferredImageAdmissionTrigger.register(targets)
+}
+
 function scheduleDeferredImageLoads(): void {
   if (deferredImageScheduleHandle !== null) {
     return
@@ -4865,6 +4917,7 @@ function bindEvents(): void {
   })
 
   assignNavigationZones()
+  registerDeferredImageAdmissionTargets()
   scheduleDeferredImageLoads()
 }
 
@@ -8500,6 +8553,13 @@ window.addEventListener('pagehide', () => {
   performanceTrace.event('lifecycle', 'pagehide')
   performanceTrace.disable()
   cancelPendingSpatialNavigation()
+  /*
+   * An observer with live observations holds its targets strongly, and those
+   * targets are <img> elements that may already own decoded artwork. Releasing
+   * them on suspend matters on a device whose documented failure mode is
+   * renderer death under memory pressure.
+   */
+  deferredImageAdmissionTrigger.teardown()
   cancelScheduledCatalogSync()
   catalogSync?.cancel()
   playerCleanup?.()
