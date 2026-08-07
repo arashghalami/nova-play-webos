@@ -260,6 +260,7 @@ function titleFromPayload(value: unknown): EnrichedTitleMetadata | null {
   return {
     tmdbId,
     mediaType,
+    poster: readString(source.poster),
     tagline: readString(source.tagline),
     ...(selectedRating ? { contentRating: selectedRating } : {}),
     ...(ageGuidance ? { ageGuidance } : {}),

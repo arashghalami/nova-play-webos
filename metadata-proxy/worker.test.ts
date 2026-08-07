@@ -31,7 +31,11 @@ function baseTmdbFetch(options: {
     }
 
     if (/\/movie\/1(?:\?|$)/.test(url) || /\/tv\/1(?:\?|$)/.test(url)) {
-      return response({ title: options.title ?? 'Example', name: options.title ?? 'Example' })
+      return response({
+        title: options.title ?? 'Example',
+        name: options.title ?? 'Example',
+        poster_path: '/exampleposter.jpg',
+      })
     }
 
     if (url.includes('/credits')) {
@@ -107,6 +111,44 @@ describe('metadata Worker rating aggregation', () => {
       basis: 'official-certification',
     })
     expect(JSON.stringify(payload)).not.toContain(env.TMDB_BEARER_TOKEN)
+  })
+
+  it('exposes the title poster as a credential-free w342 image URL', async () => {
+    vi.stubGlobal('fetch', baseTmdbFetch())
+
+    const response = await resolveTitle()
+    const payload = (await response.json()) as Record<string, unknown>
+
+    expect(response.status).toBe(200)
+    expect(payload.poster).toBe('https://image.tmdb.org/t/p/w342/exampleposter.jpg')
+    // No credential ever leaks into the poster URL or the payload.
+    expect(String(payload.poster)).not.toContain(env.TMDB_BEARER_TOKEN)
+  })
+
+  it('omits the poster when TMDB has no poster_path', async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input)
+      if (url.includes('/release_dates') || url.includes('/content_ratings')) {
+        return response({ results: [] })
+      }
+      if (/\/movie\/1(?:\?|$)/.test(url)) {
+        return response({ title: 'No Art' }) // no poster_path
+      }
+      if (url.includes('/credits')) {
+        return response({ cast: [], crew: [] })
+      }
+      if (url.includes('/recommendations')) {
+        return response({ results: [] })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const response2 = await resolveTitle()
+    const payload = (await response2.json()) as Record<string, unknown>
+
+    expect(response2.status).toBe(200)
+    expect(payload.poster).toBeUndefined()
   })
 
   it('uses Trakt classification only as a deterministic fallback when TMDB lacks Netherlands data', async () => {

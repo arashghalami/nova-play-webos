@@ -601,7 +601,13 @@ function migrateLegacyValue(legacyKey: string, scopedKey: string): string | null
   return legacyValue
 }
 
-function readJson<T>(key: string, fallback: T): T {
+/*
+ * Shared localStorage-shape primitives. Exported for artwork-record.ts (and
+ * peers) so record stores reuse the exact same read/write path — JSON failure
+ * handling, quota-safe writes — instead of duplicating the localStorage shape.
+ * They stay defined here so that logic lives in one place.
+ */
+export function readJson<T>(key: string, fallback: T): T {
   return parseJson(readStoredItem(key), fallback)
 }
 
@@ -623,7 +629,7 @@ function parseJson<T>(raw: string | null, fallback: T): T {
   }
 }
 
-function writeJson(key: string, value: unknown): boolean {
+export function writeJson(key: string, value: unknown): boolean {
   try {
     const serialized = performanceTrace.measure(
       'storage',

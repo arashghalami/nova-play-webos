@@ -69,6 +69,11 @@ import {
   type PendingCandidate,
 } from './deferred-image-promotion'
 import { classifyArtwork, type ArtworkShape } from './artwork-shape'
+import {
+  loadArtworkRecords,
+  saveArtworkRecords,
+  type ArtworkRecord,
+} from './artwork-record'
 import { episodeDisplayTitle, episodeThumbnailSources, seasonLabel } from './series-presentation'
 import { dashMediaPlayerFactory } from './dash-player'
 import {
@@ -586,6 +591,15 @@ let undoResumeTimer: number | null = null
 const expandedGlobalSearchSections = new Set<LibrarySection>()
 let favorites = profile ? loadFavorites(profile.id) : new Map()
 let resumeEntries = profile ? loadResume(profile.id) : new Map<string, ResumeEntry>()
+// Resolved catalog artwork overrides (Part B), hydrated SYNCHRONOUSLY here so
+// posterArtwork can consult them during the very first render — a reload shows a
+// previously-resolved poster with no network. Same shape/lifecycle as
+// resumeEntries, including the profile-switch reset below. Holds positive
+// overrides (a resolved poster URL) and negative markers (null = TMDB had no
+// match), both TTL'd in artwork-record.ts.
+let artworkRecords = profile
+  ? loadArtworkRecords(profile.id)
+  : new Map<string, ArtworkRecord>()
 const knownStreams = new Map<string, StreamItem>()
 const streamCache = new Map<string, CachedStreams>()
 const sectionCategories = new Map<LibrarySection, Category[]>()
@@ -2029,6 +2043,17 @@ function liveArtwork(stream: StreamItem): string {
   `
 }
 
+/**
+ * A resolved poster override for this stream, or undefined. Only positive
+ * records (a real URL) return a source; a negative marker (null) returns
+ * undefined so the provider source is used. Freshness is enforced on hydration
+ * (30-day TTL); this reads the already-hydrated Map.
+ */
+function deliveryArtworkOverride(stream: StreamItem): string | undefined {
+  const record = artworkRecords.get(streamLookupKey(stream))
+  return record && record.poster ? record.poster : undefined
+}
+
 function catalogArtworkSource(source: string): string {
   // Provider catalogues frequently return TMDB's `original` artwork. A card
   // never displays enough pixels to justify decoding a 2K–3K image on webOS;
@@ -2058,7 +2083,18 @@ function posterArtwork(stream: StreamItem): string {
       fallbackSource = fallbackPoster
     }
   } else {
-    source = stream.cover || stream.metadata?.cover || stream.seriesCover || stream.icon
+    // Part B: a resolved artwork override (positive record) wins over the
+    // provider source, so a poster resolved on a prior visit is in the FIRST
+    // paint. A negative marker (poster: null) is not a source; it just means we
+    // already know TMDB has no match, so fall through to the provider source
+    // (which Part A will still gate if degenerate).
+    const override = deliveryArtworkOverride(stream)
+    source =
+      override ||
+      stream.cover ||
+      stream.metadata?.cover ||
+      stream.seriesCover ||
+      stream.icon
   }
 
   if (
@@ -5047,7 +5083,164 @@ function handleDegenerateArtwork(image: HTMLImageElement): boolean {
   }
 
   markImageUnavailable(image)
+  // Part B: the artwork is degenerate and no provider fallback exists — a
+  // genuine backfill candidate. Try to resolve a real poster from TMDB. This is
+  // demand-driven (only from this settled, on-screen image) and bounded; it
+  // patches the element async if a poster is found.
+  queueArtworkResolution(image)
   return true
+}
+
+/*
+ * Demand-driven catalog-artwork backfill (Part B).
+ *
+ * Triggered ONLY by Part A's degenerate verdict (or a genuinely missing source)
+ * on a settled, on-screen image — never by scanning the catalog. Bounded by a
+ * negative cache (so unmatchable titles are asked once per 30 days), a
+ * concurrency cap reusing the deferred-image discipline, and a per-session
+ * attempt cap as a backstop. VOD only: a TMDB title search against 53k live
+ * channel names is meaningless. Resolved art is persisted and patched into the
+ * live element without blocking render.
+ */
+const ARTWORK_RESOLVE_CONCURRENCY = 2
+const ARTWORK_RESOLVE_SESSION_CAP = 60
+let artworkResolveInFlight = 0
+let artworkResolveSessionAttempts = 0
+const artworkResolveQueue: string[] = []
+const artworkResolveQueued = new Set<string>()
+
+function queueArtworkResolution(image: HTMLImageElement): void {
+  // Posters only (episode stills / live logos are out of scope for TMDB title
+  // resolution) and only the poster shape carries this backfill.
+  if (image.dataset.shape !== 'poster') {
+    return
+  }
+
+  if (!metadataServiceConfigured()) {
+    return
+  }
+
+  const keyHost = image.closest<HTMLElement>('[data-stream-key]')
+  const streamKey = keyHost?.dataset.streamKey
+
+  if (!streamKey) {
+    return
+  }
+
+  const stream = streamFromKey(streamKey)
+
+  // VOD only. Live (and anything without a resolvable stream) is excluded.
+  if (!stream || stream.section === 'live') {
+    return
+  }
+
+  // Negative cache / already-resolved: a hydrated record (positive or negative)
+  // means we already know the answer, so do not re-query.
+  if (artworkRecords.has(streamKey)) {
+    return
+  }
+
+  if (artworkResolveQueued.has(streamKey)) {
+    return
+  }
+
+  if (artworkResolveSessionAttempts >= ARTWORK_RESOLVE_SESSION_CAP) {
+    return
+  }
+
+  artworkResolveQueued.add(streamKey)
+  artworkResolveQueue.push(streamKey)
+  pumpArtworkResolution()
+}
+
+function pumpArtworkResolution(): void {
+  while (
+    artworkResolveInFlight < ARTWORK_RESOLVE_CONCURRENCY &&
+    artworkResolveQueue.length > 0 &&
+    artworkResolveSessionAttempts < ARTWORK_RESOLVE_SESSION_CAP
+  ) {
+    const streamKey = artworkResolveQueue.shift()!
+    void resolveArtworkFor(streamKey)
+  }
+}
+
+async function resolveArtworkFor(streamKey: string): Promise<void> {
+  artworkResolveInFlight += 1
+  artworkResolveSessionAttempts += 1
+
+  try {
+    const stream = streamFromKey(streamKey)
+
+    if (!stream || stream.section === 'live' || !profile) {
+      return
+    }
+
+    const title = metadataLookupTitle(stream.name)
+
+    if (!title) {
+      return
+    }
+
+    let poster: string | null = null
+
+    try {
+      const enrichment = await loadTitleMetadata({
+        mediaType: stream.section === 'series' ? 'tv' : 'movie',
+        title,
+        year: stream.year,
+      })
+      poster = enrichment?.poster ?? null
+    } catch {
+      // Network/resolve failure: do NOT persist a negative marker (that would
+      // suppress a retry for 30 days over a transient error). Just stop.
+      return
+    }
+
+    // Persist positive OR negative (no-match) so a future scroll does not
+    // re-query. A transient failure returned above without reaching here.
+    const record: ArtworkRecord = {
+      streamKey,
+      poster,
+      updatedAt: Date.now(),
+    }
+    artworkRecords.set(streamKey, record)
+    saveArtworkRecords(profile.id, artworkRecords)
+
+    if (poster) {
+      patchResolvedArtwork(streamKey, poster)
+    }
+  } finally {
+    artworkResolveInFlight = Math.max(0, artworkResolveInFlight - 1)
+    artworkResolveQueued.delete(streamKey)
+    pumpArtworkResolution()
+  }
+}
+
+/**
+ * Patch a resolved poster into any on-screen card for this stream, following the
+ * data-now-next-key async-patch pattern. Never blocks render; if the card is no
+ * longer present (scrolled away / navigated) it is a no-op — the persisted
+ * record makes the next render correct anyway.
+ */
+function patchResolvedArtwork(streamKey: string, poster: string): void {
+  const hosts = app.querySelectorAll<HTMLElement>(
+    `[data-stream-key="${cssEscape(streamKey)}"]`,
+  )
+
+  hosts.forEach((host) => {
+    const container = host.querySelector<HTMLElement>('.poster-artwork')
+    const image = host.querySelector<HTMLImageElement>('img.poster')
+
+    if (!container || !image) {
+      return
+    }
+
+    // Clear the interim unavailable/letter-tile state and show the real poster.
+    container.classList.remove('image-unavailable')
+    image.removeAttribute('data-fallback-src')
+    image.dataset.shape = 'poster'
+    image.src = poster
+  })
 }
 
 function bindEvents(): void {
@@ -7690,6 +7883,9 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: ProviderBroker
   settings = loadSettings(nextProfile.id)
   favorites = loadFavorites(nextProfile.id)
   resumeEntries = loadResume(nextProfile.id)
+  // Per-profile: a switched profile must never inherit another user's resolved
+  // artwork (and its negative markers).
+  artworkRecords = loadArtworkRecords(nextProfile.id)
 
   if (repairResumeEpisodeContexts()) {
     saveResume(nextProfile.id, resumeEntries)

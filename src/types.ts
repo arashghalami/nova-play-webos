@@ -126,6 +126,8 @@ export interface RelatedTitle extends FilmographyCredit {
 export interface EnrichedTitleMetadata {
   tmdbId: string
   mediaType: 'movie' | 'tv'
+  /** The title's own poster (TMDB w342 URL), when available. */
+  poster?: string
   tagline?: string
   contentRating?: ContentRating
   ageGuidance?: AgeGuidance

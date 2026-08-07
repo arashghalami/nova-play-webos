@@ -55,11 +55,16 @@ describe('artwork-quality contract (Part A)', () => {
     expect(body).toMatch(/classifyArtwork\(/)
     expect(body).toMatch(/tryImageFallbackSwap\(image\)/)
     // Must have the TERMINAL fallthrough — mark unavailable when no fallback is
-    // available — anchored to the `markImageUnavailable(image); return true` pair
-    // at the end of the function. A bare `markImageUnavailable(image)` match is
-    // insufficient: it also appears inside the fallback-swap branch's error
-    // listener, so removing the terminal call alone would still match it.
-    expect(body).toMatch(/markImageUnavailable\(image\)\s*\n\s*return true\s*\n\s*\}/)
+    // available — anchored to the terminal sequence at the end of the function
+    // (markImageUnavailable, then the Part B backfill queue, then return true).
+    // A bare `markImageUnavailable(image)` match is insufficient: it also appears
+    // inside the fallback-swap branch's error listener, so this anchors on the
+    // terminal position specifically.
+    // Terminal sequence: mark unavailable, then (after an explanatory comment)
+    // the Part B backfill queue, then return true. Allow interposed comment lines.
+    expect(body).toMatch(
+      /markImageUnavailable\(image\)\s*\n(?:\s*\/\/[^\n]*\n)*\s*queueArtworkResolution\(image\)\s*\n\s*return true/,
+    )
   })
 
   it('is not applied uniformly — only images with an explicit data-shape are judged', () => {
