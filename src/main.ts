@@ -63,6 +63,11 @@ import { foldText, matchesQuery, normalizeQuery, queryTokens } from './search'
 import { LruTtlCache } from './lru-ttl-cache'
 import { focusScrollDelta } from './focus-scroll'
 import { createAdmissionTrigger } from './image-admission-trigger'
+import {
+  planDeferredImagePromotion,
+  type ArmedCandidate,
+  type PendingCandidate,
+} from './deferred-image-promotion'
 import { episodeDisplayTitle, episodeThumbnailSources, seasonLabel } from './series-presentation'
 import { dashMediaPlayerFactory } from './dash-player'
 import {
@@ -277,6 +282,30 @@ const DEFERRED_IMAGE_CONCURRENCY = 6
 const WEBOS_DEFERRED_IMAGE_CONCURRENCY = 3
 const DEFERRED_IMAGE_PREFETCH_PX = 480
 const WEBOS_DEFERRED_IMAGE_COOLDOWN_MS = 0
+/*
+ * Two-tier deferred-image attributes.
+ *
+ * Render templates emit the INERT pending attribute only. `promoteDeferredImages`
+ * is the single writer that turns a pending image into an armed
+ * `data-deferred-src` image, and it never arms more than the cap below at once.
+ *
+ * The cap is the structural fix for the observer-cost regression. The geometric
+ * `deferredImageIsNearby` predicate alone does not bound the armed set: on a
+ * 60-card search result most cards are eligible-ish, so an unbounded arm-all
+ * would hand the IntersectionObserver dozens of targets and Chromium 79
+ * recomputes intersection geometry for every observed target synchronously in
+ * the post-layout lifecycle - the measured +10 ms median move and 7-8/20 moves
+ * over 60 ms at 36 targets. Bounding the armed pool bounds the observed target
+ * count directly, keeps `queued.length` able to reach zero so the existing
+ * teardown fires on real surfaces, and stops observer cost scaling with content.
+ *
+ * 16 is well below the 36 that was measured harmful and comfortably above the
+ * webOS concurrency of 3, so the loader never starves: the promoter refills as
+ * images settle and the window scrolls. Tunable from the device session.
+ */
+const DEFERRED_PENDING_SRC_ATTR = 'data-deferred-pending-src'
+const ARMED_DEFERRED_IMAGE_CAP = 24
+const WEBOS_ARMED_DEFERRED_IMAGE_CAP = 16
 const LIBRARY_SYNC_LAUNCH_DELAY_MS = 1_000
 const AMPERSAND = String.fromCharCode(38)
 const ESCAPE_PATTERN = /[&<>"']/g
@@ -2049,7 +2078,7 @@ function posterArtwork(stream: StreamItem): string {
 
   return `
     <span class="poster-artwork image-deferred">
-      <img class="poster" data-deferred-src="${escape(optimizedSource)}"${fallbackAttr} alt="" />
+      <img class="poster" ${DEFERRED_PENDING_SRC_ATTR}="${escape(optimizedSource)}"${fallbackAttr} alt="" />
       <span class="poster-fallback" aria-hidden="true">${escape(stream.name.slice(0, 1))}</span>
     </span>
   `
@@ -2433,7 +2462,7 @@ function episodeArtwork(episode: StreamItem): string {
       ? ` data-fallback-src="${escape(optimizedFallback)}"`
       : ''
 
-  return `<img class="episode-image" data-deferred-src="${escape(optimizedPrimary)}"${fallbackAttr} alt="" />${fallback}`
+  return `<img class="episode-image" ${DEFERRED_PENDING_SRC_ATTR}="${escape(optimizedPrimary)}"${fallbackAttr} alt="" />${fallback}`
 }
 
 function episodeMeta(episode: StreamItem, entry?: ResumeEntry): string {
@@ -4635,6 +4664,85 @@ function deferredImageConcurrency(): number {
     : DEFERRED_IMAGE_CONCURRENCY
 }
 
+function armedDeferredImageCap(): number {
+  return isWebOsRuntime() ? WEBOS_ARMED_DEFERRED_IMAGE_CAP : ARMED_DEFERRED_IMAGE_CAP
+}
+
+/*
+ * The single writer of the two-tier deferred-image contract.
+ *
+ * Render templates emit inert pending images (`data-deferred-pending-src`, no
+ * `src`). This promotes a bounded number of them to armed (`data-deferred-src`),
+ * after which registerDeferredImageAdmissionTargets + scheduleDeferredImageLoads
+ * do the actual observing and loading. It is called at the top of the scheduler's
+ * rAF pass (below), so it inherits every existing admission trigger - render,
+ * scroll, resize, the per-image settle continuation, and the geometry trigger -
+ * and needs no timer of its own. Refill therefore happens for free: when an armed
+ * image settles, the continuation re-enters the scheduler, a cap slot has freed,
+ * and the next-nearest pending image is armed.
+ *
+ * The promote/demote DECISION is the pure planDeferredImagePromotion; this
+ * function is only the DOM adapter (attribute + geometry reads, attribute
+ * writes). Demotion returns a stranded armed image - armed but drifted out of the
+ * prefetch band before the loader admitted it - to pending, so it stops holding a
+ * cap slot the viewport no longer wants; see the pure module for the rationale.
+ */
+function promoteDeferredImages(): void {
+  const pendingEls = Array.from(
+    app.querySelectorAll<HTMLImageElement>(`img[${DEFERRED_PENDING_SRC_ATTR}]`),
+  )
+  const armedEls = Array.from(
+    app.querySelectorAll<HTMLImageElement>('img[data-deferred-src]'),
+  )
+
+  if (!pendingEls.length && !armedEls.length) {
+    return
+  }
+
+  const pending: PendingCandidate[] = pendingEls.map((image, index) => {
+    const rect = image.getBoundingClientRect()
+    return {
+      ref: index,
+      nearby: deferredImageIsNearby(image),
+      distance: Math.abs(rect.top),
+    }
+  })
+
+  const armed: ArmedCandidate[] = armedEls.map((image, index) => ({
+    ref: index,
+    nearby: deferredImageIsNearby(image),
+    loading: image.dataset.deferredLoading === 'true',
+  }))
+
+  const plan = planDeferredImagePromotion(pending, armed, armedDeferredImageCap())
+
+  for (const ref of plan.demote) {
+    const image = armedEls[ref]
+    const source = image.dataset.deferredSrc
+
+    if (source) {
+      image.setAttribute(DEFERRED_PENDING_SRC_ATTR, source)
+      delete image.dataset.deferredSrc
+    }
+  }
+
+  for (const ref of plan.promote) {
+    const image = pendingEls[ref]
+    const source = image.getAttribute(DEFERRED_PENDING_SRC_ATTR)
+
+    if (source) {
+      image.dataset.deferredSrc = source
+      image.removeAttribute(DEFERRED_PENDING_SRC_ATTR)
+    }
+  }
+
+  if (plan.promote.length || plan.demote.length) {
+    // The armed set changed; re-register so the geometry trigger observes the
+    // new armed containers and releases the demoted ones.
+    registerDeferredImageAdmissionTargets()
+  }
+}
+
 /*
  * The fifth admission trigger. The other four - the end of bindEvents(), the
  * window `scroll` and `resize` listeners, and the per-image settle continuation -
@@ -4679,6 +4787,14 @@ const deferredImageAdmissionTrigger = createAdmissionTrigger<Element>({
 function registerDeferredImageAdmissionTargets(): void {
   const targets: Element[] = []
 
+  // Observe ONLY armed containers. The armed set is bounded by the cap, which is
+  // precisely what keeps the observed-target count bounded and the Chromium 79
+  // per-target geometry recompute cheap - observing pending containers too would
+  // put every card back under the observer and reintroduce the regression the cap
+  // exists to fix. Promotion refill for not-yet-armed pending images rides the
+  // window `scroll`/`resize` listeners and the per-image settle continuation,
+  // which call the scheduler (and therefore the promoter) directly; the geometry
+  // observer is only the extra admission path for container/transform reveals.
   app.querySelectorAll<HTMLImageElement>('img[data-deferred-src]').forEach((image) => {
     targets.push(deferredImageContainer(image) ?? image)
   })
@@ -4693,6 +4809,13 @@ function scheduleDeferredImageLoads(): void {
 
   deferredImageScheduleHandle = window.requestAnimationFrame(() => {
     deferredImageScheduleHandle = null
+
+    // Promote first: turn a bounded number of inert pending images into armed
+    // ones before the loader reads the armed queue below. This runs on every
+    // scheduler entry (render, scroll, resize, settle continuation, geometry
+    // trigger), so armed slots freed by a settled image refill on the very next
+    // pass with no separate timer.
+    promoteDeferredImages()
 
     const concurrency = deferredImageConcurrency()
 
