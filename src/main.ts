@@ -68,6 +68,7 @@ import {
   type ArmedCandidate,
   type PendingCandidate,
 } from './deferred-image-promotion'
+import { classifyArtwork, type ArtworkShape } from './artwork-shape'
 import { episodeDisplayTitle, episodeThumbnailSources, seasonLabel } from './series-presentation'
 import { dashMediaPlayerFactory } from './dash-player'
 import {
@@ -2013,7 +2014,7 @@ function liveArtwork(stream: StreamItem): string {
       suppressRemoteArtworkForLocalLibrary() &&
       isRemoteArtworkSource(stream.icon)
     )
-      ? `<span class="live-logo-frame"><img class="channel-logo live-channel-logo" src="${escape(stream.icon)}" alt="" loading="lazy" /></span>`
+      ? `<span class="live-logo-frame"><img class="channel-logo live-channel-logo" data-shape="logo" src="${escape(stream.icon)}" alt="" loading="lazy" /></span>`
       : ''
 
   return `
@@ -2078,7 +2079,7 @@ function posterArtwork(stream: StreamItem): string {
 
   return `
     <span class="poster-artwork image-deferred">
-      <img class="poster" ${DEFERRED_PENDING_SRC_ATTR}="${escape(optimizedSource)}"${fallbackAttr} alt="" />
+      <img class="poster" data-shape="poster" ${DEFERRED_PENDING_SRC_ATTR}="${escape(optimizedSource)}"${fallbackAttr} alt="" />
       <span class="poster-fallback" aria-hidden="true">${escape(stream.name.slice(0, 1))}</span>
     </span>
   `
@@ -2462,7 +2463,7 @@ function episodeArtwork(episode: StreamItem): string {
       ? ` data-fallback-src="${escape(optimizedFallback)}"`
       : ''
 
-  return `<img class="episode-image" ${DEFERRED_PENDING_SRC_ATTR}="${escape(optimizedPrimary)}"${fallbackAttr} alt="" />${fallback}`
+  return `<img class="episode-image" data-shape="still" ${DEFERRED_PENDING_SRC_ATTR}="${escape(optimizedPrimary)}"${fallbackAttr} alt="" />${fallback}`
 }
 
 function episodeMeta(episode: StreamItem, entry?: ResumeEntry): string {
@@ -4880,6 +4881,18 @@ function scheduleDeferredImageLoads(): void {
         deferredImageLoads = Math.max(0, deferredImageLoads - 1)
         delete image.dataset.deferredLoading
         container?.classList.remove('image-loading')
+
+        // A successful decode can still be a degenerate placeholder (e.g. a
+        // provider's 100x70 landscape thumbnail in a portrait poster frame) that
+        // will smear under object-fit: cover. Judge the decoded dimensions
+        // against the frame shape declared at template time and, if degenerate,
+        // route through the SAME machinery the failure path uses: try the
+        // data-fallback-src swap, else mark image-unavailable (the letter tile).
+        // Part B later replaces that interim tile with a resolved poster.
+        if (outcome === 'load') {
+          handleDegenerateArtwork(image)
+        }
+
         performanceTrace.event('image', 'deferred-settled', {
           outcome,
           queuedRemaining: app.querySelectorAll('img[data-deferred-src]').length,
@@ -4952,14 +4965,89 @@ function scheduleImageErrorCheck(image: HTMLImageElement): void {
       return
     }
 
-    if (image.classList.contains('live-channel-logo')) {
-      image.closest<HTMLElement>('.live-channel-artwork')?.classList.add('logo-unavailable')
-    } else if (image.classList.contains('episode-image')) {
-      image.closest<HTMLElement>('.episode-art')?.classList.add('image-unavailable')
-    } else {
-      image.closest<HTMLElement>('.poster-artwork')?.classList.add('image-unavailable')
-    }
+    markImageUnavailable(image)
   }, 5_000)
+}
+
+/**
+ * Apply the same "no usable artwork" state the failure paths use: the container
+ * class that reveals the letter/monogram tile. Centralised so the timeout path,
+ * the error path, and the degenerate-artwork path stay identical.
+ */
+function markImageUnavailable(image: HTMLImageElement): void {
+  if (image.classList.contains('live-channel-logo')) {
+    image.closest<HTMLElement>('.live-channel-artwork')?.classList.add('logo-unavailable')
+  } else if (image.classList.contains('episode-image')) {
+    image.closest<HTMLElement>('.episode-art')?.classList.add('image-unavailable')
+  } else {
+    image.closest<HTMLElement>('.poster-artwork')?.classList.add('image-unavailable')
+  }
+}
+
+function artworkShapeOf(image: HTMLImageElement): ArtworkShape {
+  const declared = image.dataset.shape
+  return declared === 'poster' || declared === 'still' || declared === 'logo'
+    ? declared
+    : 'poster'
+}
+
+/**
+ * After a successful decode, reject artwork that is degenerate for its declared
+ * frame shape (the strong case: a landscape thumbnail in a portrait poster
+ * frame, which smears under object-fit: cover). Routes through the existing
+ * fallback→unavailable machinery. Returns true when the image was rejected.
+ *
+ * Only images carrying an explicit data-shape are judged, so this never touches
+ * images outside the deferred-artwork templates.
+ */
+function handleDegenerateArtwork(image: HTMLImageElement): boolean {
+  if (!image.dataset.shape) {
+    return false
+  }
+
+  const verdict = classifyArtwork(artworkShapeOf(image), {
+    width: image.naturalWidth,
+    height: image.naturalHeight,
+  })
+
+  if (verdict !== 'degenerate') {
+    return false
+  }
+
+  performanceTrace.event('image', 'degenerate-rejected', {
+    imageType: image.className || 'unclassified',
+    shape: image.dataset.shape,
+    naturalWidth: image.naturalWidth,
+    naturalHeight: image.naturalHeight,
+  })
+
+  if (tryImageFallbackSwap(image)) {
+    // tryImageFallbackSwap sets image.src to the fallback, but settle's load/
+    // error listeners were once:true and already fired. Attach fresh one-shot
+    // handlers so the fallback is itself re-judged (degenerate → unavailable) and
+    // a failed fallback still resolves to the letter tile. Re-arm the timeout net.
+    image.addEventListener(
+      'load',
+      () => {
+        if (
+          classifyArtwork(artworkShapeOf(image), {
+            width: image.naturalWidth,
+            height: image.naturalHeight,
+          }) === 'degenerate'
+        ) {
+          markImageUnavailable(image)
+        }
+      },
+      { once: true },
+    )
+    image.addEventListener('error', () => markImageUnavailable(image), { once: true })
+    delete image.dataset.errorCheckScheduled
+    scheduleImageErrorCheck(image)
+    return true
+  }
+
+  markImageUnavailable(image)
+  return true
 }
 
 function bindEvents(): void {

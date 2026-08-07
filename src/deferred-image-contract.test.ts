@@ -25,9 +25,11 @@ const mainSource = runtimeSources['./main.ts'] ?? ''
 
 describe('deferred-image chain contract', () => {
   it('templates emit the inert pending attribute, never armed src directly', () => {
-    // Poster and episode artwork must emit the pending attribute...
-    expect(mainSource).toMatch(/class="poster"\s+\$\{DEFERRED_PENDING_SRC_ATTR\}=/)
-    expect(mainSource).toMatch(/class="episode-image"\s+\$\{DEFERRED_PENDING_SRC_ATTR\}=/)
+    // Poster and episode artwork must emit the pending attribute. Other inert
+    // attributes (e.g. data-shape) may sit between the class and the pending
+    // attribute, so allow any non-`>` run in between rather than only whitespace.
+    expect(mainSource).toMatch(/class="poster"[^>]*\s\$\{DEFERRED_PENDING_SRC_ATTR\}=/)
+    expect(mainSource).toMatch(/class="episode-image"[^>]*\s\$\{DEFERRED_PENDING_SRC_ATTR\}=/)
 
     // ...and no template literal may hand-write an armed data-deferred-src (only
     // the promoter, via image.dataset.deferredSrc, is allowed to arm). A literal
