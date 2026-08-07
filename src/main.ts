@@ -69,6 +69,7 @@ import {
   type PendingCandidate,
 } from './deferred-image-promotion'
 import { classifyArtwork, type ArtworkShape } from './artwork-shape'
+import { nextAudioIndex, nextTextIndex, trackLabel } from './track-selection'
 import {
   loadArtworkRecords,
   saveArtworkRecords,
@@ -7260,6 +7261,35 @@ function cycleAudioTrack(): void {
     activeHls.audioTrack = (activeHls.audioTrack + 1) % activeHls.audioTracks.length
     const track = activeHls.audioTracks[activeHls.audioTrack]
     showToast(`Audio: ${track?.name ?? `Track ${activeHls.audioTrack + 1}`}`)
+    revealControls()
+    return
+  }
+
+  // Native fallback: webOS exposes multi-audio on native progressive playback
+  // (.mkv/.mp4) through the standard AudioTrackList. hls.js was the only path
+  // consulted before, so native multi-audio titles wrongly reported a single
+  // track. Advance the enabled track via the pure selector and toast its
+  // language.
+  // `audioTracks` (AudioTrackList) is not in the TS DOM lib and is a webOS
+  // native extension here; type the minimal surface we use.
+  const video = document.querySelector<HTMLVideoElement>('#video-player')
+  const audioTracks = (video as unknown as {
+    audioTracks?: {
+      length: number
+      [index: number]: { enabled: boolean; language?: string; label?: string }
+    }
+  } | null)?.audioTracks
+
+  if (audioTracks && audioTracks.length > 1) {
+    const list = Array.from({ length: audioTracks.length }, (_, i) => audioTracks[i])
+    const next = nextAudioIndex(list)
+
+    for (let i = 0; i < audioTracks.length; i += 1) {
+      audioTracks[i].enabled = i === next
+    }
+
+    const chosen = next >= 0 ? audioTracks[next] : undefined
+    showToast(`Audio: ${trackLabel(chosen, next)}`)
   } else {
     showToast('This stream has one audio track.')
   }
@@ -7267,6 +7297,21 @@ function cycleAudioTrack(): void {
   revealControls()
 }
 
+/*
+ * Subtitle cycling. hls.js exposes subtitle renditions directly; for native
+ * playback we can only drive the standard TextTrackList.
+ *
+ * webOS platform limitation (verified on lg-oled-g1 with an .mkv carrying an
+ * embedded S_TEXT/UTF8 subtitle): the GStreamer pipeline does NOT surface
+ * embedded container subtitles to the web layer. `textTracks` stays empty, the
+ * `umsmediainfo` event never fires in this app context, a webOS `mediaOption`
+ * (both as a URL query and on a <source type>) does not enable it, and the
+ * luna com.webos.media track methods are "not handled" on this build. There is
+ * no element-level subtitle property either. So embedded-MKV subtitles are not
+ * selectable/renderable from here; this path only handles sidecar/HTML text
+ * tracks when they exist. (Multi-AUDIO on the same files works via the native
+ * AudioTrackList — see cycleAudioTrack.)
+ */
 function cycleSubtitleTrack(): void {
   if (activeHls?.subtitleTracks.length) {
     const next = activeHls.subtitleTrack + 1 >= activeHls.subtitleTracks.length ? -1 : activeHls.subtitleTrack + 1
@@ -7278,12 +7323,12 @@ function cycleSubtitleTrack(): void {
     const tracks = video?.textTracks
 
     if (tracks?.length) {
-      const activeIndex = Array.from(tracks).findIndex((track) => track.mode === 'showing')
-      const nextIndex = activeIndex + 1 >= tracks.length ? -1 : activeIndex + 1
+      const nextIndex = nextTextIndex(Array.from(tracks))
       Array.from(tracks).forEach((track, index) => {
         track.mode = index === nextIndex ? 'showing' : 'disabled'
       })
-      showToast(nextIndex >= 0 ? 'Subtitles on' : 'Subtitles off')
+      const chosen = nextIndex >= 0 ? tracks[nextIndex] : undefined
+      showToast(nextIndex >= 0 ? `Subtitles: ${trackLabel(chosen, nextIndex)}` : 'Subtitles off')
     } else {
       showToast('No subtitle tracks available.')
     }
