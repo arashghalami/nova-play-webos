@@ -54,8 +54,8 @@ searches from the repo root will hit them; Grep/Glob will not.
 
 | File | Size |
 |---|---|
-| `src/main.ts` | 8,221 lines (~85k tokens) |
-| `src/library/catalog-repository.ts` | 4,316 lines |
+| `src/main.ts` | 9,397 lines (~85k tokens) |
+| `src/library/catalog-repository.ts` | 4,904 lines |
 | `src/style.css` | 86 KB |
 | `docs/library-engine/journal/2026-08-04.md` | 93 KB (largest journal day) |
 | `docs/library-engine/contracts.md` | 61 KB |
