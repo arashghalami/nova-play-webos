@@ -2179,7 +2179,12 @@ function renderDetails(): void {
   }
 
   const metadata = metadataForCurrentDetail()
-  const media = metadata.cover ?? item.cover ?? item.icon
+  // A resolved artwork override (Part B) wins over the provider cover here too,
+  // so the detail "video card" poster matches the corrected catalog/search art
+  // instead of the provider's degenerate thumbnail. Falls through to the
+  // provider chain when there is no positive override.
+  const media =
+    deliveryArtworkOverride(item) ?? metadata.cover ?? item.cover ?? item.icon
   const description = metadata.plot ?? item.plot ?? 'No description provided by this IPTV provider.'
   const detailFacts = [
     metadata.genre,
@@ -6467,6 +6472,26 @@ async function enrichSelectedTitle(
     if (current) {
       selectedTitleEnrichment = enrichment
       titleEnrichmentLoading = false
+      // Part B backfill from the detail view: opening a card (e.g. from search)
+      // resolves the title's poster even if the catalog never settled its image.
+      // Persist it into the artwork override store so the detail poster, and the
+      // catalog/search cards, and a later reload all show the real art. VOD only
+      // (this whole function already excludes live); movies only, since a series
+      // parent's poster is handled by its own art.
+      if (
+        enrichment?.poster &&
+        profile &&
+        item.section !== 'series' &&
+        item.streamType !== 'episode' &&
+        !artworkRecords.has(streamLookupKey(item))
+      ) {
+        artworkRecords.set(streamLookupKey(item), {
+          streamKey: streamLookupKey(item),
+          poster: enrichment.poster,
+          updatedAt: Date.now(),
+        })
+        saveArtworkRecords(profile.id, artworkRecords)
+      }
       renderDetails()
     }
   } catch {

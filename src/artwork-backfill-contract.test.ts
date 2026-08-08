@@ -85,6 +85,20 @@ describe('artwork backfill contract (Part B)', () => {
     expect(poster).toMatch(/deliveryArtworkOverride\(stream\)[\s\S]{0,80}stream\.cover/)
   })
 
+  it('the detail view poster also consults the override before the provider cover', () => {
+    const details = fnBody(mainSource, 'function renderDetails(): void {')
+    // The detail "video card" media source must prefer the override so it matches
+    // the corrected catalog/search art, not the provider's degenerate thumbnail.
+    expect(details).toMatch(/deliveryArtworkOverride\(item\)[\s\S]{0,60}metadata\.cover/)
+  })
+
+  it('backfills the override store when detail enrichment resolves a poster', () => {
+    // Opening a card (e.g. from search) can resolve a poster even if the catalog
+    // never settled the image; that poster must be persisted so cards/reload get
+    // it. Guard the persistence, gated to non-negative + VOD + no existing record.
+    expect(mainSource).toMatch(/enrichment\?\.poster\s*&&[\s\S]{0,200}artworkRecords\.set\(/)
+  })
+
   it('hydrates overrides synchronously and resets them on profile switch', () => {
     expect(mainSource).toMatch(/let artworkRecords = profile\s*[\s\S]*?loadArtworkRecords\(profile\.id\)/)
     expect(mainSource).toMatch(/artworkRecords = loadArtworkRecords\(nextProfile\.id\)/)
