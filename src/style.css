@@ -2030,7 +2030,7 @@ select:focus,
 
 .brand {
   border-radius: 999px;
-  transition: color var(--motion-fast) var(--motion-ease), transform var(--motion-fast) var(--motion-ease);
+  transition: transform var(--motion-fast) var(--motion-ease);
 }
 
 .brand:focus {
@@ -2066,9 +2066,7 @@ select:focus,
   background: transparent;
   border: 0;
   border-radius: 50%;
-  transition:
-    color var(--motion-focus) var(--motion-ease),
-    transform var(--motion-focus) var(--motion-ease);
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .icon-button:hover {
@@ -2105,9 +2103,7 @@ select:focus,
   border-radius: 999px;
   font-weight: 700;
   letter-spacing: 0.01em;
-  transition:
-    color var(--motion-focus) var(--motion-ease),
-    transform var(--motion-focus) var(--motion-ease);
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .primary-button {
@@ -3195,7 +3191,7 @@ kbd {
   border-radius: 999px;
   font-size: var(--fs-label);
   font-weight: 700;
-  transition: color var(--motion-focus) var(--motion-ease), transform var(--motion-focus) var(--motion-ease);
+  transition: transform var(--motion-focus) var(--motion-ease);
 }
 
 .season-pill > * + * {
