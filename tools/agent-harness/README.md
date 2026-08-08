@@ -135,8 +135,14 @@ Two modes, and the difference matters:
   working tree is untouched and unreachable. Review the branch, then merge or
   delete it.
 
-Use `--worktree` for anything that implements. Use the default for read-only
-investigation.
+- **`--write`.** Real writes in `--root` **without** creating a worktree. This
+  exists so a second agent can verify or fix inside a worktree the first one
+  already made — `--worktree` would branch a fresh copy from `HEAD` and lose
+  those changes. It is a footgun anywhere else: point it at your actual
+  checkout and the agent edits it directly.
+
+Use `--worktree` for anything that implements, `--write` only to work inside an
+existing worktree, and the default for read-only investigation.
 
 In both modes:
 

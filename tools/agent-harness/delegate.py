@@ -83,6 +83,7 @@ ALLOWED_CMDS = [
     ["git", "status"], ["git", "diff"], ["git", "log"],
     ["node", "scripts/*"],
     ["python", "-m", "py_compile", "*"],
+    ["python", "tools/agent-harness/*"],   # symmetric with node scripts/*: run a self-test
 ]
 
 TOOL_DOCS = [
@@ -624,6 +625,10 @@ def main():
     ap.add_argument("--patch", default="agent.patch")
     ap.add_argument("--transcript")
     ap.add_argument("--label", default="agent")
+    ap.add_argument("--write", action="store_true",
+                    help="real writes in --root without creating a worktree. Only safe "
+                         "when --root is already a disposable worktree; otherwise the "
+                         "agent edits your actual tree.")
     ap.add_argument("--worktree", action="store_true",
                     help="run in a disposable git worktree with REAL writes, so the "
                          "agent can run tests against its own edits")
@@ -644,7 +649,7 @@ def main():
     wt_path = None
     if args.worktree:
         wt_path, wt_branch = make_worktree(main_root, args.label)
-    run = Runner(wt_path or args.root, "disk" if wt_path else "stage")
+    run = Runner(wt_path or args.root, "disk" if (wt_path or args.write) else "stage")
 
     tpath = args.transcript or os.path.join(
         args.root, ".claude", "agent-runs",
