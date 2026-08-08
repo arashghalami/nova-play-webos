@@ -82,6 +82,10 @@ export function transitionPropertyClass(property) {
     return 'blanket'
   }
 
+  if (property === 'transform' || property === 'opacity') {
+    return null
+  }
+
   if (PAINT_PROPERTIES.has(property)) {
     return 'paint'
   }
@@ -90,7 +94,7 @@ export function transitionPropertyClass(property) {
     return 'layout'
   }
 
-  return null
+  return 'non-compositor'
 }
 
 /** Splits on top-level commas, ignoring commas inside functions. */
@@ -155,10 +159,11 @@ function tokenize(segment) {
 }
 
 /**
- * Returns the property a `transition` shorthand segment applies to, or null when
- * the segment names only timings. Returns UNRESOLVED_PROPERTY when the segment
- * cannot be attributed — the caller reports that rather than assuming it is
- * safe, so the check fails closed.
+ * Returns the property a `transition` shorthand segment applies to, or null for
+ * an empty or `none` segment. CSS defaults an omitted transition-property to
+ * `all`. Returns UNRESOLVED_PROPERTY when the segment cannot be attributed —
+ * the caller reports that rather than assuming it is safe, so the check fails
+ * closed.
  */
 function segmentProperty(segment) {
   const tokens = tokenize(segment)
@@ -181,8 +186,12 @@ function segmentProperty(segment) {
     return lower
   }
 
-  // A segment of pure timings (`200ms ease`) transitions nothing on its own.
-  return tokens.some((token) => token.toLowerCase().includes('var(')) ? UNRESOLVED_PROPERTY : null
+  // A timing-only shorthand (`200ms ease`) defaults transition-property to `all`.
+  return tokens.some((token) => token.toLowerCase().includes('var('))
+    ? UNRESOLVED_PROPERTY
+    : tokens.length
+      ? 'all'
+      : null
 }
 
 function transitionedProperties(declaration) {
