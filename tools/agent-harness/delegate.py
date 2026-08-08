@@ -595,6 +595,18 @@ def call_model(url, key, payload, mode, tr, anomaly_path, turn):
     backoffs = [2, 8, 20]      # seconds before attempts 2, 3, 4
     resp = None
     for attempt in range(1, 5):
+        # Pre-call heartbeat: the transcript is otherwise only written AFTER a
+        # reply arrives, so a legitimately slow xhigh call is indistinguishable
+        # from a wedged one. Emit one short line to transcript AND stderr the
+        # instant a call (or retry) starts, so a working-but-slow agent stays
+        # visible. This fires per attempt, so retries are seen as they happen.
+        req_bytes = len(json.dumps(payload).encode())
+        n_msgs = len(payload.get("messages") or [])
+        hb = (f"[{turn:>2}] calling {payload.get('model')} "
+              f"(attempt {attempt}/4, {n_msgs} msgs, ~{req_bytes} bytes) ...")
+        if tr is not None:
+            tr.write(f"\n_{hb}_")
+        print("  " + hb, file=sys.stderr, flush=True)
         resp = chat(url, key, payload)
         if advances(resp, mode):
             return resp, True
