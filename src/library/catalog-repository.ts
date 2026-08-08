@@ -4864,15 +4864,40 @@ function utf8ByteLength(value: string): number {
   return bytes
 }
 
+/**
+ * Cooperative macrotask yield. Production uses a real `setTimeout(0)` so the
+ * webOS device measurements reflect true event-loop turnaround between bounded
+ * write units. Tests may swap in a faster real macrotask (see
+ * `setCooperativeMacrotaskSchedulerForTests`) because, under Node with
+ * fake-indexeddb, every `setTimeout(0)` is clamped to ~15 ms; a large workload
+ * pays that clamp thousands of times and blows the test timeout even though
+ * each IndexedDB put is sub-millisecond. The seam must stay a genuine
+ * macrotask, not a microtask, so IndexedDB transaction auto-commit boundaries
+ * are preserved.
+ */
+let scheduleCooperativeMacrotask: () => Promise<void> = () =>
+  new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0))
+
+/**
+ * Test-only override for the cooperative macrotask scheduler. Passing
+ * `undefined` restores the production `setTimeout(0)` behavior. This never
+ * affects packaged builds; it exists so large cooperative-write suites can run
+ * without paying Node's ~15 ms timer clamp per yield.
+ */
+export function setCooperativeMacrotaskSchedulerForTests(
+  scheduler: (() => Promise<void>) | undefined,
+): void {
+  scheduleCooperativeMacrotask =
+    scheduler ?? (() => new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0)))
+}
+
 function defaultYield(): Promise<void> {
-  return new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0))
+  return scheduleCooperativeMacrotask()
 }
 
 function nextEventLoopTurn(): Promise<number> {
   const startedAt = monotonicNow()
-  return new Promise<number>((resolve) => {
-    globalThis.setTimeout(() => resolve(monotonicNow() - startedAt), 0)
-  })
+  return scheduleCooperativeMacrotask().then(() => monotonicNow() - startedAt)
 }
 
 function monotonicNow(): number {

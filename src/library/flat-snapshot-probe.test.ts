@@ -101,6 +101,18 @@ describe('flat snapshot capability probe', () => {
       itemsPerSnapshot: 8,
       targetPayloadBytes: 2 * 1024,
       cleanup: false,
+      // The cooperative macrotask yield exists to measure real
+      // `setTimeout(0)` turnaround on the device. Under Node + fake-indexeddb
+      // each of the ~3,165 yields costs ~14 ms, so a real-timer run of this
+      // 1,055-unit workload takes ~45 s and blows any sane test timeout even
+      // though every IndexedDB put is sub-millisecond. Inject a fast yield so
+      // this test exercises the atomicity/coverage contract, not timer latency.
+      // The delay is still honored so any future inter-unit pacing stays real;
+      // this workload uses the default `interUnitDelayMs` of 0.
+      scheduleMacrotask: (delayMs) =>
+        delayMs > 0
+          ? new Promise<void>((resolve) => globalThis.setTimeout(resolve, delayMs))
+          : Promise.resolve(),
     })
 
     expect(report).toMatchObject({
@@ -121,7 +133,7 @@ describe('flat snapshot capability probe', () => {
     expect(
       report.measurements.filter((measurement) => measurement.operation === 'cooperative-yield'),
     ).toHaveLength(1_055)
-  }, 20_000)
+  })
 
   it('cancels a cooperative write promptly when playback starts', async () => {
     const databaseName = uniqueDatabaseName()
