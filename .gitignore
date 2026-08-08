@@ -48,3 +48,6 @@ docs/superpowers/
 # Delegated-agent run logs and staged patches (local tooling output).
 .claude/agent-runs/
 *.patch
+
+# Disposable agent worktrees.
+.claude/worktrees/
