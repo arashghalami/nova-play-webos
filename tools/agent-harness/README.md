@@ -99,6 +99,13 @@ python ~/.claude/bin/fanout.py --synthesize --deadline 900 \
   --agent "anthropic_tool_call.claude-opus-4-8-think|high|main-thread blocking"
 ```
 
+**Self-test.** `tools/agent-harness/selftest_resilience.py` exercises the retry,
+sentinel and anomaly-logging paths. Run it with:
+
+```sh
+python tools/agent-harness/selftest_resilience.py
+```
+
 ## Watching and steering a run
 
 Every run writes a live transcript to `.claude/agent-runs/` containing the
@@ -162,10 +169,32 @@ thing to suspect; the transcript shows exactly what it read.
   junction (`mklink /J`, no admin needed). The POSIX `os.symlink` branch is
   written but untested — if you are on macOS or Linux, expect to debug that
   first.
-- **Native tool calling with `anthropic_tool_call.*` has failed repeatedly** in
-  long agent loops, returning a bare `Error:` after 10–20 tool calls. The cause
-  was never established. `--tool-mode prompt` works with that model and is the
-  reliable path until someone diagnoses it properly.
+- **Native tool calling with `anthropic_tool_call.*`: a failure seen 3 times,
+  not reproduced since.** The bare `Error:` after a run of tool calls was
+  observed 3 times in one window and has **not** been reproduced across five
+  controlled attempts since: 30-turn loops, 568KB payloads, 4-way parallel tool
+  calls, replaying `<think>` blocks versus stripping them, and both read-only
+  and implementation tasks. Native tool calling has since completed real tasks
+  repeatedly.
+
+  The best-supported explanation is **gateway latency, not a tool-calling
+  defect**. A stalled upstream surfaces as a client-side `TimeoutError` if the
+  client gives up first, or as HTTP 200 with content `Error: ` if OpenWebUI
+  gives up first — because `str(TimeoutError())` is the empty string and the
+  gateway appears to stringify the exception. A real 900-second hang against
+  this gateway was observed during this work.
+
+  This is a **hypothesis with supporting evidence, not a confirmed diagnosis**.
+  Confirming it needs the gateway operator's logs, so anomaly records capture
+  the gateway's response id as a correlation handle.
+
+  The harness now retries non-advancing replies and transport failures with
+  jittered backoff, logs anomalies to a `.anomalies.jsonl` beside the
+  transcript, and never treats a reply that called no tool as a final answer.
+
+  `--tool-mode prompt` remains genuinely required for the `gpt-5.6-*` family,
+  which rejects native tools whenever `reasoning_effort` is set. That was always
+  true and is unaffected by the above.
 - `usage` is not always returned by the gateway, so token counts in the run
   footer are sometimes `0`. That means "not reported", not "free".
 - The synthesis step in `fanout.py` is a single model call over the agents'

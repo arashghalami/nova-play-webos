@@ -51,3 +51,7 @@ docs/superpowers/
 
 # Disposable agent worktrees.
 .claude/worktrees/
+
+# Python bytecode from the agent harness self-test.
+__pycache__/
+*.pyc

@@ -1,6 +1,7 @@
 import { copyFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { defineConfig, loadEnv } from 'vite'
+import { configDefaults } from 'vitest/config'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, __dirname, 'VITE_')
@@ -11,6 +12,17 @@ export default defineConfig(({ mode }) => {
   let bundledMediaEngineIds: string[] = []
 
   return {
+    test: {
+      /*
+       * Delegated agents create disposable git worktrees under .claude/worktrees/,
+       * each containing a full copy of src/ (and its *.test.ts files). Without this
+       * exclude, vitest's default discovery walks into those duplicated trees and
+       * double-counts the suite; worse, a stale worktree can fail the build with
+       * tests that are not the working tree's. Keep vitest's built-in excludes and
+       * add .claude/** on top.
+       */
+      exclude: [...configDefaults.exclude, '.claude/**'],
+    },
     base: './',
     define: {
       __NOVA_METADATA_PROXY_CONFIGURED__: JSON.stringify(metadataProxyConfigured),

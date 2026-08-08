@@ -35,6 +35,10 @@ SAFETY (deliberately conservative -- widen only on request)
     pipes, globbing, chaining or substitution is possible
   * write_file never touches disk; writes are emitted as a patch for review
   * hard iteration cap
+  * transport timeouts (client-side read timeout) and non-advancing replies
+    (a 200 that carried no tool action) are both treated as the same
+    retryable condition and retried with jittered backoff, never crashing
+    the run; genuinely terminal HTTP auth failures (401/403) still exit
 """
 import argparse
 import datetime
@@ -42,10 +46,13 @@ import difflib
 import fnmatch
 import json
 import os
+import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -53,6 +60,14 @@ CONF = os.path.join(os.path.expanduser("~"), ".claude", ".openwebui.env")
 DEFAULT_MODEL = "anthropic_tool_call.claude-opus-4-8-think"
 MAX_RESULT_CHARS = 100_000
 CMD_TIMEOUT = 600
+
+# Per-request read timeout, seconds. Tradeoff: reasoning models at xhigh effort
+# legitimately take minutes to reply, so this must stay generous or we would
+# abort perfectly healthy calls. But an unbounded wait is worse -- a single
+# wedged upstream connection would hang the whole run forever with no recovery,
+# turning one slow call into a dead run. A bounded-but-generous timeout lets the
+# retry path (see call_model) recover instead.
+REQUEST_TIMEOUT = 600
 
 # Argv prefix rules. Each element is an fnmatch pattern, so a rule can name a
 # path shape. Matched element-wise over the first len(rule) argv entries, never
@@ -67,6 +82,7 @@ ALLOWED_CMDS = [
     ["npx", "vitest", "run"], ["npx", "vitest", "run", "*"], ["npx", "tsc"],
     ["git", "status"], ["git", "diff"], ["git", "log"],
     ["node", "scripts/*"],
+    ["python", "-m", "py_compile", "*"],
 ]
 
 TOOL_DOCS = [
@@ -486,12 +502,114 @@ def chat(url, key, payload):
     req.add_header("Authorization", "Bearer " + key)
     req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=900) as r:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
-        sys.exit(f"error: HTTP {e.code}\n{e.read()[:600].decode(errors='replace')}")
+        # Auth failures are terminal: retrying a bad/expired key is pointless,
+        # so exit rather than burn the retry budget.
+        if e.code in (401, 403):
+            sys.exit(f"error: HTTP {e.code}\n{e.read()[:600].decode(errors='replace')}")
+        # Other HTTP errors (e.g. 5xx from a struggling gateway) are transient:
+        # hand a sentinel back so call_model retries instead of dying.
+        return {"_transient": f"HTTP {e.code} after {REQUEST_TIMEOUT}s"}
+    except (TimeoutError, socket.timeout):
+        # Client-side read timeout. TimeoutError is NOT a subclass of URLError,
+        # so it would otherwise propagate and kill the whole run. Note that the
+        # same slow upstream can instead surface as a 200 whose content is a
+        # bare "Error:" (str(TimeoutError()) is ""); advances() rejects that,
+        # so both symptoms funnel into the identical retry path.
+        return {"_transient": f"read timeout after {REQUEST_TIMEOUT}s"}
     except urllib.error.URLError as e:
-        sys.exit(f"error: cannot reach gateway: {e.reason}")
+        # Connection-level failure (DNS, refused, reset). Transient: retry.
+        return {"_transient": f"cannot reach gateway: {e.reason}"}
+
+
+def advances(resp, mode):
+    # True when the reply gives the loop something to act on. WHY this exists:
+    # "no tool calls" must never again be conflated with "the model is done".
+    # A reply with no tool_calls (native) or no tool block (prompt) used to be
+    # accepted as the final answer, so a gateway hiccup that returned a bare
+    # "Error:" with no tool_calls got reported as a run's result. finish is
+    # itself a tool, so a genuine completion still advances the loop.
+    # A transient transport failure (see chat) is signalled by the sentinel
+    # dict, which has no "choices"; it never advances, so call_model retries.
+    # Test key PRESENCE, not truthiness: an empty message ({"_transient": ""})
+    # is still a transport failure, and a truthiness test would fall through to
+    # resp["choices"] and reintroduce the KeyError this sentinel exists to
+    # prevent. The isinstance guard keeps a None or list from raising here.
+    if isinstance(resp, dict) and "_transient" in resp:
+        return False
+    msg = resp["choices"][0]["message"]
+    if mode == "native":
+        return bool(msg.get("tool_calls"))
+    return TOOL_BLOCK.search(msg.get("content") or "") is not None
+
+
+def log_anomaly(anomaly_path, turn, attempt, mode, payload, resp):
+    # One JSON object per line, appended. NOTE: the gateway returns usage as
+    # null, so we deliberately do NOT rely on token counts to detect anomalies;
+    # the signal is purely "the reply did not advance the loop".
+    request_bytes = len(json.dumps(payload).encode())
+    # Classify by key PRESENCE, not truthiness: a falsey sentinel such as
+    # {"_transient": ""} is still a transport failure and has no "choices".
+    # A truthiness test would mislabel it "no_advance" and then index it as a
+    # normal response, reintroducing the KeyError the sentinel exists to prevent.
+    is_transient = isinstance(resp, dict) and "_transient" in resp
+    transient = resp.get("_transient") if isinstance(resp, dict) else None
+    rec = {
+        "turn": turn,
+        "attempt": attempt,
+        "mode": mode,
+        "model": payload.get("model"),
+        # "cause" distinguishes the two ways a call fails to advance the loop:
+        # "transport" is a client-side/gateway transport failure (e.g. a read
+        # timeout), "no_advance" is a well-formed 200 that carried no tool
+        # action. Keeping them apart matters when correlating with the gateway
+        # operator: only the latter implies the model itself misbehaved.
+        "cause": "transport" if is_transient else "no_advance",
+        "transient": transient,
+        "messages_in_request": len(payload.get("messages") or []),
+        "request_bytes": request_bytes,
+        "response": resp,
+    }
+    if not is_transient:
+        msg = resp["choices"][0]["message"]
+        # top-level "id" is the gateway's correlation id -- the only handle for
+        # reporting this upstream.
+        rec["response_id"] = resp.get("id")
+        rec["finish_reason"] = resp["choices"][0].get("finish_reason")
+        rec["content"] = msg.get("content")
+    with open(anomaly_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec) + "\n")
+
+
+def call_model(url, key, payload, mode, tr, anomaly_path, turn):
+    # Wraps chat() with retries when the reply does not advance the loop.
+    # Retrying is side-effect free: it happens BEFORE any tool of that turn
+    # executes, so nothing on disk has changed yet. 4 attempts total.
+    #
+    # Jitter matters because several agents run in parallel via fanout.py; a
+    # fixed backoff would make them all retry in lockstep and re-hammer a
+    # struggling gateway at the same instants.
+    backoffs = [2, 8, 20]      # seconds before attempts 2, 3, 4
+    resp = None
+    for attempt in range(1, 5):
+        resp = chat(url, key, payload)
+        if advances(resp, mode):
+            return resp, True
+        log_anomaly(anomaly_path, turn, attempt, mode, payload, resp)
+        # Presence, not truthiness: a falsey sentinel ({"_transient": ""}) is
+        # still a transport failure, so classify it as one for the log message.
+        is_transient = isinstance(resp, dict) and "_transient" in resp
+        transient = resp.get("_transient") if isinstance(resp, dict) else None
+        reason = (f"transport failure ({transient})" if is_transient
+                  else "reply carried no tool action")
+        print(f"  [{turn:>2}] anomaly: {reason} "
+              f"(attempt {attempt}/4)", file=sys.stderr, flush=True)
+        if attempt < 4:
+            delay = backoffs[attempt - 1] * random.uniform(0.75, 1.25)
+            time.sleep(delay)
+    return resp, False
 
 
 def main():
@@ -539,19 +657,41 @@ def main():
         "", "## Task", "", args.task, "", "---"]))
     print(f"transcript: {tpath}", file=sys.stderr, flush=True)
 
+    # Sibling files next to the transcript.
+    anomaly_path = tpath[:-3] + ".anomalies.jsonl" if tpath.endswith(".md") \
+        else tpath + ".anomalies.jsonl"
+    messages_path = tpath[:-3] + ".messages.jsonl" if tpath.endswith(".md") \
+        else tpath + ".messages.jsonl"
+
+    # Message journalling: every message appended to msgs is written here as one
+    # JSON line, write-only, for post-mortem analysis of a dead run.
+    #
+    # A --resume flag is deliberately NOT implemented: replaying a journalled turn
+    # would re-execute tools that already wrote to disk (write_file, replace_in_file,
+    # run_command), which needs idempotency keys before it is safe.
+    def journal(m):
+        with open(messages_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(m) + "\n")
+
+    def add_msg(m):
+        msgs.append(m)
+        journal(m)
+
     system = prompt_system() if mode == "prompt" else BASE_RULES
-    msgs = [{"role": "system", "content": system},
-            {"role": "user", "content": args.task}]
+    msgs = []
+    add_msg({"role": "system", "content": system})
+    add_msg({"role": "user", "content": args.task})
     sent = recv = 0
     final = None
-    nudges = 0        # consecutive replies that carried no tool block
+    nudges = 0        # consecutive replies that carried no tool action
+    wrap_up = False   # take the partial-report path (cap reached, or gave up)
 
     for i in range(1, args.max_iters + 1):
         if os.path.exists(steer_path):                 # human course-correction
             guidance = open(steer_path, encoding="utf-8").read().strip()
             if guidance:
-                msgs.append({"role": "user",
-                             "content": f"[operator guidance] {guidance}"})
+                add_msg({"role": "user",
+                         "content": f"[operator guidance] {guidance}"})
                 tr.write(f"\n### [{i}] OPERATOR GUIDANCE\n\n> {guidance}")
                 print(f"  [{i:>2}] <-- operator guidance injected", file=sys.stderr, flush=True)
             open(steer_path, "w").close()
@@ -563,25 +703,49 @@ def main():
             payload["tools"] = native_tools()
             payload["tool_choice"] = "auto"
 
-        resp = chat(url, key, payload)
+        resp, ok = call_model(url, key, payload, mode, tr, anomaly_path, i)
         u = resp.get("usage") or {}
         sent += u.get("prompt_tokens") or 0
         recv += u.get("completion_tokens") or 0
-        msg = resp["choices"][0]["message"]
+        # resp may be the transient sentinel (no "choices") when ok is False, so
+        # extract defensively rather than indexing -- otherwise the very timeout
+        # we are hardening against would crash here instead of being retried.
+        choices = resp.get("choices")
+        msg = choices[0]["message"] if choices else {}
         content = msg.get("content") or ""
+
+        if not ok:
+            # The reply never advanced after 4 attempts. Do NOT end the run on
+            # gateway garbage. Nudge: tell the model it called no tool so nothing
+            # ran, and it must call exactly one tool or finish. Allow at most 2
+            # such nudges; on the third give-up, stop the loop and fall through to
+            # the iteration-cap wrap-up so a partial report is still produced.
+            nudges += 1
+            if nudges >= 3:
+                tr.write("\n**model returned no tool action 3 times; giving up "
+                         "and requesting a wrap-up**")
+                print(f"  [{i:>2}] no tool action after retries x3; wrapping up",
+                      file=sys.stderr, flush=True)
+                wrap_up = True
+                break
+            tr.step(i, content, "NO_TOOL_ACTION", {}, "nudging for a tool call")
+            add_msg({"role": "assistant", "content": content})
+            add_msg({"role": "user", "content":
+                     "You called no tool, so nothing ran. Call exactly one tool "
+                     "now to make progress, or call finish if you are genuinely "
+                     "done."})
+            continue
+        nudges = 0
 
         if mode == "native":
             calls = msg.get("tool_calls")
-            if not calls:
-                final = content
-                tr.step(i, content, None, None, None)
-                break
+            # ok is True, so calls is non-empty here (advances() guarantees it).
             # Reasoning models surface <think> blocks in content. Replaying those
             # verbatim into the next request feeds the upstream API a thinking block
             # it did not author and cannot verify, which is a plausible cause of the
             # gateway returning a bare "Error:" a few turns in. Send the prose only.
             replay = THINK_BLOCK.sub("", content).strip()
-            msgs.append({"role": "assistant", "content": replay, "tool_calls": calls})
+            add_msg({"role": "assistant", "content": replay, "tool_calls": calls})
             stop = False
             for c in calls:
                 name = c["function"]["name"]
@@ -598,38 +762,21 @@ def main():
                     else:
                         result = run.dispatch(name, cargs)
                 tr.step(i, content if c is calls[0] else None, name, cargs, result)
-                msgs.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+                add_msg({"role": "tool", "tool_call_id": c["id"], "content": result})
             if stop:
                 break
         else:
+            # ok is True, so a tool block is present here (advances() guarantees it).
             m = TOOL_BLOCK.search(content)
-            if not m:
-                # A reply with no tool block is usually the model narrating its plan
-                # and stopping, not answering. Treating that as the final report
-                # silently truncates the run, so nudge once and only accept it as
-                # final if it happens twice running.
-                nudges += 1
-                if nudges >= 2:
-                    final = content
-                    tr.step(i, content, None, None, None)
-                    break
-                tr.step(i, content, "NO_TOOL_BLOCK", {}, "nudging for a tool call")
-                msgs.append({"role": "assistant", "content": content})
-                msgs.append({"role": "user", "content":
-                             "You did not emit a tool block, so nothing ran. Reply "
-                             "with exactly one ```tool block now to act on that plan, "
-                             "or call finish if you are genuinely done."})
-                continue
-            nudges = 0
             narration = content[:m.start()].strip()
             try:
                 call = json.loads(m.group(1))
                 name, cargs = call["name"], call.get("args", {})
             except Exception as e:
-                msgs.append({"role": "assistant", "content": content})
-                msgs.append({"role": "user",
-                             "content": f"That tool block was unparseable ({e}). "
-                                        "Re-emit exactly one valid ```tool block."})
+                add_msg({"role": "assistant", "content": content})
+                add_msg({"role": "user",
+                         "content": f"That tool block was unparseable ({e}). "
+                                    "Re-emit exactly one valid ```tool block."})
                 tr.step(i, narration, "PARSE_ERROR", {}, str(e))
                 continue
             if name == "finish":
@@ -638,20 +785,27 @@ def main():
                 break
             result = run.dispatch(name, cargs)
             tr.step(i, narration, name, cargs, result)
-            msgs.append({"role": "assistant", "content": content})
-            msgs.append({"role": "user",
-                         "content": f"Result of {name}:\n\n{result}"})
+            add_msg({"role": "assistant", "content": content})
+            add_msg({"role": "user",
+                     "content": f"Result of {name}:\n\n{result}"})
+        if wrap_up:
+            break
     else:
+        wrap_up = True     # ran to the iteration cap without a finish()
+
+    if wrap_up:
         # The cap is a budget, not a failure. An agent that spent 6 turns reading
         # real files has findings worth keeping, so spend one more call asking for
-        # them rather than discarding the whole run for want of a finish().
+        # them rather than discarding the whole run for want of a finish(). This
+        # same path also serves the give-up case (model returned no tool action
+        # after retries + nudges), so a partial report is always produced.
         tr.write(f"\n**hit the {args.max_iters}-iteration cap; requesting a wrap-up**")
         print(f"  [--] cap reached; asking for a partial report", file=sys.stderr, flush=True)
-        msgs.append({"role": "user", "content":
-                     f"You have reached the {args.max_iters}-iteration limit and cannot "
-                     "call any more tools. Write your final report NOW in plain prose "
-                     "(no tool block) from what you established so far. State clearly "
-                     "which parts are incomplete and what you would have checked next."})
+        add_msg({"role": "user", "content":
+                 f"You have reached the {args.max_iters}-iteration limit and cannot "
+                 "call any more tools. Write your final report NOW in plain prose "
+                 "(no tool block) from what you established so far. State clearly "
+                 "which parts are incomplete and what you would have checked next."})
         wrap = {"model": args.model, "messages": msgs, "stream": False}
         if args.effort != "none":
             wrap["reasoning_effort"] = args.effort
@@ -659,7 +813,10 @@ def main():
         u = resp.get("usage") or {}
         sent += u.get("prompt_tokens") or 0
         recv += u.get("completion_tokens") or 0
-        final = (resp["choices"][0]["message"].get("content") or "").strip()
+        # A transient failure on this single wrap-up call has no retry wrapper;
+        # treat it as an empty report rather than crashing on the missing key.
+        choices = resp.get("choices")
+        final = ((choices[0]["message"].get("content") if choices else "") or "").strip()
         final = TOOL_BLOCK.sub("", final).strip()      # strip a stray block if emitted
         if final:
             final = (f"[PARTIAL - stopped at the {args.max_iters}-iteration cap]\n\n"
