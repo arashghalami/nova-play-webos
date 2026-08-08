@@ -44,3 +44,7 @@ metadata-proxy/.wrangler/
 
 # Superpowers/gstack planning artifacts are tooling output, not project docs.
 docs/superpowers/
+
+# Delegated-agent run logs and staged patches (local tooling output).
+.claude/agent-runs/
+*.patch
