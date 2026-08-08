@@ -104,6 +104,7 @@ export async function runFlatSnapshotProbe(
   const itemsPerSnapshot = positiveInteger(options.itemsPerSnapshot, DEFAULT_ITEMS_PER_SNAPSHOT)
   const targetPayloadBytes = positiveInteger(options.targetPayloadBytes, TARGET_PAYLOAD_BYTES)
   const interUnitDelayMs = nonNegativeInteger(options.interUnitDelayMs, 0)
+  const scheduleMacrotask = options.scheduleMacrotask ?? defaultScheduleMacrotask
   const measurements: CapabilityMeasurement[] = []
   const writeDurations: number[] = []
   const unitDurations: number[] = []
@@ -142,7 +143,7 @@ export async function runFlatSnapshotProbe(
       }
 
       const unitStartedAt = now()
-      const serializationTurn = nextEventLoopTurn()
+      const serializationTurn = nextEventLoopTurn(scheduleMacrotask)
       const serializeStartedAt = now()
       const payload = JSON.stringify(
         createCategorySnapshot(sequence, itemsPerSnapshot, targetPayloadBytes),
@@ -172,6 +173,7 @@ export async function runFlatSnapshotProbe(
         snapshotCount,
         itemsPerSnapshot,
         sequence + 1,
+        scheduleMacrotask,
         options.signal,
       )
       const write = writeResult.measurement
@@ -212,7 +214,7 @@ export async function runFlatSnapshotProbe(
 
       writeDurations.push(write.durationMs)
       preYieldSliceDurations.push(now() - unitStartedAt)
-      const yieldDelay = await yieldToMain(interUnitDelayMs)
+      const yieldDelay = await yieldToMain(scheduleMacrotask, interUnitDelayMs)
       yieldDelays.push(yieldDelay)
       measurements.push(measurement('cooperative-yield', yieldDelay, true, 1, 1))
       unitDurations.push(now() - unitStartedAt)
@@ -423,6 +425,7 @@ async function writeSnapshot(
   snapshotCount: number,
   itemsPerSnapshot: number,
   writesCompleted: number,
+  scheduleMacrotask: (delayMs: number) => Promise<void>,
   signal?: AbortSignal,
 ): Promise<SnapshotWriteResult> {
   const startedAt = now()
@@ -446,7 +449,7 @@ async function writeSnapshot(
         itemsPerSnapshot,
         writesCompleted,
       } satisfies SnapshotProbeRun)
-      const eventLoopTurn = nextEventLoopTurn()
+      const eventLoopTurn = nextEventLoopTurn(scheduleMacrotask)
       await complete
 
       return {
@@ -690,23 +693,26 @@ function requestResult<T>(request: IDBRequest<T>): Promise<T> {
   })
 }
 
-async function nextEventLoopTurn(): Promise<number> {
-  const startedAt = now()
-
-  await new Promise<void>((resolve) => {
-    globalThis.setTimeout(resolve, 0)
+function defaultScheduleMacrotask(delayMs: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    globalThis.setTimeout(resolve, delayMs)
   })
+}
 
+async function nextEventLoopTurn(
+  scheduleMacrotask: (delayMs: number) => Promise<void>,
+): Promise<number> {
+  const startedAt = now()
+  await scheduleMacrotask(0)
   return now() - startedAt
 }
 
-async function yieldToMain(delayMs: number): Promise<number> {
+async function yieldToMain(
+  scheduleMacrotask: (delayMs: number) => Promise<void>,
+  delayMs: number,
+): Promise<number> {
   const startedAt = now()
-
-  await new Promise<void>((resolve) => {
-    globalThis.setTimeout(resolve, delayMs)
-  })
-
+  await scheduleMacrotask(delayMs)
   return now() - startedAt
 }
 

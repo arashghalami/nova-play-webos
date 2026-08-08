@@ -39,6 +39,7 @@ describe('metadata client', () => {
         JSON.stringify({
           tmdbId: '123',
           mediaType: 'movie',
+          poster: 'https://image.tmdb.org/t/p/w342/example.jpg',
           tagline: 'A story',
           contentRatings: [
             {
@@ -101,6 +102,7 @@ describe('metadata client', () => {
     ).resolves.toMatchObject({
       tmdbId: '123',
       mediaType: 'movie',
+      poster: 'https://image.tmdb.org/t/p/w342/example.jpg',
       tagline: 'A story',
       contentRating: {
         value: '12',

@@ -515,6 +515,10 @@ async function resolveTitle(request: Request, env: Env): Promise<Response> {
     mediaType,
     title: titleFor(details, mediaType),
     originalTitle: originalTitleFor(details, mediaType),
+    // The title's own poster (w342), built the same credential-free way as
+    // related[].poster. Lets the client backfill catalog artwork for provider
+    // items that shipped only a degenerate thumbnail.
+    poster: image(details.poster_path, 'w342'),
     tagline: readString(details.tagline),
     contentRatings: ratingResolution.candidates,
     ratingResolution,

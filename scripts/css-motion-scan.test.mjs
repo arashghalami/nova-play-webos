@@ -33,7 +33,7 @@ describe('findTransitionViolations', () => {
     expect(findings[0].line).toBe(1)
   })
 
-  it('reports every banned property in a multi-property transition', () => {
+  it('reports every non-compositor property in a multi-property transition', () => {
     const findings = findTransitionViolations(
       scan(`.card {
         transition:
@@ -44,7 +44,7 @@ describe('findTransitionViolations', () => {
       }`),
     )
 
-    expect(properties(findings).sort()).toEqual(['background', 'border-color'])
+    expect(properties(findings).sort()).toEqual(['background', 'border-color', 'color'])
   })
 
   it('accepts compositor-only transitions', () => {
@@ -55,10 +55,11 @@ describe('findTransitionViolations', () => {
     expect(findings).toEqual([])
   })
 
-  it('accepts a cheap paint property that is not on the ban list', () => {
+  it('rejects an unlisted paint property such as color', () => {
     const findings = findTransitionViolations(scan('.link:focus { transition: color 200ms ease; }'))
 
-    expect(findings).toEqual([])
+    expect(properties(findings)).toEqual(['color'])
+    expect(findings[0].kind).toBe('non-compositor')
   })
 
   it('reports layout-triggering transitions, which cost more than paint', () => {
@@ -73,6 +74,20 @@ describe('findTransitionViolations', () => {
     const findings = findTransitionViolations(scan('.card { transition: all 200ms ease; }'))
 
     expect(properties(findings)).toEqual(['all'])
+  })
+
+  it('reports a timing-only shorthand that defaults to transition: all', () => {
+    const findings = findTransitionViolations(scan('.card { transition: 200ms ease; }'))
+
+    expect(properties(findings)).toEqual(['all'])
+    expect(findings[0].kind).toBe('blanket')
+  })
+
+  it('reports a decimal timing-only shorthand that defaults to transition: all', () => {
+    const findings = findTransitionViolations(scan('.card { transition: .2s ease-in-out; }'))
+
+    expect(properties(findings)).toEqual(['all'])
+    expect(findings[0].kind).toBe('blanket')
   })
 
   it('reports violations nested inside a media query', () => {

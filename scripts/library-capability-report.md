@@ -90,7 +90,9 @@ await window.__NOVA_LIBRARY_PROBE__.cleanup()
 
 Then build and package once without `VITE_ENABLE_LIBRARY_PROBE`. Verify that `window.__NOVA_LIBRARY_PROBE__` is absent.
 
-Append only a sanitized summary and one of these decisions to `LIBRARY_ENGINE_STATUS.md`:
+Append only a sanitized summary and one of these decisions to today's journal file,
+`docs/library-engine/journal/YYYY-MM-DD.md` (create it if absent, and add it to the
+Journal index in `LIBRARY_ENGINE_STATUS.md`):
 
 - `worker-idb`
 - `worker-main-idb`

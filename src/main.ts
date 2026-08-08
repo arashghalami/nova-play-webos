@@ -63,6 +63,18 @@ import { foldText, matchesQuery, normalizeQuery, queryTokens } from './search'
 import { LruTtlCache } from './lru-ttl-cache'
 import { focusScrollDelta } from './focus-scroll'
 import { createAdmissionTrigger } from './image-admission-trigger'
+import {
+  planDeferredImagePromotion,
+  type ArmedCandidate,
+  type PendingCandidate,
+} from './deferred-image-promotion'
+import { classifyArtwork, type ArtworkShape } from './artwork-shape'
+import { nextAudioIndex, nextTextIndex, trackLabel } from './track-selection'
+import {
+  loadArtworkRecords,
+  saveArtworkRecords,
+  type ArtworkRecord,
+} from './artwork-record'
 import { episodeDisplayTitle, episodeThumbnailSources, seasonLabel } from './series-presentation'
 import { dashMediaPlayerFactory } from './dash-player'
 import {
@@ -277,6 +289,30 @@ const DEFERRED_IMAGE_CONCURRENCY = 6
 const WEBOS_DEFERRED_IMAGE_CONCURRENCY = 3
 const DEFERRED_IMAGE_PREFETCH_PX = 480
 const WEBOS_DEFERRED_IMAGE_COOLDOWN_MS = 0
+/*
+ * Two-tier deferred-image attributes.
+ *
+ * Render templates emit the INERT pending attribute only. `promoteDeferredImages`
+ * is the single writer that turns a pending image into an armed
+ * `data-deferred-src` image, and it never arms more than the cap below at once.
+ *
+ * The cap is the structural fix for the observer-cost regression. The geometric
+ * `deferredImageIsNearby` predicate alone does not bound the armed set: on a
+ * 60-card search result most cards are eligible-ish, so an unbounded arm-all
+ * would hand the IntersectionObserver dozens of targets and Chromium 79
+ * recomputes intersection geometry for every observed target synchronously in
+ * the post-layout lifecycle - the measured +10 ms median move and 7-8/20 moves
+ * over 60 ms at 36 targets. Bounding the armed pool bounds the observed target
+ * count directly, keeps `queued.length` able to reach zero so the existing
+ * teardown fires on real surfaces, and stops observer cost scaling with content.
+ *
+ * 16 is well below the 36 that was measured harmful and comfortably above the
+ * webOS concurrency of 3, so the loader never starves: the promoter refills as
+ * images settle and the window scrolls. Tunable from the device session.
+ */
+const DEFERRED_PENDING_SRC_ATTR = 'data-deferred-pending-src'
+const ARMED_DEFERRED_IMAGE_CAP = 24
+const WEBOS_ARMED_DEFERRED_IMAGE_CAP = 16
 const LIBRARY_SYNC_LAUNCH_DELAY_MS = 1_000
 const AMPERSAND = String.fromCharCode(38)
 const ESCAPE_PATTERN = /[&<>"']/g
@@ -556,6 +592,15 @@ let undoResumeTimer: number | null = null
 const expandedGlobalSearchSections = new Set<LibrarySection>()
 let favorites = profile ? loadFavorites(profile.id) : new Map()
 let resumeEntries = profile ? loadResume(profile.id) : new Map<string, ResumeEntry>()
+// Resolved catalog artwork overrides (Part B), hydrated SYNCHRONOUSLY here so
+// posterArtwork can consult them during the very first render — a reload shows a
+// previously-resolved poster with no network. Same shape/lifecycle as
+// resumeEntries, including the profile-switch reset below. Holds positive
+// overrides (a resolved poster URL) and negative markers (null = TMDB had no
+// match), both TTL'd in artwork-record.ts.
+let artworkRecords = profile
+  ? loadArtworkRecords(profile.id)
+  : new Map<string, ArtworkRecord>()
 const knownStreams = new Map<string, StreamItem>()
 const streamCache = new Map<string, CachedStreams>()
 const sectionCategories = new Map<LibrarySection, Category[]>()
@@ -1984,7 +2029,7 @@ function liveArtwork(stream: StreamItem): string {
       suppressRemoteArtworkForLocalLibrary() &&
       isRemoteArtworkSource(stream.icon)
     )
-      ? `<span class="live-logo-frame"><img class="channel-logo live-channel-logo" src="${escape(stream.icon)}" alt="" loading="lazy" /></span>`
+      ? `<span class="live-logo-frame"><img class="channel-logo live-channel-logo" data-shape="logo" src="${escape(stream.icon)}" alt="" loading="lazy" /></span>`
       : ''
 
   return `
@@ -1997,6 +2042,17 @@ function liveArtwork(stream: StreamItem): string {
       </span>
     </span>
   `
+}
+
+/**
+ * A resolved poster override for this stream, or undefined. Only positive
+ * records (a real URL) return a source; a negative marker (null) returns
+ * undefined so the provider source is used. Freshness is enforced on hydration
+ * (30-day TTL); this reads the already-hydrated Map.
+ */
+function deliveryArtworkOverride(stream: StreamItem): string | undefined {
+  const record = artworkRecords.get(streamLookupKey(stream))
+  return record && record.poster ? record.poster : undefined
 }
 
 function catalogArtworkSource(source: string): string {
@@ -2028,7 +2084,18 @@ function posterArtwork(stream: StreamItem): string {
       fallbackSource = fallbackPoster
     }
   } else {
-    source = stream.cover || stream.metadata?.cover || stream.seriesCover || stream.icon
+    // Part B: a resolved artwork override (positive record) wins over the
+    // provider source, so a poster resolved on a prior visit is in the FIRST
+    // paint. A negative marker (poster: null) is not a source; it just means we
+    // already know TMDB has no match, so fall through to the provider source
+    // (which Part A will still gate if degenerate).
+    const override = deliveryArtworkOverride(stream)
+    source =
+      override ||
+      stream.cover ||
+      stream.metadata?.cover ||
+      stream.seriesCover ||
+      stream.icon
   }
 
   if (
@@ -2049,7 +2116,7 @@ function posterArtwork(stream: StreamItem): string {
 
   return `
     <span class="poster-artwork image-deferred">
-      <img class="poster" data-deferred-src="${escape(optimizedSource)}"${fallbackAttr} alt="" />
+      <img class="poster" data-shape="poster" ${DEFERRED_PENDING_SRC_ATTR}="${escape(optimizedSource)}"${fallbackAttr} alt="" />
       <span class="poster-fallback" aria-hidden="true">${escape(stream.name.slice(0, 1))}</span>
     </span>
   `
@@ -2112,7 +2179,12 @@ function renderDetails(): void {
   }
 
   const metadata = metadataForCurrentDetail()
-  const media = metadata.cover ?? item.cover ?? item.icon
+  // A resolved artwork override (Part B) wins over the provider cover here too,
+  // so the detail "video card" poster matches the corrected catalog/search art
+  // instead of the provider's degenerate thumbnail. Falls through to the
+  // provider chain when there is no positive override.
+  const media =
+    deliveryArtworkOverride(item) ?? metadata.cover ?? item.cover ?? item.icon
   const description = metadata.plot ?? item.plot ?? 'No description provided by this IPTV provider.'
   const detailFacts = [
     metadata.genre,
@@ -2433,7 +2505,7 @@ function episodeArtwork(episode: StreamItem): string {
       ? ` data-fallback-src="${escape(optimizedFallback)}"`
       : ''
 
-  return `<img class="episode-image" data-deferred-src="${escape(optimizedPrimary)}"${fallbackAttr} alt="" />${fallback}`
+  return `<img class="episode-image" data-shape="still" ${DEFERRED_PENDING_SRC_ATTR}="${escape(optimizedPrimary)}"${fallbackAttr} alt="" />${fallback}`
 }
 
 function episodeMeta(episode: StreamItem, entry?: ResumeEntry): string {
@@ -4635,6 +4707,85 @@ function deferredImageConcurrency(): number {
     : DEFERRED_IMAGE_CONCURRENCY
 }
 
+function armedDeferredImageCap(): number {
+  return isWebOsRuntime() ? WEBOS_ARMED_DEFERRED_IMAGE_CAP : ARMED_DEFERRED_IMAGE_CAP
+}
+
+/*
+ * The single writer of the two-tier deferred-image contract.
+ *
+ * Render templates emit inert pending images (`data-deferred-pending-src`, no
+ * `src`). This promotes a bounded number of them to armed (`data-deferred-src`),
+ * after which registerDeferredImageAdmissionTargets + scheduleDeferredImageLoads
+ * do the actual observing and loading. It is called at the top of the scheduler's
+ * rAF pass (below), so it inherits every existing admission trigger - render,
+ * scroll, resize, the per-image settle continuation, and the geometry trigger -
+ * and needs no timer of its own. Refill therefore happens for free: when an armed
+ * image settles, the continuation re-enters the scheduler, a cap slot has freed,
+ * and the next-nearest pending image is armed.
+ *
+ * The promote/demote DECISION is the pure planDeferredImagePromotion; this
+ * function is only the DOM adapter (attribute + geometry reads, attribute
+ * writes). Demotion returns a stranded armed image - armed but drifted out of the
+ * prefetch band before the loader admitted it - to pending, so it stops holding a
+ * cap slot the viewport no longer wants; see the pure module for the rationale.
+ */
+function promoteDeferredImages(): void {
+  const pendingEls = Array.from(
+    app.querySelectorAll<HTMLImageElement>(`img[${DEFERRED_PENDING_SRC_ATTR}]`),
+  )
+  const armedEls = Array.from(
+    app.querySelectorAll<HTMLImageElement>('img[data-deferred-src]'),
+  )
+
+  if (!pendingEls.length && !armedEls.length) {
+    return
+  }
+
+  const pending: PendingCandidate[] = pendingEls.map((image, index) => {
+    const rect = image.getBoundingClientRect()
+    return {
+      ref: index,
+      nearby: deferredImageIsNearby(image),
+      distance: Math.abs(rect.top),
+    }
+  })
+
+  const armed: ArmedCandidate[] = armedEls.map((image, index) => ({
+    ref: index,
+    nearby: deferredImageIsNearby(image),
+    loading: image.dataset.deferredLoading === 'true',
+  }))
+
+  const plan = planDeferredImagePromotion(pending, armed, armedDeferredImageCap())
+
+  for (const ref of plan.demote) {
+    const image = armedEls[ref]
+    const source = image.dataset.deferredSrc
+
+    if (source) {
+      image.setAttribute(DEFERRED_PENDING_SRC_ATTR, source)
+      delete image.dataset.deferredSrc
+    }
+  }
+
+  for (const ref of plan.promote) {
+    const image = pendingEls[ref]
+    const source = image.getAttribute(DEFERRED_PENDING_SRC_ATTR)
+
+    if (source) {
+      image.dataset.deferredSrc = source
+      image.removeAttribute(DEFERRED_PENDING_SRC_ATTR)
+    }
+  }
+
+  if (plan.promote.length || plan.demote.length) {
+    // The armed set changed; re-register so the geometry trigger observes the
+    // new armed containers and releases the demoted ones.
+    registerDeferredImageAdmissionTargets()
+  }
+}
+
 /*
  * The fifth admission trigger. The other four - the end of bindEvents(), the
  * window `scroll` and `resize` listeners, and the per-image settle continuation -
@@ -4679,6 +4830,14 @@ const deferredImageAdmissionTrigger = createAdmissionTrigger<Element>({
 function registerDeferredImageAdmissionTargets(): void {
   const targets: Element[] = []
 
+  // Observe ONLY armed containers. The armed set is bounded by the cap, which is
+  // precisely what keeps the observed-target count bounded and the Chromium 79
+  // per-target geometry recompute cheap - observing pending containers too would
+  // put every card back under the observer and reintroduce the regression the cap
+  // exists to fix. Promotion refill for not-yet-armed pending images rides the
+  // window `scroll`/`resize` listeners and the per-image settle continuation,
+  // which call the scheduler (and therefore the promoter) directly; the geometry
+  // observer is only the extra admission path for container/transform reveals.
   app.querySelectorAll<HTMLImageElement>('img[data-deferred-src]').forEach((image) => {
     targets.push(deferredImageContainer(image) ?? image)
   })
@@ -4693,6 +4852,13 @@ function scheduleDeferredImageLoads(): void {
 
   deferredImageScheduleHandle = window.requestAnimationFrame(() => {
     deferredImageScheduleHandle = null
+
+    // Promote first: turn a bounded number of inert pending images into armed
+    // ones before the loader reads the armed queue below. This runs on every
+    // scheduler entry (render, scroll, resize, settle continuation, geometry
+    // trigger), so armed slots freed by a settled image refill on the very next
+    // pass with no separate timer.
+    promoteDeferredImages()
 
     const concurrency = deferredImageConcurrency()
 
@@ -4757,6 +4923,18 @@ function scheduleDeferredImageLoads(): void {
         deferredImageLoads = Math.max(0, deferredImageLoads - 1)
         delete image.dataset.deferredLoading
         container?.classList.remove('image-loading')
+
+        // A successful decode can still be a degenerate placeholder (e.g. a
+        // provider's 100x70 landscape thumbnail in a portrait poster frame) that
+        // will smear under object-fit: cover. Judge the decoded dimensions
+        // against the frame shape declared at template time and, if degenerate,
+        // route through the SAME machinery the failure path uses: try the
+        // data-fallback-src swap, else mark image-unavailable (the letter tile).
+        // Part B later replaces that interim tile with a resolved poster.
+        if (outcome === 'load') {
+          handleDegenerateArtwork(image)
+        }
+
         performanceTrace.event('image', 'deferred-settled', {
           outcome,
           queuedRemaining: app.querySelectorAll('img[data-deferred-src]').length,
@@ -4829,14 +5007,246 @@ function scheduleImageErrorCheck(image: HTMLImageElement): void {
       return
     }
 
-    if (image.classList.contains('live-channel-logo')) {
-      image.closest<HTMLElement>('.live-channel-artwork')?.classList.add('logo-unavailable')
-    } else if (image.classList.contains('episode-image')) {
-      image.closest<HTMLElement>('.episode-art')?.classList.add('image-unavailable')
-    } else {
-      image.closest<HTMLElement>('.poster-artwork')?.classList.add('image-unavailable')
-    }
+    markImageUnavailable(image)
   }, 5_000)
+}
+
+/**
+ * Apply the same "no usable artwork" state the failure paths use: the container
+ * class that reveals the letter/monogram tile. Centralised so the timeout path,
+ * the error path, and the degenerate-artwork path stay identical.
+ */
+function markImageUnavailable(image: HTMLImageElement): void {
+  if (image.classList.contains('live-channel-logo')) {
+    image.closest<HTMLElement>('.live-channel-artwork')?.classList.add('logo-unavailable')
+  } else if (image.classList.contains('episode-image')) {
+    image.closest<HTMLElement>('.episode-art')?.classList.add('image-unavailable')
+  } else {
+    image.closest<HTMLElement>('.poster-artwork')?.classList.add('image-unavailable')
+  }
+}
+
+function artworkShapeOf(image: HTMLImageElement): ArtworkShape {
+  const declared = image.dataset.shape
+  return declared === 'poster' || declared === 'still' || declared === 'logo'
+    ? declared
+    : 'poster'
+}
+
+/**
+ * After a successful decode, reject artwork that is degenerate for its declared
+ * frame shape (the strong case: a landscape thumbnail in a portrait poster
+ * frame, which smears under object-fit: cover). Routes through the existing
+ * fallback→unavailable machinery. Returns true when the image was rejected.
+ *
+ * Only images carrying an explicit data-shape are judged, so this never touches
+ * images outside the deferred-artwork templates.
+ */
+function handleDegenerateArtwork(image: HTMLImageElement): boolean {
+  if (!image.dataset.shape) {
+    return false
+  }
+
+  const verdict = classifyArtwork(artworkShapeOf(image), {
+    width: image.naturalWidth,
+    height: image.naturalHeight,
+  })
+
+  if (verdict !== 'degenerate') {
+    return false
+  }
+
+  performanceTrace.event('image', 'degenerate-rejected', {
+    imageType: image.className || 'unclassified',
+    shape: image.dataset.shape,
+    naturalWidth: image.naturalWidth,
+    naturalHeight: image.naturalHeight,
+  })
+
+  if (tryImageFallbackSwap(image)) {
+    // tryImageFallbackSwap sets image.src to the fallback, but settle's load/
+    // error listeners were once:true and already fired. Attach fresh one-shot
+    // handlers so the fallback is itself re-judged (degenerate → unavailable) and
+    // a failed fallback still resolves to the letter tile. Re-arm the timeout net.
+    image.addEventListener(
+      'load',
+      () => {
+        if (
+          classifyArtwork(artworkShapeOf(image), {
+            width: image.naturalWidth,
+            height: image.naturalHeight,
+          }) === 'degenerate'
+        ) {
+          markImageUnavailable(image)
+        }
+      },
+      { once: true },
+    )
+    image.addEventListener('error', () => markImageUnavailable(image), { once: true })
+    delete image.dataset.errorCheckScheduled
+    scheduleImageErrorCheck(image)
+    return true
+  }
+
+  markImageUnavailable(image)
+  // Part B: the artwork is degenerate and no provider fallback exists — a
+  // genuine backfill candidate. Try to resolve a real poster from TMDB. This is
+  // demand-driven (only from this settled, on-screen image) and bounded; it
+  // patches the element async if a poster is found.
+  queueArtworkResolution(image)
+  return true
+}
+
+/*
+ * Demand-driven catalog-artwork backfill (Part B).
+ *
+ * Triggered ONLY by Part A's degenerate verdict (or a genuinely missing source)
+ * on a settled, on-screen image — never by scanning the catalog. Bounded by a
+ * negative cache (so unmatchable titles are asked once per 30 days), a
+ * concurrency cap reusing the deferred-image discipline, and a per-session
+ * attempt cap as a backstop. VOD only: a TMDB title search against 53k live
+ * channel names is meaningless. Resolved art is persisted and patched into the
+ * live element without blocking render.
+ */
+const ARTWORK_RESOLVE_CONCURRENCY = 2
+const ARTWORK_RESOLVE_SESSION_CAP = 60
+let artworkResolveInFlight = 0
+let artworkResolveSessionAttempts = 0
+const artworkResolveQueue: string[] = []
+const artworkResolveQueued = new Set<string>()
+
+function queueArtworkResolution(image: HTMLImageElement): void {
+  // Posters only (episode stills / live logos are out of scope for TMDB title
+  // resolution) and only the poster shape carries this backfill.
+  if (image.dataset.shape !== 'poster') {
+    return
+  }
+
+  if (!metadataServiceConfigured()) {
+    return
+  }
+
+  const keyHost = image.closest<HTMLElement>('[data-stream-key]')
+  const streamKey = keyHost?.dataset.streamKey
+
+  if (!streamKey) {
+    return
+  }
+
+  const stream = streamFromKey(streamKey)
+
+  // VOD only. Live (and anything without a resolvable stream) is excluded.
+  if (!stream || stream.section === 'live') {
+    return
+  }
+
+  // Negative cache / already-resolved: a hydrated record (positive or negative)
+  // means we already know the answer, so do not re-query.
+  if (artworkRecords.has(streamKey)) {
+    return
+  }
+
+  if (artworkResolveQueued.has(streamKey)) {
+    return
+  }
+
+  if (artworkResolveSessionAttempts >= ARTWORK_RESOLVE_SESSION_CAP) {
+    return
+  }
+
+  artworkResolveQueued.add(streamKey)
+  artworkResolveQueue.push(streamKey)
+  pumpArtworkResolution()
+}
+
+function pumpArtworkResolution(): void {
+  while (
+    artworkResolveInFlight < ARTWORK_RESOLVE_CONCURRENCY &&
+    artworkResolveQueue.length > 0 &&
+    artworkResolveSessionAttempts < ARTWORK_RESOLVE_SESSION_CAP
+  ) {
+    const streamKey = artworkResolveQueue.shift()!
+    void resolveArtworkFor(streamKey)
+  }
+}
+
+async function resolveArtworkFor(streamKey: string): Promise<void> {
+  artworkResolveInFlight += 1
+  artworkResolveSessionAttempts += 1
+
+  try {
+    const stream = streamFromKey(streamKey)
+
+    if (!stream || stream.section === 'live' || !profile) {
+      return
+    }
+
+    const title = metadataLookupTitle(stream.name)
+
+    if (!title) {
+      return
+    }
+
+    let poster: string | null = null
+
+    try {
+      const enrichment = await loadTitleMetadata({
+        mediaType: stream.section === 'series' ? 'tv' : 'movie',
+        title,
+        year: stream.year,
+      })
+      poster = enrichment?.poster ?? null
+    } catch {
+      // Network/resolve failure: do NOT persist a negative marker (that would
+      // suppress a retry for 30 days over a transient error). Just stop.
+      return
+    }
+
+    // Persist positive OR negative (no-match) so a future scroll does not
+    // re-query. A transient failure returned above without reaching here.
+    const record: ArtworkRecord = {
+      streamKey,
+      poster,
+      updatedAt: Date.now(),
+    }
+    artworkRecords.set(streamKey, record)
+    saveArtworkRecords(profile.id, artworkRecords)
+
+    if (poster) {
+      patchResolvedArtwork(streamKey, poster)
+    }
+  } finally {
+    artworkResolveInFlight = Math.max(0, artworkResolveInFlight - 1)
+    artworkResolveQueued.delete(streamKey)
+    pumpArtworkResolution()
+  }
+}
+
+/**
+ * Patch a resolved poster into any on-screen card for this stream, following the
+ * data-now-next-key async-patch pattern. Never blocks render; if the card is no
+ * longer present (scrolled away / navigated) it is a no-op — the persisted
+ * record makes the next render correct anyway.
+ */
+function patchResolvedArtwork(streamKey: string, poster: string): void {
+  const hosts = app.querySelectorAll<HTMLElement>(
+    `[data-stream-key="${cssEscape(streamKey)}"]`,
+  )
+
+  hosts.forEach((host) => {
+    const container = host.querySelector<HTMLElement>('.poster-artwork')
+    const image = host.querySelector<HTMLImageElement>('img.poster')
+
+    if (!container || !image) {
+      return
+    }
+
+    // Clear the interim unavailable/letter-tile state and show the real poster.
+    container.classList.remove('image-unavailable')
+    image.removeAttribute('data-fallback-src')
+    image.dataset.shape = 'poster'
+    image.src = poster
+  })
 }
 
 function bindEvents(): void {
@@ -6062,6 +6472,26 @@ async function enrichSelectedTitle(
     if (current) {
       selectedTitleEnrichment = enrichment
       titleEnrichmentLoading = false
+      // Part B backfill from the detail view: opening a card (e.g. from search)
+      // resolves the title's poster even if the catalog never settled its image.
+      // Persist it into the artwork override store so the detail poster, and the
+      // catalog/search cards, and a later reload all show the real art. VOD only
+      // (this whole function already excludes live); movies only, since a series
+      // parent's poster is handled by its own art.
+      if (
+        enrichment?.poster &&
+        profile &&
+        item.section !== 'series' &&
+        item.streamType !== 'episode' &&
+        !artworkRecords.has(streamLookupKey(item))
+      ) {
+        artworkRecords.set(streamLookupKey(item), {
+          streamKey: streamLookupKey(item),
+          poster: enrichment.poster,
+          updatedAt: Date.now(),
+        })
+        saveArtworkRecords(profile.id, artworkRecords)
+      }
       renderDetails()
     }
   } catch {
@@ -6856,6 +7286,35 @@ function cycleAudioTrack(): void {
     activeHls.audioTrack = (activeHls.audioTrack + 1) % activeHls.audioTracks.length
     const track = activeHls.audioTracks[activeHls.audioTrack]
     showToast(`Audio: ${track?.name ?? `Track ${activeHls.audioTrack + 1}`}`)
+    revealControls()
+    return
+  }
+
+  // Native fallback: webOS exposes multi-audio on native progressive playback
+  // (.mkv/.mp4) through the standard AudioTrackList. hls.js was the only path
+  // consulted before, so native multi-audio titles wrongly reported a single
+  // track. Advance the enabled track via the pure selector and toast its
+  // language.
+  // `audioTracks` (AudioTrackList) is not in the TS DOM lib and is a webOS
+  // native extension here; type the minimal surface we use.
+  const video = document.querySelector<HTMLVideoElement>('#video-player')
+  const audioTracks = (video as unknown as {
+    audioTracks?: {
+      length: number
+      [index: number]: { enabled: boolean; language?: string; label?: string }
+    }
+  } | null)?.audioTracks
+
+  if (audioTracks && audioTracks.length > 1) {
+    const list = Array.from({ length: audioTracks.length }, (_, i) => audioTracks[i])
+    const next = nextAudioIndex(list)
+
+    for (let i = 0; i < audioTracks.length; i += 1) {
+      audioTracks[i].enabled = i === next
+    }
+
+    const chosen = next >= 0 ? audioTracks[next] : undefined
+    showToast(`Audio: ${trackLabel(chosen, next)}`)
   } else {
     showToast('This stream has one audio track.')
   }
@@ -6863,6 +7322,21 @@ function cycleAudioTrack(): void {
   revealControls()
 }
 
+/*
+ * Subtitle cycling. hls.js exposes subtitle renditions directly; for native
+ * playback we can only drive the standard TextTrackList.
+ *
+ * webOS platform limitation (verified on lg-oled-g1 with an .mkv carrying an
+ * embedded S_TEXT/UTF8 subtitle): the GStreamer pipeline does NOT surface
+ * embedded container subtitles to the web layer. `textTracks` stays empty, the
+ * `umsmediainfo` event never fires in this app context, a webOS `mediaOption`
+ * (both as a URL query and on a <source type>) does not enable it, and the
+ * luna com.webos.media track methods are "not handled" on this build. There is
+ * no element-level subtitle property either. So embedded-MKV subtitles are not
+ * selectable/renderable from here; this path only handles sidecar/HTML text
+ * tracks when they exist. (Multi-AUDIO on the same files works via the native
+ * AudioTrackList — see cycleAudioTrack.)
+ */
 function cycleSubtitleTrack(): void {
   if (activeHls?.subtitleTracks.length) {
     const next = activeHls.subtitleTrack + 1 >= activeHls.subtitleTracks.length ? -1 : activeHls.subtitleTrack + 1
@@ -6874,12 +7348,12 @@ function cycleSubtitleTrack(): void {
     const tracks = video?.textTracks
 
     if (tracks?.length) {
-      const activeIndex = Array.from(tracks).findIndex((track) => track.mode === 'showing')
-      const nextIndex = activeIndex + 1 >= tracks.length ? -1 : activeIndex + 1
+      const nextIndex = nextTextIndex(Array.from(tracks))
       Array.from(tracks).forEach((track, index) => {
         track.mode = index === nextIndex ? 'showing' : 'disabled'
       })
-      showToast(nextIndex >= 0 ? 'Subtitles on' : 'Subtitles off')
+      const chosen = nextIndex >= 0 ? tracks[nextIndex] : undefined
+      showToast(nextIndex >= 0 ? `Subtitles: ${trackLabel(chosen, nextIndex)}` : 'Subtitles off')
     } else {
       showToast('No subtitle tracks available.')
     }
@@ -7479,6 +7953,9 @@ function activateProfile(nextProfile: XtreamProfile, nextClient?: ProviderBroker
   settings = loadSettings(nextProfile.id)
   favorites = loadFavorites(nextProfile.id)
   resumeEntries = loadResume(nextProfile.id)
+  // Per-profile: a switched profile must never inherit another user's resolved
+  // artwork (and its negative markers).
+  artworkRecords = loadArtworkRecords(nextProfile.id)
 
   if (repairResumeEpisodeContexts()) {
     saveResume(nextProfile.id, resumeEntries)

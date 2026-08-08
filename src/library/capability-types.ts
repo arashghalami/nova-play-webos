@@ -67,6 +67,19 @@ export type FlatSnapshotProbeOptions = {
   cleanup?: boolean
   signal?: AbortSignal
   onSnapshotCommitted?: (writesCompleted: number) => void
+  /**
+   * Cooperative yield used between snapshot units and to measure event-loop
+   * turnaround. Production leaves this undefined so the probe measures a real
+   * `setTimeout(0)` macrotask on the device. Tests may inject a fast yield to
+   * avoid paying thousands of real macrotask latencies for a large workload.
+   *
+   * The probe calls this with `0` for its event-loop-turn measurements and with
+   * `interUnitDelayMs` for the inter-unit pace, so an injected scheduler must
+   * honor `delayMs` (resolve only after at least that long) whenever a test
+   * relies on inter-unit pacing; a fixed zero-delay yield is only safe when
+   * `interUnitDelayMs` is left at its `0` default.
+   */
+  scheduleMacrotask?: (delayMs: number) => Promise<void>
 }
 
 export type PublicationProbeOptions = {

@@ -22,6 +22,7 @@ import {
   deleteLibraryDatabase,
   openLibraryDatabase,
   clearLibraryMemoryCaches,
+  setCooperativeMacrotaskSchedulerForTests,
   setLibraryPlaybackStarting,
   type LibraryStoreName,
 } from './catalog-repository'
@@ -68,12 +69,30 @@ beforeEach(() => {
   vi.stubGlobal('indexedDB', new IDBFactory())
   vi.stubGlobal('IDBKeyRange', IDBKeyRange)
   setLibraryPlaybackStarting(false)
+  // The cooperative writer yields a real `setTimeout(0)` macrotask between
+  // bounded units so device traces capture true event-loop turnaround. Under
+  // Node + fake-indexeddb every `setTimeout(0)` is clamped to ~15 ms, so a
+  // production-scale workload's thousands of yields dominate wall time and can
+  // exceed the test timeout even though each put is sub-millisecond. Inject
+  // `setImmediate`: still a genuine macrotask (preserving IndexedDB
+  // auto-commit boundaries these tests rely on) but without the timer clamp.
+  const maybeSetImmediate = (globalThis as unknown as {
+    setImmediate?: (callback: () => void) => unknown
+  }).setImmediate
+  const scheduleFastMacrotask: (callback: () => void) => void =
+    typeof maybeSetImmediate === 'function'
+      ? (callback) => void maybeSetImmediate(callback)
+      : (callback) => void globalThis.setTimeout(callback, 0)
+  setCooperativeMacrotaskSchedulerForTests(
+    () => new Promise<void>((resolve) => scheduleFastMacrotask(resolve)),
+  )
 })
 
 afterEach(async () => {
   repositories.splice(0).forEach((repository) => repository.close())
   await Promise.all(databaseNames.splice(0).map(deleteLibraryDatabase))
   setLibraryPlaybackStarting(false)
+  setCooperativeMacrotaskSchedulerForTests(undefined)
   vi.unstubAllGlobals()
 })
 
