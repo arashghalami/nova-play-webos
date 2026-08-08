@@ -45,6 +45,40 @@ SYNTH_MODEL = "gpt-5.6-terra"
 
 LIVE = {}          # idx -> Popen, so a deadline can terminate stragglers
 LIVE_LOCK = threading.Lock()
+MONITORED = {}     # idx -> (lens, tpath), for the stall monitor to inspect
+
+
+def stall_monitor(stop_event, stall_warn_secs):
+    """Warn (never kill) when a running agent's transcript goes quiet.
+
+    A working-but-slow agent and a wedged one look identical from outside; the
+    only cheap signal is whether its transcript is still being written. Every
+    60s we compare each running agent's transcript mtime against a threshold and
+    warn if it has been silent too long. Warnings repeat every threshold so a
+    persistently stalled agent keeps surfacing, but no more often than that so a
+    truly dead agent does not spam. Termination stays exclusively with the
+    per-agent timeout / deadline in main(); this thread only reports.
+    """
+    last_warned = {}   # idx -> monotonic-ish time we last warned about it
+    while not stop_event.wait(60):
+        now = time.time()
+        with LIVE_LOCK:
+            snapshot = list(MONITORED.items())
+        for idx, (lens, tpath) in snapshot:
+            try:
+                mtime = os.path.getmtime(tpath)
+            except OSError:
+                continue   # transcript not created yet; nothing to judge
+            silent = now - mtime
+            if silent < stall_warn_secs:
+                continue
+            if now - last_warned.get(idx, 0.0) < stall_warn_secs:
+                continue   # at most once per threshold interval per agent
+            last_warned[idx] = now
+            print(f"  [{idx}] STALL WARNING: transcript silent for "
+                  f"{silent / 60:.1f} min (threshold {stall_warn_secs / 60:.0f} "
+                  f"min)\n      lens: {lens}\n      still running, NOT killed; "
+                  f"log: {tpath}", file=sys.stderr, flush=True)
 
 
 def run_agent(idx, model, effort, lens, task, root, max_iters, stamp, agent_timeout):
@@ -74,6 +108,7 @@ def run_agent(idx, model, effort, lens, task, root, max_iters, stamp, agent_time
                             text=True)
     with LIVE_LOCK:
         LIVE[idx] = proc
+        MONITORED[idx] = (lens, tpath)
     try:
         out, err = proc.communicate(timeout=agent_timeout)
     except subprocess.TimeoutExpired:
@@ -85,6 +120,7 @@ def run_agent(idx, model, effort, lens, task, root, max_iters, stamp, agent_time
     finally:
         with LIVE_LOCK:
             LIVE.pop(idx, None)
+            MONITORED.pop(idx, None)
     dt = time.time() - t0
     ok = proc.returncode == 0 and (out or "").strip()
     print(f"  [{idx}] {'done ' if ok else 'FAILED'} ({dt:.0f}s) {lens[:45]}",
@@ -165,6 +201,9 @@ def main():
     ap.add_argument("--deadline", type=int, default=0,
                     help="seconds before the whole fanout reports with whatever "
                          "finished, terminating stragglers. 0 = wait for all.")
+    ap.add_argument("--stall-warn-mins", type=int, default=15,
+                    help="warn (never kill) when a running agent's transcript "
+                         "has been silent this many minutes (default 15)")
     ap.add_argument("--synthesize", action="store_true")
     args = ap.parse_args()
 
@@ -183,6 +222,12 @@ def main():
           file=sys.stderr, flush=True)
 
     results, unfinished = [], []
+    stop_monitor = threading.Event()
+    monitor = threading.Thread(
+        target=stall_monitor,
+        args=(stop_monitor, max(1, args.stall_warn_mins) * 60),
+        daemon=True)
+    monitor.start()
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=args.max_parallel)
     futs = {ex.submit(run_agent, i, m, e, l, args.task, root, args.max_iters,
                       stamp, args.agent_timeout): i
@@ -206,25 +251,50 @@ def main():
                 except Exception:
                     pass
     ex.shutdown(wait=False)
+    stop_monitor.set()
     results.sort(key=lambda r: r[0])
+
+    # Persist the full combined output ourselves. If a caller pipes stdout
+    # through `tail`/`head`, the reports are otherwise destroyed and have to be
+    # rebuilt from transcripts; this file is the complete copy of record.
+    combined = []
+
+    def emit(text=""):
+        # Print to stdout exactly as before AND capture for the persisted file,
+        # so the two never drift.
+        print(text)
+        combined.append(text)
 
     ok = [r for r in results if r[3]]
     for idx, model, lens, rep, err, tpath, dt in results:
-        print(f"\n{'='*72}\nAGENT {idx} ({model}, {dt:.0f}s) -- {lens}\n{'='*72}\n")
-        print(rep if rep else f"[no report: {err}]\n[partial transcript: {tpath}]")
+        emit(f"\n{'='*72}\nAGENT {idx} ({model}, {dt:.0f}s) -- {lens}\n{'='*72}\n")
+        emit(rep if rep else f"[no report: {err}]\n[partial transcript: {tpath}]")
     for idx in unfinished:
         m, e, l = specs[idx - 1]
-        print(f"\n{'='*72}\nAGENT {idx} ({m}) -- {l}\n{'='*72}\n"
-              f"[killed at the {args.deadline}s deadline; partial transcript kept]")
+        emit(f"\n{'='*72}\nAGENT {idx} ({m}) -- {l}\n{'='*72}\n"
+             f"[killed at the {args.deadline}s deadline; partial transcript kept]")
 
     if args.synthesize and len(ok) > 1:
-        print(f"\n{'='*72}\nSYNTHESIS\n{'='*72}\n", flush=True)
-        print(synthesize(args.task, results, SYNTH_MODEL))
+        emit(f"\n{'='*72}\nSYNTHESIS\n{'='*72}\n")
+        emit(synthesize(args.task, results, SYNTH_MODEL))
     elif args.synthesize:
         print("\n[synthesis skipped: fewer than two agents produced a report]",
               file=sys.stderr)
 
+    out_path = os.path.join(root, ".claude", "agent-runs", f"{stamp}-fanout.md")
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(combined) + "\n")
+        saved = out_path
+    except OSError as e:
+        saved = None
+        print(f"\nwarning: could not write combined output to {out_path}: {e}",
+              file=sys.stderr, flush=True)
+
     print(f"\n[{len(ok)}/{len(specs)} agents reported]", file=sys.stderr)
+    if saved:
+        print(f"[full combined output saved to {saved}]", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":
