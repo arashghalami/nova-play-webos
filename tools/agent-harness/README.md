@@ -115,6 +115,20 @@ model's narration, each tool call, and a preview of every result:
 tail -f .claude/agent-runs/<stamp>-<label>.md
 ```
 
+Two PowerShell monitors in the repo root read those transcripts so you do not
+have to tail them by hand:
+
+```powershell
+.\agent-dash.ps1            # one-shot table: status, age, last action
+.\agent-dash.ps1 -Think     # ...plus each agent's latest thinking block
+.\agent-watch.ps1           # live view, refreshing; times each wait, flags retries
+.\agent-watch.ps1 -Name plan-v2   # filter to one run
+```
+
+Both parse the pre-call heartbeat, so an agent waiting on a slow model shows as
+`WAIT` with a growing timer rather than looking dead. `RETRY` in magenta means
+the harness is re-issuing a call that came back without a tool action.
+
 To redirect an agent mid-run without killing it, write into the `.steer` file
 beside its transcript. The next turn picks it up as operator guidance:
 
