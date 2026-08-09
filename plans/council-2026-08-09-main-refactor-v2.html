@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Council verdict — main-refactor-v2.md</title>
+<style>
+  :root{
+    --bg:#fbfbfa; --panel:#ffffff; --ink:#1c1c1a; --muted:#6b6b66;
+    --line:#e3e2de; --accent:#7a4a1e; --accent-soft:#f3ece4;
+    --kill:#a33a2a; --kill-bg:#fbeeeb; --ok:#2e6a45; --ok-bg:#ecf5ef;
+    --warn:#8a6a1a; --warn-bg:#f8f2e2;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#17171a; --panel:#1f1f23; --ink:#e9e8e4; --muted:#a3a29c;
+      --line:#33333a; --accent:#d8a86a; --accent-soft:#2a2620;
+      --kill:#e08573; --kill-bg:#2e1f1c; --ok:#7fc39a; --ok-bg:#1b2a21;
+      --warn:#d9b45f; --warn-bg:#2b2618;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#17171a; --panel:#1f1f23; --ink:#e9e8e4; --muted:#a3a29c;
+    --line:#33333a; --accent:#d8a86a; --accent-soft:#2a2620;
+    --kill:#e08573; --kill-bg:#2e1f1c; --ok:#7fc39a; --ok-bg:#1b2a21;
+    --warn:#d9b45f; --warn-bg:#2b2618;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.62 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:920px;margin:0 auto;padding:48px 24px 96px}
+  header{border-bottom:2px solid var(--ink);padding-bottom:22px;margin-bottom:34px}
+  .eyebrow{font-size:12px;letter-spacing:.13em;text-transform:uppercase;color:var(--accent);font-weight:700;margin:0 0 10px}
+  h1{font-size:31px;line-height:1.2;margin:0 0 12px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:14.5px;margin:0}
+  .sub code{font-size:13px}
+  h2{font-size:21px;margin:44px 0 14px;letter-spacing:-.01em;padding-top:8px}
+  h3{font-size:16px;margin:26px 0 8px}
+  p{margin:0 0 13px}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.875em;
+    background:var(--accent-soft);padding:1px 5px;border-radius:4px}
+  .verdict{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);
+    border-radius:8px;padding:24px 26px;margin:0 0 8px}
+  .verdict h2:first-child{margin-top:0}
+  .headline{font-size:19px;line-height:1.45;font-weight:600;margin:0 0 18px}
+  .headline em{color:var(--accent);font-style:normal}
+  ul{margin:0 0 14px;padding-left:22px}
+  li{margin:0 0 8px}
+  .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;margin:18px 0 8px;background:var(--panel)}
+  table{border-collapse:collapse;width:100%;min-width:680px;font-size:13.5px}
+  th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:700;white-space:nowrap}
+  tbody tr:last-child td{border-bottom:none}
+  td.opt{font-weight:600;width:30%;min-width:210px}
+  .pill{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.04em;
+    padding:2px 8px;border-radius:999px;white-space:nowrap}
+  .p-kill{color:var(--kill);background:var(--kill-bg)}
+  .p-ok{color:var(--ok);background:var(--ok-bg)}
+  .p-mix{color:var(--warn);background:var(--warn-bg)}
+  .chair{background:var(--accent-soft)}
+  .note{font-size:13px;color:var(--muted);margin:8px 0 0}
+  details{border:1px solid var(--line);border-radius:8px;background:var(--panel);margin:0 0 10px;overflow:hidden}
+  summary{cursor:pointer;padding:13px 18px;font-weight:600;font-size:14.5px;list-style:none;
+    display:flex;justify-content:space-between;gap:14px;align-items:baseline}
+  summary::-webkit-details-marker{display:none}
+  summary::after{content:"+";color:var(--muted);font-weight:400;font-size:17px}
+  details[open] summary::after{content:"–"}
+  details[open] summary{border-bottom:1px solid var(--line)}
+  .model{font-size:11.5px;color:var(--muted);font-weight:400;letter-spacing:.02em}
+  .body{padding:16px 18px 6px;font-size:14.5px}
+  .body ol{padding-left:20px;margin:0 0 12px}
+  .flag{border:1px solid var(--line);border-left:4px solid var(--warn);border-radius:8px;
+    background:var(--panel);padding:18px 20px;margin:16px 0}
+  .flag h3{margin-top:0}
+  .first{border:1px solid var(--accent);border-radius:8px;background:var(--accent-soft);padding:22px 24px;margin:16px 0 0}
+  .first h2{margin:0 0 12px}
+  footer{margin-top:56px;padding-top:18px;border-top:1px solid var(--line);
+    font-size:12.5px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">LLM Council · Verdict</p>
+  <h1>Should Nova Play commit to <code>main-refactor-v2.md</code>?</h1>
+  <p class="sub">Three-app codebase — webOS TV, Android TV, Android phone — on a shared <code>@nova/engine</code>, across nine gated phases. Judged against constraints the plan did not know: two people, 40 hrs/week total, one Android TV box, one test phone, real users on the shipping webOS app, phone required.</p>
+</header>
+
+<div class="verdict">
+  <p class="headline">Verdict: <em>kill v2 as written.</em> The plan is rigorous but rigorous about the wrong thing — it makes architecture the critical path to a required product, and puts the phone at Phase 7 behind a Phase 6 gate that is explicitly allowed to say “Defer/stop phone.” Build the phone first, prove Android playback in week one, and let the shared engine be earned by duplication rather than assumed up front.</p>
+
+  <h2 style="margin-top:0">Where the council agrees</h2>
+  <ul>
+    <li><strong>Do not commit to v2 as written.</strong> The phone does not begin until Phase 7 — after guard infrastructure, requirements validation, the playback spike, engine extraction, an Android TV product, the Phase 5 <code>apps/webos</code> move, and Phase 6’s experiment.</li>
+    <li><strong>Phone before Android TV.</strong> Phase 4’s Android TV slice is an unjustified detour ahead of the one product that is actually required. Reconsider Android TV only once the phone ships and its support burden is known.</li>
+    <li><strong>Run the Android playback canary before Phase 0.</strong> <code>spikes/android-playback/</code> moves no shipping source and its own rollback section says it cannot damage webOS. Phase 0’s <code>target-registry.mjs</code>, workspace-aware cycle resolution, CSS scanner parameterization and six guard fixtures all protect source movement the canary does not perform.</li>
+    <li><strong>A D-pad TV interface is not an honest phone product.</strong> Touch navigation, keyboard search, system Back, orientation, accessibility and phone-owned player controls are the real work.</li>
+    <li><strong>Staying webOS-only is rejected.</strong> Android is a stated business requirement.</li>
+  </ul>
+
+  <h2>Where the council clashes</h2>
+  <p><strong>The thin WebView wrapper.</strong> The Contrarian and the Executor called it a disposable diagnostic only. First Principles, the Expansionist and the Outsider treated it as the seed of the shipping product — First Principles went furthest: “phone first, and it is nearly free.” Four of five peer reviewers picked that line out as the single biggest blind spot in the round.</p>
+  <p><strong>Chairman’s resolution:</strong> the wrapper is a <em>mandatory diagnostic and a keepable shell, but never the product</em>. Package today’s web output unmodified, prove playback and lifecycle, retain the Capacitor shell if WebView wins — then replace the phone-friction surfaces with touch-first presentation. Passing the media corpus proves a backend, not readiness: the Phase 2 spike by design has <em>no catalog and no provider implementation</em>, so it says nothing about login, credentials, persistence, accessibility or distribution.</p>
+  <p><strong>Second clash: a permanently separate Android codebase.</strong> Four advisors endorsed it without pricing the maintenance cost. For two people, two divergent implementations of provider, playback, catalog and policy logic is exactly the cost <code>@nova/engine</code> and <code>verify:single-engine</code> existed to prevent. The resolution is a <em>distinct phone app and presentation, not a permanent logic fork</em> — share pure modules incrementally, when both products consume them, and never as a precondition to shipping.</p>
+
+  <h2>Blind spots the peer review caught</h2>
+  <p><strong>The device gate cannot be satisfied honestly.</strong> Four of five reviewers raised this independently — the strongest signal in the round, and no advisor had mentioned it. Phase 1 §4 demands approved minimum and current device classes; Phases 2, 4 and 7 require every physical-device row to pass. One phone and one TV box establishes feasibility on <em>those two devices</em>, not Android compatibility. The choice must be named on Monday, not deferred: a <strong>controlled beta</strong> (est. 8–12 testers across ≥3 OEM/API/WebView classes, with sanitized crash/lifecycle/backend telemetry and rollback), <em>or</em> support explicitly limited to the named tested phone/API/WebView combination. A one-row “supported matrix” is fiction.</p>
+  <p><strong>Capacity was never converted into a budget.</strong> Reserve 8–12 hrs/week for webOS support and release; that leaves 28–32 hrs/week for Android. A real phone MVP is estimated at 240–320 engineering hours excluding device certification — roughly <strong>9–13 calendar weeks</strong>. Not “nearly free,” not “install now.”</p>
+  <p><strong>The calendar is the real killer.</strong> Section 7 refuses to estimate effort or dates. Green gates can consume months while delivering nothing installable.</p>
+</div>
+
+<div class="flag">
+  <h3>Orchestrator check — one review claim was wrong, and it makes the plan cheaper</h3>
+  <p>Reviewer 2 argued that nobody had verified the existing build even runs outside webOS, and that platform coupling — not codecs — might be the real risk. That claim would change the Monday action, so it was checked against the repository instead of passed through.</p>
+  <p><strong>It is largely false.</strong> <code>isWebOsRuntime()</code> (<code>src/main.ts:350</code>) is a pure feature detector for <code>window.webOSSystem || window.PalmSystem</code>. All 34 webOS references in <code>main.ts</code> are either ternary branches on that boolean (<code>:378, :382, :386, :4705, :4711, :4945</code>) or optional-chained calls that no-op when the bridge is absent (<code>system?.keepAlive?.(true)</code> at <code>:8599</code> and <code>:8617</code>). Launch params early-return when absent (<code>:403–407</code>). The app is developed daily in a desktop browser via <code>npm run dev</code> — the same environment as a bare Capacitor WebView.</p>
+  <p>Corollary: the Chromium 79 / ES2015 target is a <em>floor, not a ceiling</em>. Any modern Android System WebView runs that output. <strong>The canary needs no build changes at all</strong> — it can package the existing <code>webos-app/</code> output unmodified. Reviewer 2’s second point does stand, and fed the chairman: the separate-app path commits two people to divergent codebases.</p>
+</div>
+
+<h2>Advisor positions at a glance</h2>
+<div class="tablewrap">
+<table>
+  <thead>
+    <tr><th>Option</th><th>Contrarian</th><th>First&nbsp;Principles</th><th>Expansionist</th><th>Outsider</th><th>Executor</th><th class="chair">Chairman</th></tr>
+  </thead>
+  <tbody>
+    <tr><td class="opt">(a) v2 as written — 9 phases, 3 apps</td>
+      <td><span class="pill p-kill">Kill</span></td><td><span class="pill p-kill">Kill</span></td><td><span class="pill p-kill">Kill</span></td><td><span class="pill p-kill">Kill</span></td><td><span class="pill p-kill">Kill</span></td><td class="chair"><span class="pill p-kill">Kill</span></td></tr>
+    <tr><td class="opt">(b) Purpose-built Android app, share only pure logic</td>
+      <td><span class="pill p-ok">Endorse</span></td><td><span class="pill p-ok">Endorse</span></td><td><span class="pill p-ok">Endorse</span></td><td><span class="pill p-ok">Endorse</span></td><td><span class="pill p-ok">Endorse</span></td><td class="chair"><span class="pill p-ok">Endorse</span> <span class="note" style="display:block">no permanent logic fork</span></td></tr>
+    <tr><td class="opt">(c) Phone first, Android TV later or never</td>
+      <td><span class="pill p-ok">Endorse</span></td><td><span class="pill p-ok">Endorse</span></td><td><span class="pill p-ok">Endorse</span></td><td><span class="pill p-ok">Endorse</span></td><td><span class="pill p-ok">Endorse</span></td><td class="chair"><span class="pill p-ok">Endorse</span></td></tr>
+    <tr><td class="opt">(d) Thin WebView wrapper, no refactor <span class="note" style="display:block;font-weight:400">— the only real disagreement</span></td>
+      <td><span class="pill p-mix">Diagnostic only</span></td><td><span class="pill p-ok">Endorse now</span></td><td><span class="pill p-ok">Endorse as seed</span></td><td><span class="pill p-ok">Monday move</span></td><td><span class="pill p-mix">Diagnostic only</span></td><td class="chair"><span class="pill p-mix">Mandate as diagnostic, kill as release</span></td></tr>
+    <tr><td class="opt">(e) Stay webOS-only</td>
+      <td><span class="pill p-kill">Kill</span></td><td><span class="pill p-kill">Kill</span></td><td><span class="pill p-kill">Kill</span></td><td><span class="pill p-kill">Kill</span></td><td><span class="pill p-kill">Kill</span></td><td class="chair"><span class="pill p-kill">Kill</span></td></tr>
+    <tr><td class="opt">Step one: guard-first or Android-canary-first?</td>
+      <td><span class="pill p-ok">Canary</span></td><td><span class="pill p-ok">Canary</span></td><td><span class="pill p-ok">Canary</span></td><td><span class="pill p-ok">Canary</span></td><td><span class="pill p-ok">Canary</span></td><td class="chair"><span class="pill p-ok">Canary</span></td></tr>
+  </tbody>
+</table>
+</div>
+<p class="note">Unanimous on four of six rows. The council converged hard — which is why the peer-review round was pushed to attack the convergence itself, and found the device-coverage hole that all five advisors had walked past.</p>
+
+<h2>The recommendation</h2>
+<p>Replace v2’s nine phases with three delivery checkpoints:</p>
+<ol>
+  <li><strong>Playback decision.</strong> Answer only the subset of <code>docs/android/requirements.md</code> needed for mandatory phone protocols, cleartext policy, lifecycle, tracks, cancellation and the legal corpus. Run WebView first. Record sanitized results in <code>docs/android/playback-spike-results.json</code>; commit <code>docs/adr/android-playback-backend.md</code>. If WebView fails, a Media3 feasibility spike is est. 24–32 hours (full plugin integration remains unestimated). If neither backend passes the mandatory rows, <strong>stop at that ADR commit</strong> and change requirements rather than touching webOS.</li>
+  <li><strong>Phone vertical slice.</strong> Credentials and provider connectivity, browse/search, playback, real track switching, A-to-B cancellation, resume, storage, background/foreground recovery, system Back, touch controls. Do <em>not</em> create <code>modules/engine</code> or <code>apps/android-tv</code>, and do not run <code>verify:boundaries</code> or <code>verify:single-engine</code> first.</li>
+  <li><strong>Controlled release.</strong> Signing, distribution, redacted telemetry, accessibility checks, and the controlled device beta. Extract a shared module only when you are otherwise fixing the same logic twice — and at that first extraction add the smallest necessary workspace guard, not all of Phase 0 preemptively.</li>
+</ol>
+<p><strong>Delete Phase 5</strong> (moving webOS into <code>apps/webos</code> delivers no capability and destabilizes the only shipping app). <strong>Delete Phase 6</strong> — the phone is not optional, so a gate permitting “Defer/stop phone” is incoherent with the requirement.</p>
+<p><strong>Kill criteria, set now:</strong> two consecutive weeks with no APK completing login → browse → playback; more than 25% of capacity spent on verification machinery; or no end-to-end phone slice after 160 engineering hours. <strong>The abandonment checkpoint is the playback ADR commit</strong>, before any Phase 3 workspace commit — at that boundary the untouched webOS release is still intact and scope can reduce to the phone alone.</p>
+
+<div class="first">
+  <h2>The one thing to do first</h2>
+  <p>On Monday: <strong>tag the current approved webOS commit</strong>, then create one isolated commit under <code>spikes/android-phone-playback/</code>.</p>
+  <p>Spend ~4 hours fixing the mandatory phone playback/lifecycle requirements and the legal corpus. Then ~20–28 hours packaging today’s <strong>unmodified</strong> <code>webos-app/</code> output in the smallest Capacitor shell and installing it on the owned phone. Test HLS, DASH, MPEG-TS, real audio and subtitle switching, A-cancel-then-B, background/foreground, Activity recreation, process death, and cleartext/CORS behaviour.</p>
+  <p>Commit the sanitized report and the backend ADR. Do <strong>not</strong> start <code>scripts/target-registry.mjs</code>, <code>test:guards</code>, <code>apps/webos</code>, <code>modules/engine</code> or Android TV before that evidence exists.</p>
+</div>
+
+<h2>Full advisor responses</h2>
+
+<details>
+  <summary><span>The Contrarian — hunts for the fatal flaw</span><span class="model">gpt-5.6-sol · xhigh</span></summary>
+  <div class="body">
+    <p><strong>1.</strong> <strong>Kill (a):</strong> nine gated phases optimize architectural uniformity instead of Android delivery. <strong>Endorse (b):</strong> build a purpose-built Android app with its own presentation and share only modules already proven DOM-free, such as the Phase 3 candidates <code>search.ts</code>, <code>playback-fallback.ts</code>, <code>track-selection.ts</code>. <strong>Endorse (c):</strong> phone first; defer Android TV until phone ships — Phase 4 otherwise consumes the scarce capacity before the required product even reaches Phase 6. <strong>Kill (d) as a released product:</strong> the existing remote/focus-driven <code>src/main.ts</code> UI is not an honest phone experience; use the wrapper only as a disposable feasibility probe. <strong>Kill (e):</strong> it rejects the stated Android business requirement.</p>
+    <p><strong>2.</strong> Android-canary-first is correct. Phase 0’s <code>target-registry.mjs</code>, TypeScript cycle resolver, parameterized CSS scanners, registry dispatcher and six failing fixtures protect source movement that the isolated Phase 2 spike explicitly does not perform. Requiring <code>test:guards</code> and all ten Phase 1 answers before touching Android burns capacity against a hypothetical repository shape.</p>
+    <p><strong>3.</strong> The phone should be a separate touch-first Capacitor product using the selected backend, not a late view layer over an engine that does not yet exist. Implement one installable vertical slice: credentials, browse/search, playback, track selection, cancellation, resume. Do not make <code>verify:single-engine</code> a precondition for customer value. v2 delivers this no earlier than Phase 7; it could begin immediately after the playback ADR.</p>
+    <p><strong>4.</strong> The fatal halfway state is <strong>Phase 4</strong>: logic migrated into <code>modules/engine</code>, <code>apps/android-tv</code> incomplete, webOS now depending on new boundaries, and the required phone with no shipping route. Early warning: two consecutive capacity checkpoints spent satisfying <code>verify:boundaries</code>, <code>verify:single-engine</code>, device reports and contract migrations without producing a newly installable phone flow. Abandonment checkpoint: the Phase 2 ADR commit, before Phase 3 adds workspaces. If no end-to-end phone slice exists after 160 engineering hours, cut Android TV and all engine-hash machinery.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span>The First Principles Thinker — rebuilds the problem from the ground up</span><span class="model">claude-opus-4-8-think · high</span></summary>
+  <div class="body">
+    <p>Strip the question. The owner does not need “three apps sharing one engine.” In six months the owner needs Android users — phone users specifically — running a working player while webOS keeps shipping. <strong>v2 is an architecture migration wearing a product goal as a costume</strong>, and it never asks whether unifying an engine is what puts a phone app on a phone.</p>
+    <p><strong>Q1.</strong> Kill (a). Endorse (d) now, then (c). The tell that this plan is avoiding the product decision is structural: the <em>required</em> phone app’s existence is not decided until Phase 6’s <code>docs/adr/android-phone-product.md</code>, whose own decision point permits “Defer/stop phone.” A plan cannot both treat phone as a hard requirement and place a “maybe never” gate five phases deep. The engine unification — <code>verify:single-engine</code>, engine-source-hash equality across three builds — is a maintenance dream serving zero users.</p>
+    <p><strong>Q2.</strong> Canary-first, decisively. The plan defeats its own sequencing: Phase 2’s spike lives in <code>spikes/android-playback/</code>, “has no import from the shipping webOS entry,” and its rollback “cannot damage webOS.” Guards exist only to stop false-green source moves and workspace creation. The spike does neither. So Phase 0 and Phase 1’s <code>check-android-requirements.mjs</code> gate nothing the spike can break.</p>
+    <p><strong>Q3.</strong> Phone first, and it is nearly free. If the WebView wrapper plays the corpus, real users install a phone app <em>now</em> — not at Phase 7. If it doesn’t, Media3 is your answer before you’ve touched <code>src/</code>.</p>
+    <p><strong>Q4.</strong> The killer isn’t technical — it’s Section 7’s admission that “effort and release dates are unknown.” Two people at 40 hours total spend Phases 0–1 shipping nothing, then Phase 5 destabilizes the working webOS app for zero new capability. Early warning: the calendar passes Phase 2 with no installable phone artifact.</p>
+    <p class="note"><em>Chairman’s note: “nearly free” was flagged by four of five peer reviewers as the round’s biggest blind spot. The Phase 2 spike has no catalog and no provider implementation by design, so a passing corpus proves a backend, not a product.</em></p>
+  </div>
+</details>
+
+<details>
+  <summary><span>The Expansionist — hunts for undervalued upside</span><span class="model">gpt-5.6-terra · high</span></summary>
+  <div class="body">
+    <p>Kill (a). Endorse (b), (c) and (d) <em>as one sequence</em>: ship a thin Android phone WebView wrapper first, then evolve it into a purpose-built phone app sharing only proven pure logic. Kill (e). Android is the growth market, and <strong>the undervalued asset is the existing browser player</strong>: Hls.js, Dash.js, MPEG-TS, native video paths, track-selection policy, <code>playback-fallback.ts</code>, <code>player-transport.ts</code> and <code>search.ts</code> already constitute an Android-launch kernel — the very modules Phase 3 names for <code>modules/engine</code>. The wrong move is making the required phone product wait behind Phase 6’s permitted “Defer/stop phone” and Phase 7.</p>
+    <p>Endorse Android-canary-first. The smallest high-option-value Monday move is a minimal Capacitor phone wrapper under <code>spikes/</code>, loading the current web build with one media surface and the Phase 2 corpus, cancellation, track and lifecycle instrumentation. Phase 2 already proves this spike imports nothing from the shipping app and can be deleted without harming webOS — its rollback section makes it the perfect zero-regression discovery vehicle. <code>target-registry.mjs</code> and <code>test:guards</code> are valuable <em>expansion</em> infrastructure, only after Android has demonstrated a viable commercial surface.</p>
+    <p>The phone should be phone-owned from its first installable APK: touch navigation, keyboard search, system Back, portrait/landscape, accessibility, player controls. Start with the existing web UI inside the wrapper because that is the fastest route to real-user evidence; immediately replace only the phone-friction surfaces. This advances Phase 6’s three representative flows to the front, where they generate user learning instead of a late <code>docs/android/phone-ui-reuse.json</code>.</p>
+    <p>The project dies through <strong>“architecture without distribution”</strong>: Phases 0–5 produce registries, reports, <code>modules/engine</code> and <code>apps/webos</code> while no user can install Android. The early warning is any green commit adding <code>modules/engine</code> or moving <code>src/main.ts</code> before an installable phone APK has passed the Phase 2 corpus on the physical phone.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span>The Outsider — zero context, catches the curse of knowledge</span><span class="model">gpt-5.6-luna · high</span></summary>
+  <div class="body">
+    <p><strong>(a) Kill v2 as written.</strong> It is a technically coherent migration plan, but for two people it confuses “gated” with “affordable.” The required phone is explicitly allowed to die at Phase 6, while Phases 0–5 consume the project before the required product exists. <code>verify:single-engine</code>, ten report/guard commands, three artifact policies and repeated physical-device runs are <strong>a permanent second product: verification infrastructure</strong>. That is not justified by 40 total engineering hours per week.</p>
+    <p><strong>(b) Endorse a separate Android app sharing only pure logic.</strong> Phase 3 already names graph-confirmed candidates — <code>search.ts</code>, <code>content-rating.ts</code>, <code>playback-fallback.ts</code>, <code>track-selection.ts</code> — but the plan turns that modest reuse into an engine, ports, adapters, controllers and three-build hash equality.</p>
+    <p><strong>(c) Endorse phone first; postpone Android TV indefinitely.</strong> Phase 4 requires a full Android-TV slice plus physical LG regression, yet Phase 7 is when the required phone finally appears. That ordering is backwards.</p>
+    <p><strong>(d) Endorse the thin wrapper as Monday’s first move</strong> — the first commit should be a wrapper spike and installable APK, not guard architecture. <strong>(e) Kill.</strong></p>
+    <p>The project dies when Phase 2 evidence shows the wrapper needs native playback or Android-specific lifecycle/storage, but the owner continues into Phase 3’s engine extraction anyway. The warning sign is a failing mandatory row in <code>docs/android/playback-spike-results.json</code>. A second failure is calendar exhaustion: Phase 7 not begun after the first month while webOS is unchanged and the verification surface grows. Keep shipping the current webOS build rather than ending with code split across <code>src/</code> and <code>apps/</code>.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span>The Executor — what do you do Monday morning</span><span class="model">gpt-5.6-sol · high</span></summary>
+  <div class="body">
+    <p><strong>1.</strong> Kill (a) — nine phases make architecture the critical path to a required product. Endorse (b) and (c). <strong>Kill (d) as a release strategy</strong>: wrapping the existing TV-focused <code>src/main.ts</code> produces an installable APK, not an honest touch product; use a wrapper only as disposable diagnostic code. Kill (e).</p>
+    <p><strong>2.</strong> Run the Android canary before Phase 0. Monday morning: spend <strong>4 hours</strong> answering only the Phase 1 §4 questions needed to define mandatory phone playback, lifecycle, cleartext networking and the legal corpus. Then <strong>20–28 hours</strong> building the one-screen Capacitor spike and testing on the actual phone — HLS/DASH/MPEG-TS, track switching, A-cancel-then-B, background/foreground, Activity recreation, process death — and write <code>docs/adr/android-playback-backend.md</code>. If WebView fails, allow <strong>24–32 hours</strong> for Media3. Do not write <code>target-registry.mjs</code>, rewrite <code>check-import-cycles.mjs</code>, or build six guard fixtures until a backend passes.</p>
+    <p><strong>3.</strong> Build the phone immediately after that ADR as a separate Capacitor product. Budget <strong>240–320 engineering hours</strong>: 40–60 shell/credentials/connectivity; 80–100 browse/search/details; 60–80 playback, tracks, cancellation, resume; 40–60 lifecycle, persistence, packaging, device QA. Reserving 8–12 hrs/week for webOS support yields an installable phone release in roughly <strong>8–10 weeks</strong>. Initially duplicate composition glue rather than extracting controllers from <code>main.ts</code>; move only already-tested pure modules when both apps actively consume them.</p>
+    <p><strong>4.</strong> The fatal failure mode is engine extraction becoming mandatory before any Android product ships. Warning signs: two consecutive weeks without a phone APK completing login, catalog browse and sample playback; or more than 25% of capacity going into <code>verify:boundaries</code>, <code>verify:single-engine</code>, registries, reports and manifests. Tag the current webOS release, then put the abandonment checkpoint immediately after the Phase 2 backend ADR and before Phase 3’s workspace commit. <strong>Delete Phase 5</strong> — moving webOS into <code>apps/webos</code> delivers nothing. <strong>Delete Phase 6</strong> — phone is not optional.</p>
+  </div>
+</details>
+
+<h2>Peer review round</h2>
+<details>
+  <summary><span>Five anonymized reviews — what the convergence was hiding</span><span class="model">sol·xhigh, opus-4-8-think·high, terra·high, luna·high, terra·xhigh</span></summary>
+  <div class="body">
+    <p>Each reviewer saw all five responses as A–E with identities stripped, plus the framing and the v2 plan. Map: Executor = A, Outsider = B, Contrarian = C, Expansionist = D, First Principles = E.</p>
+    <h3>Strongest response</h3>
+    <p>Four of five picked <strong>A (the Executor)</strong> — the only response converting the shared diagnosis into an executable schedule with hour budgets, falsifiable warning signs, and named things to delete. One picked <strong>C (the Contrarian)</strong> for the clearest product verdict, one picked <strong>D (the Expansionist)</strong> for the cleanest diagnostic-versus-product distinction.</p>
+    <h3>Biggest blind spot</h3>
+    <p>Unanimous: <strong>E (First Principles)</strong>, for “phone first, and it is nearly free.” Reviewer 3: <em>“reckless nonsense. A passing media corpus proves playback feasibility, not a shippable phone product… Phase 2 explicitly has no catalog/provider implementation.”</em> Reviewer 5 added that “WebView fails, therefore Media3” does not follow either — Media3 still requires a native plugin, lifecycle integration and track/control parity.</p>
+    <h3>What all five advisors missed</h3>
+    <p><strong>Device coverage (4 of 5 reviewers, independently).</strong> Every advisor silently accepted one-phone testing as sufficient Android evidence. Reviewer 1: <em>“one successful handset cannot justify an ‘Android phone’ release or A’s 8–10-week forecast.”</em> Reviewer 3: <em>“v2’s Phase 1 matrix is presently either dishonest (one row per form factor) or impossible… otherwise ‘Android is a business requirement’ is not an executable commitment, and every promised phone schedule is fiction.”</em></p>
+    <p><strong>Capacity as a release constraint (Reviewer 4).</strong> Nobody converted 40 total hours/week into an allocation across webOS support, Android development, QA, release and user support — which makes the 8–10 week claims unsupported.</p>
+    <p><strong>Divergent-codebase cost (Reviewer 2).</strong> A separate app commits two people to permanently maintaining divergent codebases — precisely the cost v2’s single engine existed to prevent. Nobody did that arithmetic. <em>This one survived into the chairman’s verdict.</em></p>
+    <p><strong>webOS coupling (Reviewer 2).</strong> Claimed the existing build might not run outside webOS at all. Checked against the repo and found largely false — see the orchestrator note above. The canary is cheaper than the reviewer feared.</p>
+  </div>
+</details>
+
+<footer>
+  <p><strong>Counciled:</strong> <code>plans/main-refactor-v2.md</code> — commit or not, for a 2-person team at 40 hrs/week with one Android TV box and one test phone.<br>
+  <strong>Method:</strong> Karpathy LLM Council — 5 independent advisors → anonymized peer review → chairman synthesis, with one review claim verified against the repository.<br>
+  <strong>Run on:</strong> the OpenWebUI gateway via <code>tools/agent-harness/ask-model.py</code> (gpt-5.6-sol / terra / luna + claude-opus-4-8-think), not native sub-agents. ~150k tokens deliberated off-context.<br>
+  <strong>Date:</strong> 2026-08-09 · Full transcript: <code>plans/council-2026-08-09-main-refactor-v2.md</code></p>
+</footer>
+
+</div>
+</body>
+</html>
