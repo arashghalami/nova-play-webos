@@ -336,29 +336,83 @@ The committed project location is `docs/android/playback-corpus-release-receipt.
 
 A post-public verifier first creates deterministic `proposed-release-receipt.json` plus a separate run-specific verification report. It verifies public facts and bindings without calling the proposal normative. R copies proposed receipt bytes byte-for-byte to the committed path. An independent post-commit verifier reads the Git blob, recomputes public facts, and verifies the earlier report and proposed-receipt hash. Only successful `RECEIPT_VERIFIED` makes the receipt normative.
 
-### 11.6 Reproducibility artifact classes
+### 11.6 Closed reproducibility artifact registry
 
-| Class | Artifacts | Rule |
-|---|---|---|
-| Deterministic content-control | Strict registry canonical payload; schemas/schema locks; recipes/recipe set; synthetic primitives; oracle definitions; deterministic HLS/DASH manifests and state-machine definitions; proposed/content lock for identical object bytes; archive projection/archive for identical object bytes; fixed-input licence/provenance records | Bit-identical under the same source/spec/toolchain envelope |
-| Run-specific evidence | Candidate manifest; provenance attestation envelope; run validation report; append-only events; staging receipt; approval signed time/signature; Release receipt; verification observations/incidents | Not byte-identical; stable projections bind equivalent deterministic artifacts and identities |
+This is the closed registry of every artifact schema/type in this design. An artifact has exactly one `artifactClass`; no artifact may be “other,” inferred into a class, or assigned to two classes. Schema validation enumerates these artifact names and classes. The registry validator computes the set of artifact schema/type names and requires exact set equality with the names below, then requires exactly one matching row per name. A missing, extra, duplicate, or cross-class name fails with `ARTIFACT_CLASS_MEMBERSHIP`. The contract/golden tests enumerate every schema/type and prove exact one-class membership.
 
-Deterministic projections are exhaustive: registry is full strict-registry JCS; each schema is exact UTF-8 bytes and schema lock is path-sorted JCS `{path,size,rawSha256}`; each recipe is full strict JCS and recipe set is ID-sorted JCS `{recipeId,recipeVersion,recipeHash}`; each primitive is exact bytes and primitive set is path-sorted `{path,size,rawSha256}`; each oracle/machine/manifest is full strict JCS or exact declared UTF-8 bytes; proposed/content lock is full strict JCS; archive projection is path-sorted `{path,size,objectSha256,mode,mtime}` and archive is exact compressed bytes; licence/provenance projection is full strict JCS.
+For `deterministic-control`, the equality rule is `raw-byte` for exact files/binary objects and `JCS-byte` for strict structured objects. The required identity is the named raw or domain field in the final column. Permitted inputs are exhaustive; ambient time, hostname, locale, filesystem iteration order, random state, mutable network facts, run identity, and every input not named in the row are forbidden.
 
-Evidence-equivalence projections use RFC 8785 JCS and are exact per artifact:
+| Artifact name (`deterministic-control`) | Canonical source bytes | Equality | Only permitted influences | Required identity |
+|---|---|---|---|---|
+| normative registry extracted payload | Full strict registry RFC 8785 JCS | JCS-byte | approved registry JSON and schema version | `specDigest` |
+| complete normative Markdown source | Complete UTF-8, no-BOM, LF-only file through EOF | raw-byte | approved Markdown bytes when raw bytes are a declared input | `rawMarkdownSha256` |
+| JSON Schema | Exact UTF-8 schema file | raw-byte | approved schema source | `schemaHash` |
+| schema lock | Full strict path-sorted lock JCS | JCS-byte | schema paths, sizes, and `schemaHash` values | `schemaLockHash` |
+| hash registry | Full strict registry JCS | JCS-byte | approved hash-row definitions and registry version | `hashRegistryDigest` |
+| recipe | Full strict recipe JCS | JCS-byte | registry binding, fixed recipe parameters, tool capabilities | `recipeHash` |
+| recipe-set manifest | Recipe-ID UTF-8-byte-sorted strict JCS | JCS-byte | recipe IDs, versions, and `recipeHash` values | `recipeSetHash` |
+| synthetic source definition | Full strict source-definition JCS | JCS-byte | approved primitive parameters and fixed seed | `sourceDefinitionHash` |
+| deterministic generated source primitive | Exact generated primitive bytes | raw-byte | bound source definition and pinned generator | `primitiveHash` |
+| primitive-set manifest | Normalized-path UTF-8-byte-sorted strict JCS `{path,size,primitiveHash}` array | JCS-byte | deterministic generated source primitives only | `primitiveSetHash` |
+| source/toolchain lock | Full strict lock JCS | JCS-byte | pinned source, compiler, ABI, configure, licence, and capability inputs | `toolchainHash` |
+| container Dockerfile | Exact UTF-8 Dockerfile | raw-byte | approved build stages and pinned base identity | `containerHash` |
+| pinned patch | Exact patch bytes | raw-byte | approved patch source | `patchHash` |
+| tool capability requirements | Full strict requirements JCS | JCS-byte | approved capability predicates | `capabilityRequirementsHash` |
+| semantic oracle definition | Full strict oracle JCS | JCS-byte | registry semantics and fixed oracle rules | `oracleHash` |
+| generated HLS manifest | Exact emitted UTF-8 playlist bytes | raw-byte | fixed objects, recipe, and machine projection | `manifestHash` |
+| generated DASH manifest | Exact emitted UTF-8 MPD bytes | raw-byte | fixed objects, recipe, and machine projection | `manifestHash` |
+| HLS-live machine definition | Full `nova-play-hls-live-v1` strict JCS | JCS-byte | fixed machine policy, recipe, and objects | `machineDefinitionHash` |
+| DASH-live machine definition | Full `nova-play-dash-live-v1` strict JCS | JCS-byte | fixed machine policy, recipe, and objects | `machineDefinitionHash` |
+| delay-machine definition | Full `nova-play-hls-delay-v1` strict JCS | JCS-byte | fixed machine policy, recipe, and objects | `machineDefinitionHash` |
+| canonical machine conformance trace | Full canonical trace JCS | JCS-byte | machine definition and canonical event input | `traceHash` |
+| signing policy artifact | Full strict policy JCS | JCS-byte | prior valid policy, protected transition authorization, fixed scope/keys | `signingPolicyDigest` |
+| publication policy artifact | Full strict publication-policy JCS | JCS-byte | approved immutable publication rules | `immutableReleasePolicyHash` |
+| incident policy artifact | Full strict S-bound incident-policy JCS | JCS-byte | approved pre-E proposal/finalization authorities | `incidentPolicyDigest` |
+| signing-policy schema | Exact UTF-8 schema file | raw-byte | approved schema source | `schemaHash` |
+| revocation-policy schema | Exact UTF-8 schema file | raw-byte | approved schema source | `schemaHash` |
+| lock-listed regular-file object | Exact regular-file bytes | raw-byte | fixed source/recipe/toolchain inputs | `objectSha256` |
+| closure tuple projection | Fully ordered closure-tuple array JCS | JCS-byte | lock-listed tuples only | `closureHash` |
+| proposed content lock | Full strict JCS with no trailing newline | JCS-byte | registry, objects, closures, recipes, oracles, archive and legal records | `lockDigest` and `lockRawSha256` |
+| E-committed content lock | Exact byte-copy of proposed content lock | raw-byte | proposed content-lock bytes only | `lockDigest` and `lockRawSha256` |
+| deterministic archive projection | Fully ordered archive-projection JCS | JCS-byte | exact lock-listed object set and packaging policy | `archiveProjectionHash` |
+| deterministic archive | Exact canonical compressed archive bytes | raw-byte | exact archive projection, object bytes, pinned packager/compressor | `archiveSha256` |
+| stable licence/provenance source record | Full strict record JCS | JCS-byte | fixed declared source, licence, notice, caveat, and redistribution inputs | `licenceHash` |
+| owner approval record | Full exact signed approval JCS with no trailing newline | JCS-byte | candidate/staging/publication bindings, applicable policies, owner statement, signer identity, informational `signedAt` | externally computed `approvalDigest` |
+| proposed Release receipt | Full strict canonical JCS with no trailing newline; identity fields are external and absent from these bytes | JCS-byte | fixed verified final public-fact snapshot and bound transaction | externally computed `receiptDigest` and `receiptRawSha256` |
+| R-committed Release receipt | Exact byte-copy of proposed Release receipt; identity fields remain external | raw-byte | proposed Release-receipt bytes only | externally computed `receiptDigest` and `receiptRawSha256` |
 
-| Evidence artifact | Included in stable projection | Excluded as run-varying |
-|---|---|---|
-| Candidate manifest | Repository/source/workflow identities; every artifact name/size/digest; attestation subject/issuer/signer; runner/OCI/toolchain/recipe/oracle/schema/policy/proposed-lock/archive/report/evidence hashes; semantic result | Transaction/attempt, run ID/attempt, numeric Actions artifact IDs, observation times |
-| Provenance attestation | Subject names/digests, issuer, signer workflow identity, predicate type and deterministic-material digests | Envelope signature and signed/observed time |
-| Validation report | Candidate digest, validator/schema/oracle/policy versions, per-check IDs/results, deterministic input/output hashes | Run ID, attempt ID, start/end/observation times, bounded diagnostics |
-| Event | Corpus version, transaction/attempt, sequence, prior digest, state/disposition, actor/authority, Git/blob and artifact identities, event evidence | Informational observation time only |
-| Staging receipt | Repository/candidate/proposed-lock identities, numeric Release/asset IDs, exact asset metadata/hashes, planned signed publication projection | Polling attempts, transient diagnostics, observation time |
-| Approval | All signed JCS fields, including policy/key/candidate/staging/publication identities | Nothing from signed JCS; signature bytes and informational `signedAt` vary only between distinct approvals |
-| Release receipt | Repository/tag/Release/asset numeric identities, exact public metadata/hashes, candidate/approval binding | Verification-run identity, observations, incidents, polling time |
-| Verification/incident report | Subject artifact identities, policy/check versions, check IDs/results, observed immutable facts | Run/attempt, observation time, bounded diagnostics |
+`proposed-release-receipt.json` and the byte-identical R receipt are therefore `deterministic-control`; the observations used to verify them are separate `run-evidence`.
 
-Identity-critical GitHub IDs are never excluded where the row includes them. Two runs are equivalent only when the complete corresponding included-member JCS bytes match. Already approved or published bytes remain exact and immutable.
+For `deterministic-public-fact`, JCS bytes are deterministic from one fixed external fact snapshot but that snapshot can differ by transaction. Every row uses full strict RFC 8785 JCS, schema-declared member names, and JCS member ordering. Once committed or approved, its exact bytes are fixed. Source APIs are repository-numeric-ID-bound GitHub REST/GraphQL responses and Git object/tree/blob reads at the declared immutable ref; normalization retains only the exact fields named by the owning schema, converts API integer identities to JSON integers, preserves API UTF-8 strings exactly, sorts set-like arrays by their schema key using UTF-8 bytes or numeric order, and represents absent nullable fields as `null`. HTTP headers, request IDs, pagination cursors, ETags, rate limits, polling/retry counts, response time, wall-clock observation time, and diagnostics are excluded transient observations.
+
+| Artifact name (`deterministic-public-fact`) | Exact source facts and normalization | Equality | Required identity |
+|---|---|---|---|
+| staging receipt | One draft Release/asset snapshot by repository, numeric Release ID, and numeric asset IDs; normalize exact schema fields and planned publication projection | JCS-byte after approval/E | `stagingDigest` |
+| final Release receipt facts before byte-copy to R | One public immutable Release/tag/asset snapshot plus bound candidate/approval facts; normalize exact receipt schema fields | JCS-byte before construction of deterministic proposed receipt | `publicReleaseFactsDigest` |
+| revocation record | Protected-tree record, selector facts, authority, and exact signature-bound policy sequence | JCS-byte after protected commit | `revocationDigest` |
+| immutable GitHub capability-probe fact record | Named API/probe evidence at repository numeric ID and configuration snapshot; normalize declared immutable result fields | JCS-byte after approval | `capabilityProbeDigest` |
+| public Release/tag/asset projection | Exact Git tag object and GitHub Release/asset API identity fields declared by publication schema | JCS-byte after publication | `publicReleaseProjectionDigest` |
+
+`run-evidence` bytes may differ. Each stable binding projection is strict JCS. Mandatory identity fields may never be omitted from that projection; permitted variation is limited to the row’s listed fields; every other exclusion is forbidden. Equivalence means byte equality of the complete stable binding projection, except that candidate identity is intentionally distinct for every rerun.
+
+| Artifact name (`run-evidence`) | Mandatory stable binding projection | Permitted run-varying fields | Equivalence rule |
+|---|---|---|---|
+| candidate manifest | Repository owner/name/numeric ID; source commit; workflow path/blob; run ID/attempt; numeric artifact IDs/names/sizes/digests; attestation subject/issuer/signer; runner/OCI/toolchain/recipe/oracle/schema/policy/proposed-lock/archive/report/evidence identities; transaction/attempt | observation times and bounded diagnostics only | Complete projection JCS equality; a rerun is never equivalent |
+| provenance attestation envelope | Candidate identity; subject names/digests; predicate type; issuer; signer workflow identity; deterministic materials | envelope signature bytes and informational signed/observed time | Complete projection JCS equality |
+| validation report | Candidate/transaction/attempt/run identity; validator/schema/oracle/policy versions; ordered checks/results; deterministic input/output identities | start/end/observation time and bounded diagnostics | Complete projection JCS equality |
+| candidate observation | Candidate/transaction/attempt/run identity and named observed artifact/GitHub facts | observation time and bounded diagnostics | Complete projection JCS equality |
+| staging observation | Candidate/transaction/attempt; numeric Release/asset identities and observed fields | polling count, observation time, bounded diagnostics | Complete projection JCS equality |
+| promotion observation | Candidate/approval/transaction/attempt; tag/Release/asset identities and mutation result | polling count, observation time, bounded diagnostics | Complete projection JCS equality |
+| verification observation | Candidate/approval/receipt/transaction/attempt and exact observed public identities | polling count, observation time, bounded diagnostics | Complete projection JCS equality |
+| event proposal | Event/corpus/transaction/attempt identity, proposed state/disposition, actor/authority, expected chain tip, and all evidence references | informational observation time and bounded diagnostics | Complete proposal projection JCS equality |
+| finalized append-only event | Event/corpus/transaction/attempt identity plus final sequence/prior digest/filename and complete proposal evidence | informational observation time only | Complete finalized-event projection JCS equality |
+| incident | Corpus/transaction/attempt, actor/authority, subject identities, policy/check versions, findings and disposition | run/attempt observation time and bounded diagnostics | Complete projection JCS equality |
+| detached owner signature | Approval digest, exact signer principal/namespace/full key ID, signature algorithm and signature bytes | signature nonce/material inherent to a distinct approval | Exact signature bytes plus binding projection equality |
+| owner approval informational signed time | Approval digest and `signedAt` value | `signedAt` between distinct approvals only | Exact signed approval JCS equality; time grants no authority |
+| workflow log | Repository/source/workflow/run/attempt/transaction and subject artifact identities | ordered log messages and timestamps subject to redaction | Binding projection equality; log bytes need not match |
+| diagnostic record | Repository/source/workflow/run/attempt/transaction, check ID and subject identities | bounded diagnostic detail and observation time | Binding projection equality |
+
+Candidate comparison must never exclude repository identity, source commit, workflow path/blob, run ID, run attempt, numeric artifact IDs, artifact digests, or attestation subject/issuer/signer identity. A rerun is a distinct candidate even when all deterministic content matches. No comparison may use a reduced projection that drops one of those fields.
 
 ## 12. Canonicalization and hash domains
 
@@ -380,8 +434,9 @@ SHA-256 values use lowercase 64-character hexadecimal unless an external API exp
 | `candidateDigest` | SHA-256, `nova-play:candidate:v1` | Exact candidate JCS | lowercase hex |
 | `stagingDigest` | SHA-256, `nova-play:staging:v1` | Exact staging JCS | lowercase hex |
 | `approvalDigest` | SHA-256, `nova-play:approval:v1` | Exact signed approval JCS | lowercase hex |
-| `receiptDigest` | SHA-256, `nova-play:receipt:v1` | Exact receipt JCS | lowercase hex |
-| `closureHash` | SHA-256, `nova-play:closure:v1` | Sorted closure-tuple JCS | lowercase hex |
+| `receiptDigest` | SHA-256, `nova-play:receipt:v1` | Exact proposed-receipt JCS bytes | lowercase hex |
+| `receiptRawSha256` | SHA-256, raw | Exact proposed-receipt file bytes; canonical JCS with no trailing newline | lowercase hex |
+| `closureHash` | SHA-256, `nova-play:closure:v1` | Totally ordered closure-tuple JCS | lowercase hex |
 | `archiveSha256` | SHA-256, raw | Exact canonical compressed archive bytes | lowercase hex |
 | `objectSha256` | SHA-256, raw | Exact lock-listed regular-file object bytes | lowercase hex |
 | `assetSha256` | SHA-256, raw | Exact bytes of one named GitHub Release asset as downloaded | lowercase hex |
@@ -420,8 +475,9 @@ SHA-256 values use lowercase 64-character hexadecimal unless an external API exp
 | `verificationReportHash` | SHA-256, raw | Exact bytes of the complete public or post-commit verification report | lowercase hex |
 | `provenanceHash` | SHA-256, raw | Exact serialized provenance-envelope bytes | lowercase hex |
 | `priorEventDigest` | SHA-256, `nova-play:event:v1` | RFC 8785 JCS of the complete immediately preceding event object | lowercase hex |
-| `priorStateHash` | SHA-256, `nova-play:machine-state:v1` | RFC 8785 JCS of the complete state before one transition | lowercase hex |
-| `nextStateHash` | SHA-256, `nova-play:machine-state:v1` | RFC 8785 JCS of the complete state after one transition | lowercase hex |
+| `stateDigest` | SHA-256, `nova-play:machine-state:v1` | RFC 8785 JCS of the complete resulting state in a transition result/response | lowercase hex |
+| `priorStateDigest` | SHA-256, `nova-play:machine-state:v1` | RFC 8785 JCS of the complete state before one trace transition | lowercase hex |
+| `resultingStateDigest` | SHA-256, `nova-play:machine-state:v1` | RFC 8785 JCS of the complete resulting state embedded separately in a trace row | lowercase hex |
 | `bodyObjectSha256` | SHA-256, raw | Exact response-body object bytes | lowercase hex |
 | `rawSha256` | SHA-256, raw | Exact bytes of the separately named file in a path-bound projection tuple | lowercase hex |
 | `priorPolicyBlobHash` | SHA-256, raw | Exact content bytes of the immediately preceding policy-history Git blob, excluding the Git object header | lowercase hex |
@@ -429,13 +485,23 @@ SHA-256 values use lowercase 64-character hexadecimal unless an external API exp
 | `approvalDigests` item | SHA-256, `nova-play:approval:v1` | RFC 8785 JCS of one exact signed approval object | lowercase hex |
 | `receiptDigests` item | SHA-256, `nova-play:receipt:v1` | RFC 8785 JCS of one exact receipt object | lowercase hex |
 | `actionsArtifactDigest` | GitHub Actions API-declared algorithm | Exact bytes of the named numeric Actions artifact | algorithm-qualified |
+| `hashRegistryDigest` | SHA-256, `nova-play:hash-registry:v1` | Full strict hash-registry JCS excluding this externally computed value | lowercase hex |
+| `sourceDefinitionHash` | SHA-256, `nova-play:source-definition:v1` | Full strict synthetic-source-definition JCS | lowercase hex |
+| `patchHash` | SHA-256, raw | Exact pinned patch bytes | lowercase hex |
+| `capabilityRequirementsHash` | SHA-256, `nova-play:capability-requirements:v1` | Full strict capability-requirements JCS | lowercase hex |
+| `signingPolicyDigest` | SHA-256, `nova-play:signing-policy:v1` | Full strict signing-policy JCS without externally computed digest | lowercase hex |
+| `incidentPolicyDigest` | SHA-256, `nova-play:incident-policy:v1` | Full strict S-bound incident-policy JCS | lowercase hex |
+| `publicReleaseFactsDigest` | SHA-256, `nova-play:public-release-facts:v1` | Normalized final public-fact snapshot JCS | lowercase hex |
+| `capabilityProbeDigest` | SHA-256, `nova-play:capability-probe:v1` | Immutable capability-probe fact-record JCS | lowercase hex |
+| `publicReleaseProjectionDigest` | SHA-256, `nova-play:public-release-projection:v1` | Strict public Release/tag/asset projection JCS | lowercase hex |
+| `eventProposalDigest` | SHA-256, `nova-play:event-proposal:v1` | Full strict event-proposal JCS with no final chain fields | lowercase hex |
 | `hashRegistryVersion` | not a digest | Literal `nova-play-hash-registry-v1` | UTF-8 string |
 
-The registry version is `nova-play-hash-registry-v1`. Every schema hash field must use a field name listed in this table; generic `hash`, `domain hash`, or `artifact digests` fields are forbidden. Object identity is always `objectSha256`, raw SHA-256 over exact object bytes. Closure tuples use `objectSha256`, not a separate domain hash. Git object IDs are separately labelled `gitObjectFormat` and `gitObjectId`, never SHA-256 content hashes. Workflow identity records both Git object ID and raw `workflowBlobHash`.
+The registry version is `nova-play-hash-registry-v1`. This table is the closed hash interoperability registry. Every `*Hash`, `*Digest`, Git ID, OCI digest, attestation digest, signature input, policy/event/revocation/proposal/trace, raw document, schema, recipe, tool/source, object, closure, archive, report, licence, receipt, and workflow identity field in every artifact schema must occur exactly once as a row. Each row fixes exact field name, owner artifact/schema, algorithm, domain/version or `raw`, exact bytes/projection, canonicalization, output encoding, embedded-versus-external computation, equality use, and prohibited self-reference; where this compact table shares a field across multiple owners, the owning schema enumerates those owners without creating another field row. Schema-to-registry and registry-to-schema validation is bidirectional: an identity field absent from this registry or a registry field absent from every owning schema fails. Every row has golden input bytes and expected output; native Git, OCI, Actions, subject, and attestation identifiers remain algorithm-qualified and are never coerced to project SHA-256.
 
-No object hashes itself. Self-hash fields are forbidden by every artifact schema. Any hash field can hash only a separately defined projection or separately stored object. The archive is not listed as an embedded byte field in an object that hashes itself. The approval signature is over exact JCS bytes of the approval object with no trailing newline.
+All project SHA-256 values are lowercase 64-character hexadecimal. Generic `hash`, `domain hash`, or untyped `artifactDigests` members are forbidden. Object identity is always `objectSha256`. Git identity is the pair `gitObjectFormat`/`gitObjectId`; workflow identity additionally records raw `workflowBlobHash`. Every domain row is externally computed unless its owner schema explicitly embeds a reference to a separately stored object. No object hashes itself; every schema forbids its own identity field in the hashed projection. The approval signature input is exact approval JCS with no trailing newline.
 
-A closure hash is the domain hash of a JCS array sorted by normalized path and then role. Every tuple includes:
+A closure hash is the domain hash of a JCS array sorted by this total key, with no locale or default string collation: (1) normalized path UTF-8 bytes lexicographically; (2) the fixed role ordinal `manifest=0`, `playlist=1`, `mpd=2`, `init=3`, `segment=4`, `media=5`, `subtitle=6`, `fault=7`, `config=8`; (3) full-object tuple before ranged tuple; (4) numeric byte-range offset ascending; and (5) numeric byte-range length ascending. Two tuples still identical after all five keys are rejected. Every tuple includes:
 
 ```json
 {
@@ -447,7 +513,9 @@ A closure hash is the domain hash of a JCS array sorted by normalized path and t
 }
 ```
 
-`byteRange` is either a valid explicit object with non-negative integer offset and positive integer length, or `null` for full-object identity. It is never inferred from a URL range header. The closure projection also rejects duplicate path/role/range tuples and rejects a range beyond the declared regular-file size.
+`byteRange` is either a valid explicit object with non-negative integer offset and positive integer length, or `null` for full-object identity. It is never inferred from a URL range header. The closure projection rejects a range beyond the declared regular-file size. Golden vectors cover every hash-registry row and closure ordering edges: UTF-8 path prefixes, every adjacent role ordinal, full versus range, offsets `2` versus `10`, equal offsets with differing lengths, and exact duplicates.
+
+The receipt identity binding uses both externally computed fields: `receiptDigest`, the receipt-domain hash over exact proposed-receipt JCS bytes, and `receiptRawSha256`, raw SHA-256 over the exact proposed-receipt file bytes. Neither field is embedded in the proposed or R receipt, so neither hashes itself. The proposed-receipt report, event proposal, finalized event, approval/publication binding where applicable, and R verification evidence carry these fields. Although canonical JCS with no trailing newline makes their bound byte sequence identical, the algorithms/projections remain distinct. R copies those exact bytes. The post-commit verifier proves the R Git blob bytes have `receiptRawSha256`, recomputes `receiptDigest`, validates public facts against the receipt, and validates proposed-receipt/report references.
 
 Unknown fields are rejected. Canonicalization, hash domain, oracle, schema, and projection versions are immutable contracts. A new version is required rather than silently changing an old projection.
 
@@ -493,45 +561,41 @@ DASH support is allowlisted to static and deterministic local-live MPDs with exp
 
 Each row explicitly references every shared object hash in its closure. A valid global object store is insufficient unless the row closure includes the object.
 
-The executable contracts are `nova-play-hls-live-v1`, `nova-play-dash-live-v1`, and `nova-play-hls-delay-v1`. Each is strict canonical JCS bound by recipe, oracle, proposed lock, and candidate. Canonical initial state is `{"clock":0,"loopsRemaining":<recipe loopCount>,"nextRequest":0,"pending":[],"released":[],"requestCount":0,"sequence":0,"terminal":false,"windowStart":0}`; recipes also provide immutable non-negative integer `loopCount` and immutable positive integers `segmentCount`, `windowWidth`, `maximumEvents`, `maximumTick`, `maximumRequests`, `maximumPending`, and `maximumClock`.
+### 14.1 Total executable media-machine contract
 
-Canonical machine input is a strict JCS array of envelopes `{"tick":N,"eventIndex":N,"event":E}` whose length may not exceed `maximumEvents`. `tick` and `eventIndex` are non-negative integers; `eventIndex` equals the envelope's zero-based input-array position and is therefore globally contiguous and unique. Ticks are nondecreasing in input order, start at zero, contain no empty group, and may not exceed `maximumTick`. They identify logical input batches only: state `clock` changes exclusively through `ADVANCE`, need not equal `tick`, and may not exceed `maximumClock`. Envelope shape is validated before replay; a malformed envelope makes the complete input invalid with deterministic validation error `INVALID_ENVELOPE` and produces no transition trace, so grouping and ordering remain defined.
+The three machine IDs and versions are exactly `nova-play-hls-live-v1`, `nova-play-dash-live-v1`, and `nova-play-hls-delay-v1`. Each machine definition is strict canonical JCS and contains strict schemas for its definition, canonical initial state, event input, pending entry, response, result, and trace; a finite closed event alphabet; a total transition function over every valid state/event pair; and all bounds. Unknown fields or enum values fail schema validation.
 
-Within a valid envelope, valid event shapes are exactly `{"type":"REQUEST","method":"...","path":"...","ordinal":N}`, `{"type":"ADVANCE"}`, `{"type":"RELEASE_NEXT"}`, `{"type":"CANCEL","ordinal":N}`, and `{"type":"END"}`. A request schema accepts any UTF-8 string for `method` and `path` so semantic method/path failures can deterministically return 400; request and cancel ordinals must be non-negative integers. An unknown or structurally invalid inner event produces `INVALID_EVENT`, a `null` response, and no state change.
+The canonical initial state is the strict object `{"logicalTick":0,"loopsRemaining":<loopCount>,"nextRequest":0,"pending":{},"releaseCount":0,"requestCount":0,"segmentSequence":0,"terminal":false,"windowStart":0}`. All numeric values are bounded non-negative integers. Machine policy declares positive integer `segmentCount`, `windowWidth`, `maximumEvents`, `maximumTick`, `maximumRequests`, `maximumPending`, `maximumReleaseAfter`, and `maximumReleaseCount`, plus non-negative integer `loopCount`. Exceeding any bound returns the named deterministic failure (`EVENT_LIMIT`, `TICK_LIMIT`, `REQUEST_LIMIT`, `PENDING_LIMIT`, `RELEASE_LIMIT`, or `LOOP_LIMIT`) with no unlisted mutation.
 
-Processing groups by ascending tick and sorts each complete group once by `(eventPriority,eventOrdinal,eventPath,eventBytes,eventIndex)`, where priorities are `REQUEST=0`, `CANCEL=1`, `RELEASE_NEXT=2`, `ADVANCE=3`, `END=4`, and invalid inner event `=5`; `eventOrdinal` is the event ordinal for valid `REQUEST`/`CANCEL` and `-1` otherwise; `eventPath` is the raw UTF-8 path bytes for a valid `REQUEST` and the empty byte string otherwise; `eventBytes` is the inner event's RFC 8785 JCS bytes. The final component deterministically orders otherwise identical events. The original envelope values are copied unchanged into the trace.
+The finite event alphabet is `REQUEST`, `ADVANCE`, `RELEASE_NEXT`, `CANCEL`, and `END`. Exact event variants are `{"type":"REQUEST","method":"GET","path":"<UTF-8 string>"}`, `{"type":"ADVANCE"}`, `{"type":"RELEASE_NEXT"}`, `{"type":"CANCEL","normalizedRequestKey":"<validated key>"}`, and `{"type":"END"}`; each rejects unknown fields. Input is a strict JCS array of `{"logicalTick":N,"eventSequence":N,"event":E}`. `logicalTick` is a non-negative integer no greater than `maximumTick`; `eventSequence` is its globally unique, contiguous zero-based input position. Before replay, envelopes are schema-validated. Invalid envelope/input returns `INVALID_INPUT` with detail `INVALID_ENVELOPE`, `EVENT_LIMIT`, or `TICK_LIMIT`, no trace, and the canonical initial state. A structurally invalid event returns `INVALID_INPUT` with detail `INVALID_EVENT`, a trace row, and no state mutation.
 
-Validation precedence is envelope schema, event-count/tick bounds, inner-event schema, terminal state, event permission, clock/request-count bounds, ordinal, method, path, pending bound, then availability. A method is valid only when exactly uppercase `GET`; a path is valid only when lowercase ASCII POSIX-relative without scheme/authority/query/fragment/percent encoding/backslash/dot segment. A mismatched request ordinal produces `INVALID_ORDINAL`, status 409, and no state change. An invalid inner event produces `INVALID_EVENT`; input above `maximumEvents` produces pre-replay `EVENT_LIMIT`; an envelope above `maximumTick` produces `TICK_LIMIT`; an `ADVANCE` when `clock == maximumClock` produces `CLOCK_LIMIT`; a request when `requestCount == maximumRequests` produces `REQUEST_LIMIT`; and a queued request requiring insertion when `pending.length == maximumPending` produces `PENDING_LIMIT`. Each transition-bound error returns `null` and leaves state unchanged. Otherwise every valid-ordinal request increments both `nextRequest` and `requestCount`, including a 400, 404, or 410 request. Terminal requests still pass ordinal, method, and path validation before terminal path selection. Empty 400/404/409/410 responses use `[["content-length","0"]]`; locked responses use `[["content-length","<decimal-size>"],["content-type","<recipe-literal>"]]`. “Available” means present in the current machine projection; “another segment exists” means `sequence + 1 < segmentCount`.
+Requests are normalized and then ordered within a tick by exactly `(logicalTick, eventSequence, normalizedRequestKey)`, comparing integer components numerically and the normalized key as UTF-8 bytes. Non-request events use the schema-fixed empty key. The normalized request key is `GET` plus one U+0020 followed by the validated lowercase-ASCII POSIX-relative path. The complete input is already unique by `eventSequence`; no locale, raw request bytes, scheduler, wall clock, or default collation participates.
 
-The total common transition table applies only after earlier-precedence checks above:
+Every transition returns the strict result `{"machineResult":"OK|INVALID_INPUT|INVALID_REQUEST|EVENT_LIMIT|TICK_LIMIT|REQUEST_LIMIT|PENDING_LIMIT|RELEASE_LIMIT|LOOP_LIMIT","response":R-or-null,"stateDigest":"lowercase-64-hex"}`. A response is exactly `{"status":N,"headers":[["name","value"]],"bodyObjectSha256":"lowercase-64-hex","stateDigest":"lowercase-64-hex"}`: status is an integer; headers are the machine-row fixed ordered list; body identity is the raw SHA-256 of the exact body object; and `stateDigest` is the `nova-play:machine-state:v1` hash of resulting-state JCS. A no-body response has the zero-length empty byte string, never `{}`, `null`, a newline, or textual JSON, and raw SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`. Every no-body 4xx, 410, queued response, or queue error uses that value unless its conformance row explicitly lock-lists another body object.
 
-| State/event | Next state | Response |
-|---|---|---|
-| structurally invalid inner event | unchanged | `null`, trace error `INVALID_EVENT` |
-| input above `maximumEvents` | no replay | deterministic validation error `EVENT_LIMIT`; no trace |
-| envelope above `maximumTick` | unchanged | `null`, trace error `TICK_LIMIT` |
-| `ADVANCE` at `maximumClock` | unchanged | `null`, trace error `CLOCK_LIMIT` |
-| any `REQUEST` at `maximumRequests` | unchanged | `null`, trace error `REQUEST_LIMIT` |
-| queued valid available `REQUEST` at `maximumPending` | unchanged | `null`, trace error `PENDING_LIMIT` |
-| any `REQUEST` with `ordinal != nextRequest` | unchanged | 409, fixed empty headers/body hash, trace error `INVALID_ORDINAL` |
-| nonterminal `REQUEST`, valid ordinal but invalid method/path | `nextRequest += 1`; `requestCount += 1` | 400, fixed empty headers, `bodyObjectSha256` of fixed empty body |
-| nonterminal `REQUEST`, valid unavailable path | `nextRequest += 1`; `requestCount += 1` | 404 with fixed headers/body hash |
-| nonterminal `REQUEST`, valid available path | `nextRequest += 1`; `requestCount += 1`; queued delay mode appends `{ordinal,path,releaseAfter}` | HLS/DASH or immediate delay mode: 200 locked response; queued delay mode: `null` |
-| nonterminal `ADVANCE` | `clock += 1`; if `sequence + 1 < segmentCount`, set `sequence=sequence+1` and `windowStart=max(0,sequence-windowWidth+1)` using the incremented sequence; else if `loopsRemaining > 0`, set `loopsRemaining=loopsRemaining-1`, `sequence=0`, and `windowStart=0`; otherwise set `terminal=true` | `null` |
-| delay `RELEASE_NEXT` | decrement every positive `releaseAfter` in ordinal order, release/remove the lowest ordinal now at zero, append ordinal to `released`; if none pending, unchanged | released locked response or `null` |
-| delay `CANCEL(N)` | remove pending ordinal N if present; otherwise unchanged | `null` |
-| live-machine `RELEASE_NEXT` or `CANCEL` | unchanged | trace error `EVENT_NOT_ALLOWED` |
-| nonterminal `END` | `terminal=true`, pending cleared | `null` |
-| terminal `REQUEST`, valid ordinal but invalid method/path | `nextRequest += 1`; `requestCount += 1` | 400, fixed empty headers, `bodyObjectSha256` of fixed empty body |
-| terminal `REQUEST`, valid ordinal/method/path to the recipe-literal manifest or MPD | `nextRequest += 1`; `requestCount += 1` | fixed 410 response |
-| terminal `REQUEST`, valid ordinal/method/path to every other normalized path | `nextRequest += 1`; `requestCount += 1` | fixed 404 response |
-| terminal `ADVANCE`, `RELEASE_NEXT`, `CANCEL`, or `END` | unchanged | `null` |
+For every request, the total decision procedure is exactly:
 
-For `nova-play-hls-live-v1`, the recipe-literal manifest path is always available while nonterminal; segment path at recipe-array index `i` is available exactly when `windowStart <= i <= sequence`; every other normalized path is unavailable. Manifest response bytes are the locked projection of those inclusive indices. For `nova-play-dash-live-v1`, the recipe-literal MPD path is always available while nonterminal; segment path at recipe-array index `i` is available exactly when `windowStart <= i <= sequence`; every other normalized path is unavailable. The MPD response uses the locked projection with recipe-literal period/adaptation/representation IDs. For `nova-play-hls-delay-v1`, the exact keys of the recipe path-to-`releaseAfter` map are available and every other normalized path is unavailable. Recipes declare `mode` as `queued` for A or `immediate` for B. Queued mode appends pending state and returns `null`; immediate mode returns the locked response and never appends pending state. No host wall clock, scheduler, randomness, or upstream participates. Recipes fix maximum events, ticks, logical clock, requests, pending entries, segments, window width, loops, and response bytes.
+1. Normalize and validate the request. Invalid requests return declared status 400 and machine result `INVALID_REQUEST`.
+2. Evaluate machine-global terminal state. A terminal request returns the declared terminal status/body; queue capacity is not inspected.
+3. Resolve requested resource identity.
+4. An unknown resource returns declared 404; a known but unavailable live-window resource returns declared 410; queue capacity is not inspected.
+5. Determine whether the response can be emitted immediately.
+6. An immediate response is emitted; queue capacity is not inspected.
+7. Only when insertion into the pending map is required is capacity tested.
+8. A full pending map returns `PENDING_LIMIT`, the fixed queue response, and no insertion or state mutation.
+9. Otherwise the exact pending entry is inserted and the declared queued response is returned.
 
-A non-null response is the strict object `{"status":N,"headers":[["name","value"]],"bodyObjectSha256":"lowercase-64-hex"}` with no unknown fields. `status` is exactly the transition-table integer. Header names and values are lowercase ASCII strings in exact listed order: empty responses use `[["content-length","0"]]`; locked responses use `[["content-length","<decimal body byte size>"],["content-type","<recipe-literal>"]]`. `bodyObjectSha256` is raw SHA-256 of the exact empty-body object for empty responses or exact locked body object for locked responses. A pending or no-response transition uses JSON `null`.
+Thus invalid, terminal, unknown, unavailable, and immediate requests never compete with `PENDING_LIMIT`. A valid request consumes its expected ordinal and request count only at the branch specified by its golden row; invalid input and `PENDING_LIMIT` do not mutate state.
 
-Canonical trace JCS is an array of the processed input envelopes extended with `priorStateHash`, `nextStateHash`, `response`, and `traceError`; the closed trace-error enum is `null`, `INVALID_EVENT`, `TICK_LIMIT`, `CLOCK_LIMIT`, `REQUEST_LIMIT`, `PENDING_LIMIT`, `INVALID_ORDINAL`, or `EVENT_NOT_ALLOWED`. `INVALID_ENVELOPE` and `EVENT_LIMIT` are closed pre-replay validation-report errors and produce no transition trace. Events sharing `tick` form one group and are sorted by the total event key above before transitions. Each machine definition contains exact initial-state, success/window-advance, unavailable-path, invalid-request, invalid-event, invalid-envelope, terminal-invalid-request, terminal-manifest, terminal-other-path, same-tick-all-event-types, each exact bound edge and overflow, loop, natural-terminal, explicit-END, and bounds traces; the delay machine additionally contains queued-release, immediate-response, multiple-pending-order, early-release, missing-cancel, successful-cancel, and terminal-clears-pending traces. Validators replay every transition and compare complete trace JCS bytes. Real-device cancellation timing remains Phase 2 evidence.
+A pending entry is the strict object `{"normalizedRequestKey":"...","bodyObjectSha256":"lowercase-64-hex","enqueueLogicalTick":N,"enqueueEventSequence":N,"releaseAfter":N,"releaseCountConsumed":N,"status":N,"headers":[["name","value"]],"terminalDisposition":"cancel-with-terminal-response"}`. Entries are keyed by normalized request key; duplicate insertion is schema-invalid. `releaseAfter` is a bounded positive integer with minimum 1 and maximum `maximumReleaseAfter`; zero, negative, non-integer, or over-maximum values are schema-invalid. `releaseCountConsumed` starts at zero and cannot exceed `releaseAfter`. `RELEASE_NEXT` increments the machine release count and every pending entry’s consumed count in normalized-request-key UTF-8-byte order, then emits/removes only the first eligible entry in that order. Remaining eligible entries wait for later `RELEASE_NEXT` events without another increment; this one-response rule preserves the exact transition-result schema and is subject to `maximumReleaseCount`.
+
+HLS live exposes its manifest immediately while nonterminal and segments exactly within the inclusive `[windowStart,segmentSequence]`; known segments outside the current window are unavailable (410), and unknown paths are 404. DASH live applies the same rule to its MPD and concretized segment identities. Delay A requires pending insertion for each known configured path; delay B emits the same locked resource immediately. Manifest and segment delay rows are independently configured and tested.
+
+`ADVANCE` increments `logicalTick`. If another segment exists, it advances `segmentSequence` and recomputes the inclusive window. Otherwise it consumes one loop and resets the window when `loopsRemaining > 0`; with no loop remaining it enters natural terminal state. `END` also enters terminal state. Entering terminal by either route deterministically cancels every pending entry in normalized-request-key UTF-8-byte order. Each cancellation emits a trace subevent with the machine’s declared terminal status, fixed ordered headers, empty-body hash above, and resulting state digest. No pending entry may release after terminal; the final state has an empty pending map. A terminal `ADVANCE`, `RELEASE_NEXT`, `CANCEL`, or `END` is a defined no-op result. All other valid state/event pairs, including missing cancellation targets and empty release operations, have an explicit deterministic row in the machine definition.
+
+Canonical trace JCS is a strict array whose row schema is `{"logicalTick":N,"eventSequence":N,"normalizedRequestKey":"...","event":E,"priorStateDigest":"lowercase-64-hex","result":R,"terminalCancellations":[R...],"resultingState":S,"resultingStateDigest":"lowercase-64-hex"}`. Arrays preserve transition and cancellation order; no field is omitted. Each machine definition lock-lists exact trace JCS bytes and `traceHash`. Implementations must reproduce both exactly.
+
+Normative golden traces cover: full queue plus unknown resource; full queue plus unavailable resource; full queue plus terminal machine; full queue plus immediately available resource; full queue plus insertion-required resource; natural terminal with zero, one, and multiple pending entries; `releaseAfter=1`; maximum `releaseAfter`; rejected zero and over-maximum values; same-tick request ordering; every precedence branch; every valid state/event pair; every bound and failure result; HLS and DASH loop/window boundaries; and delayed manifest and delayed segment behavior for A. Golden traces separately prove terminal cancellation order, no post-terminal release, and an empty final pending map. Real-device cancellation timing remains Phase 2 evidence.
 
 ## 15. Deterministic execution envelope
 
@@ -708,19 +772,41 @@ The approval object binds, at minimum:
 
 Promotion changes only signed fields. The bare word `latest` is never an unpinned alias; the API field is the explicit `make_latest` field/value. A changed bound field invalidates approval.
 
-For policy v1, `signedAt` is informational. A key must be `active` for principal/namespace in the exact policy blob bound by E. Policy evolution follows protected Git ancestry and monotonic `policySequence`. Rotation adds a key; overlap exists only while both full key IDs are active. Retirement prevents new approvals under later policies but preserves history unless revoked. Compromise may retroactively revoke named approvals. Revoked approval cannot publish and makes a published version `REVOKED`; wall-clock time alone never authorizes.
+### 20.1 Pinned genesis and policy chain
 
-Policy and revocation discovery is repository-derived, not caller-selected. For a current-validity decision, the verifier independently resolves and records repository numeric ID, protected default-ref name, ref object ID, and its exact tip as `verificationCommit`; a caller-supplied older commit fails. The verifier proves that tip is a descendant of E and loads policy history only from its Git tree. A newer trusted monotonic checkpoint may substitute only when policy defines and verifies that checkpoint. Historical/as-of verification is a separately labelled non-authorizing mode and cannot permit publication or make a current trust claim. Immutable policy records are `docs/android/signing/policy-history/<8-digit-policySequence>.json`; `docs/android/signing/policy.json` must be byte-identical to the highest-sequence history record. Sequence starts at zero, has no gap or duplicate, and each record contains exact `policySchemaVersion`, `policySequence`, `priorPolicyBlobHash` (`null` only at zero), repository numeric ID, principals, namespaces, full public-key bytes/IDs and states, revocation authorities, and policy-transition authorities. Every `priorPolicyBlobHash` must equal the raw SHA-256 of the preceding history blob, and every policy-transition detached signature must validate over exact policy JCS under an authority active in that preceding policy. Unknown policy files, fields, sequences, ancestry, or signatures fail closed.
+The future written-design approval record and Plan 1 authority root must pin signing-policy sequence `0`, the genesis policy’s exact raw SHA-256 and Git blob ID, complete authorized public-key bytes, principal `corpus-owner-v1`, namespace `nova-play-corpus-approval-v1`, an explicit owner trust statement, and exact policy-schema and hash-registry versions. No chain is valid without byte and ancestry equality to this genesis root.
 
-The complete current revocation set is every Git blob matching `docs/android/signing/revocations/<8-digit-revocationSequence>-<revocationDigest>.json` in the `verificationCommit` tree, with its same-basename `.sig`; no API input or reduced list may override it. Revocation sequence starts at zero, is contiguous and unique, and path order must equal numeric sequence order. Each strict revocation JCS object contains exactly `revocationSchemaVersion`, `hashRegistryVersion`, repository owner/name and numeric ID, `revocationSequence`, `priorRevocationDigest` (`null` only at zero), `authorizingPolicySequence`, authority principal and full key ID, revoked full key ID, sorted unique exact `approvalDigests`, optional inclusive `policySequenceRange` or JSON `null`, sorted unique exact Release numeric IDs, sorted unique exact `receiptDigests`, corpus-version scope or JSON `null`, and non-empty reason. It contains no `revocationDigest` or time-based authority field. A new record's `authorizingPolicySequence` must equal the highest validated policy at the commit that first contains it, and its authority must be active there for namespace `nova-play-corpus-revocation-v1`; historical policies verify existing records but cannot authorize new records. The filename digest and each successor's `priorRevocationDigest` must equal the externally computed `revocationDigest`; the detached signature must validate exact JCS bytes against that current authority. Unknown fields, a missing sibling signature, a gap, duplicate, malformed scope, invalid signature, untrusted policy, or omitted tree record fails closed. Historical verification evaluates the approval against its E-bound policy and then applies this complete validated set through `verificationCommit`.
+Every strict policy contains corpus/project scope; monotonic `policySequence`; prior `signingPolicyDigest` (`null` only at genesis); active and retired key arrays; key IDs derived from exact complete public-key bytes; allowed principals/namespaces; transition-authority rules; and externally computed `signingPolicyDigest`. Policy history is contiguous. A transition is valid only when signed/authorized under the immediately prior valid policy and committed on protected ancestry. Unknown fields, gaps, duplicates, unpinned genesis, invalid transitions, or caller-selected policy tips fail closed.
+
+Approval A validates against both the exact E-bound policy and the highest valid policy reachable at A’s parent. Its signer key must be active for the principal/namespace in both. A key retired by the A-parent policy therefore cannot create a new approval for an older unapproved E. Rotation overlap exists only when old and new keys are both active in both applicable policies. Signer-supplied `signedAt` is informational and never restores authority.
+
+Policy and revocation discovery is repository-derived. Current verification independently resolves repository numeric ID, protected default ref, ref object ID, and exact `verificationCommit`; historical verification is separately labelled and non-authorizing. Historical validation always uses the pinned genesis, complete valid policy chain, both E-bound and A-parent checks, and the complete current valid revocation chain.
+
+### 20.2 Single revocation-selector predicate
+
+A strict revocation contains project/corpus scope, contiguous `revocationSequence`, `priorRevocationDigest` (`null` only at zero), reason, authority, and `selectorMode`, which is exactly one of `key-wide`, `approval-set`, `policy-range`, `release-set`, or `receipt-set`. Exactly the field required by that mode is present and non-empty; every other selector field is forbidden. Matching is the single predicate: scope matches **and** the selected mode predicate matches. No union, intersection, fallback, or empty-selector interpretation exists.
+
+- `key-wide` requires one exact public-key ID and matches that ID.
+- `approval-set` requires a non-empty UTF-8-byte-sorted unique array of exact approval digests.
+- `policy-range` requires inclusive non-negative integer `minimumPolicySequence` and `maximumPolicySequence`, with minimum no greater than maximum.
+- `release-set` requires a non-empty numerically sorted unique array of exact Release numeric IDs.
+- `receipt-set` requires a non-empty UTF-8-byte-sorted unique array of exact receipt digests.
+
+The complete current revocation chain is loaded from the protected verification tree, is contiguous, digest-linked, signed by authority active under the policy at first commit, and cannot be reduced by an API input. Compromise may revoke historical named approvals through `approval-set` or all approvals by an exact key through `key-wide`. A revoked approval cannot promote; an already published matching corpus version becomes `REVOKED`.
+
+Golden tests cover pinned genesis, complete chain, rotation overlap, retirement cutover, an older E approved after retirement, every selector mode, nonmatching scope, malformed mixed selectors, compromise, and historical validation. Wall-clock time alone never authorizes.
 
 ## 21. Append-only state machine
 
-Durable events live at `docs/android/playback-corpus-events/<corpusVersion>/`; filenames are `<8-digit-sequence>-<EVENT_TYPE>.json`, where the uppercase event type is one of the enums in this section. The chain is corpus-version-wide: sequence starts at `00000000`, is contiguous and unique with no gap, and is atomically allocated by the protected committing workflow. Sequence zero has `priorEventDigest:null`; every later value equals the externally computed digest of the immediately preceding event. Filename sequence/type must equal object sequence/type. Committed transitions only append files and never modify or delete them.
+Durable events live at `docs/android/playback-corpus-events/<corpusVersion>/`; filenames are `<8-digit-sequence>-<EVENT_TYPE>.json`. Producers never precompute final chain fields.
 
-Every event is strict versioned JCS with exactly `eventSchemaVersion`, `eventType`, `corpusVersion`, `transactionId`, `attemptId`, `sequence`, `priorEventDigest`, `state`, `disposition`, `actor`, `authority`, `gitIdentities`, `githubIdentities`, `artifactDigests`, `evidence`, and `observationTime`; nullable fields are present as JSON `null`, unknown fields are rejected, and every enum/type is schema-closed. `observationTime` is informational but remains included in the complete event JCS and therefore in `eventDigest`. Digest-map keys must be exact Section 12 field names.
+An event proposal is strict JCS containing event schema/type, corpus version, transaction ID, attempt ID, proposed state/disposition, actor and asserted authority, source/evidence/artifact/GitHub references, event evidence, run-specific informational observation time, and expected chain-tip digest. It must not contain final sequence, prior-event digest, final event digest, or final filename. Its external `eventProposalDigest` uses `nova-play:event-proposal:v1`.
 
-Candidate/staging events that reach E are imported byte-for-byte into E. Failed pre-E attempts are durably committed by a protected evidence-only incident commit before retry; that commit may append only their events and incident evidence. `OWNER_APPROVED` is committed in A and binds approval/signature blob IDs and external `approvalDigest`, never A's commit ID. Promotion-produced `CORPUS_TAGGED`, `RELEASE_PUBLISHED`, and verifier-produced `RECEIPT_PROPOSED` events are imported with `RECEIPT_COMMITTED` into R. `RECEIPT_VERIFIED` and later closure events are appended in subsequent path-limited commits. A transaction/attempt absorbing disposition terminates that attempt but not this corpus-version chain; the next attempt receives new IDs and the next global sequence.
+Only the protected path-limited event-commit workflow finalizes. It (1) acquires a repository concurrency lease for the corpus-version chain; (2) reads the protected branch tip and complete event directory; (3) validates contiguous sequence and every prior digest; (4) compares the proposal’s expected chain tip; (5) rejects or reconciles a stale proposal; (6) allocates the next zero-padded sequence; (7) injects prior digest; (8) constructs strict final-event JCS; (9) computes external `eventDigest`; (10) creates the exact filename; (11) commits atomically without altering prior events; and (12) verifies the committed Git blob and resulting chain. On branch CAS failure it rereads/revalidates, finalizes against the new tip only when the proposal remains semantically valid, or requires a new proposal. It never rewrites a proposal as though it had been final.
+
+Before candidate execution, S commits and binds a strict incident policy authorizing candidate/staging proposals and incident finalization before E. Candidate identity binds its exact Git blob and `incidentPolicyDigest`; E copies/references them. The exact transition is `EVIDENCE_POLICY_ACTIVATED`, finalized atomically as part of E by the event-commit workflow. It binds the S-bound policy blob/digest, the complete proposed E tree projection and its externally computed digest, the E-bound event/signing policy blob/digest, and the normative content-lock/staging identities; it does not contain E’s not-yet-created commit ID. After E commits and its resulting tree is verified against that projection, approval/publication/receipt/closure proposals require E-bound authority. A remains the direct child of E. No byte import is a transition.
+
+Candidate, stage, promotion, and verifier components emit proposals. `OWNER_APPROVED`, `CORPUS_TAGGED`, `RELEASE_PUBLISHED`, `RECEIPT_PROPOSED`, `RECEIPT_COMMITTED`, `RECEIPT_VERIFIED`, incident, rejection, quarantine, revocation, and closure transitions all use the same finalizer. `REJECTED` and `QUARANTINED` remain absorbing for their transaction/attempt; `REVOKED` remains absorbing for the corpus version. No producer imports an event byte-for-byte or assigns its sequence.
 
 Nominal progress:
 
@@ -728,7 +814,7 @@ Nominal progress:
 SPEC_COMMITTED
 CANDIDATE_VALIDATED
 DRAFT_STAGED
-EVIDENCE_COMMITTED
+EVIDENCE_POLICY_ACTIVATED
 OWNER_APPROVED
 CORPUS_TAGGED
 RELEASE_PUBLISHED
@@ -751,8 +837,8 @@ REVOKED
 |---|---|---|---|---|
 | `SPEC_COMMITTED` | Protected source maintainer | Normative registry migration and schemas validate | source commit S, registry/spec digest | `CANDIDATE_VALIDATED` |
 | `CANDIDATE_VALIDATED` | Protected candidate workflow | Full lock, archive, envelope, oracle, licence, and attestation validation | candidate manifest, reports, attestation | `DRAFT_STAGED` |
-| `DRAFT_STAGED` | Protected stage workflow | Capability probe passed; stage preflight/revalidation passes | draft numeric Release/asset IDs, staging receipt | `EVIDENCE_COMMITTED` |
-| `EVIDENCE_COMMITTED` | Protected source maintainer | Evidence commit E contains stable receipt/lock/evidence facts only | E Git tree/blob hashes | `OWNER_APPROVED` |
+| `DRAFT_STAGED` | Protected stage workflow | Capability probe passed; stage preflight/revalidation passes | draft numeric Release/asset IDs, staging receipt | `EVIDENCE_POLICY_ACTIVATED` |
+| `EVIDENCE_POLICY_ACTIVATED` | Protected event finalizer | Atomically finalize this event inside E under S-bound authority, then verify E tree against its bound projection | S/E policy blobs/digests, proposed E tree projection/digest, resulting E tree/blob identities | `OWNER_APPROVED` |
 | `OWNER_APPROVED` | Corpus owner | Detached signature validates from A Git blobs; A is direct child of E and path-limited | approval digest and signature | `CORPUS_TAGGED` |
 | `CORPUS_TAGGED` | Protected promotion workflow | Protected environment approved; tag does not exist or matches exact planned annotated tag | annotated tag object and target S | `RELEASE_PUBLISHED` |
 | `RELEASE_PUBLISHED` | Protected promotion workflow | Approved publication only | public facts | `RECEIPT_PROPOSED` |
@@ -764,9 +850,9 @@ REVOKED
 
 | Disposition | Actor/authority | Guard/evidence | Scope and successor |
 |---|---|---|---|
-| `REJECTED` | Corpus owner or protected policy evaluator authorized by E-bound policy | Rejection with transaction/candidate/staging identities and reason | Terminates transaction; new same-version attempt allowed only before publication |
-| `QUARANTINED` | Protected validating workflow or incident authority named by E-bound policy | Identity/security/unknown-state incident and observations | Terminates retained attempt; reuse forbidden; new attempt only after incident review |
-| `REVOKED` | Corpus owner or revocation authority active in the applicable signing policy | Signed committed record naming key, approval/Release/receipt, scope, and reason | Terminates trust in corpus version; Release retained; corrected bytes require new version |
+| `REJECTED` | Before E: corpus owner or evaluator authorized by the S-bound incident policy; after E: authority in the E-bound policy | Rejection with transaction/candidate/staging identities and reason | Terminates transaction; new same-version attempt allowed only before publication |
+| `QUARANTINED` | Before E: validating workflow or incident authority in the S-bound incident policy; after E: authority in the E-bound policy | Identity/security/unknown-state incident and observations | Terminates retained attempt; reuse forbidden; new attempt only after incident review |
+| `REVOKED` | Corpus owner or revocation authority active in the applicable signing policy | Signed committed record with exactly one selector mode, matching scope, and reason | Terminates trust in corpus version; Release retained; corrected bytes require new version |
 
 Absorbing scope is transaction/attempt for `REJECTED`/`QUARANTINED` and corpus version for `REVOKED`, never the whole program. History is not rewritten or deleted.
 
@@ -821,6 +907,11 @@ Required test coverage:
 - Recipe normalization, source-lock validation, encoder capability detection, software-only enforcement, fixed-thread/environment enforcement, deterministic archive projection, and archive budget checks.
 - Oracle parsing, normalized `ffprobe` projection, subtitle/audio cue evidence, decoded synthetic-signal checks, negative fixture rules, and forbidden-collateral-fault checks.
 - Licence/provenance completeness for all 24 media rows and publication blocking for any missing or unresolved redistribution decision.
+- Exact one-class membership for every artifact schema/type; no missing, duplicate, inferred, or cross-class artifact; candidate projections retain every identity-critical field and reruns remain distinct.
+- Exact machine initial/event/pending/response/trace schemas; total transitions; empty-body hash; precedence/full-queue combinations; terminal cancellation; release-after boundaries; HLS/DASH loop/window boundaries; and delayed A manifest/segment golden bytes and hashes.
+- Closed hash-registry bidirectional coverage, one golden vector per row, receipt domain/raw identities, closure five-key sorting edges, duplicate rejection, and native Git/OCI/attestation separation.
+- Pinned signing genesis, complete ancestry, rotation overlap, retirement cutover including older E, dual E/A-parent checks, all five exclusive revocation selector modes, compromise, and historical validation.
+- Event-proposal forbidden-final-field checks, proposal-domain hash, protected finalization, stale/CAS reconciliation, S-bound pre-E authority, exact E policy transition, append-only history, and absorbing dispositions.
 - Append-only event transitions, absorbing disposition behavior, direct-parent approval commit validation, approval field binding, SSH signature namespace/principal/allowed-signers/rotation/revocation checks, and Git blob byte verification.
 - GitHub API adapters using recorded responses and fault injection: unknown outcomes, duplicate retry prevention, missing/changed assets, stale draft mutation, tag collision, partial failure, published-state recovery, and quarantine.
 - Capability probe end-to-end under the actual repository configuration.
@@ -905,26 +996,88 @@ The corpus may state only fixture integrity, content identity, provenance/approv
 | Archive growth | Row budgets, aggregate archive/extraction limits, early budget validation | Any mandatory corpus exceeds limits without owner-approved redesign |
 | GitHub API partial failure | Numeric IDs, idempotency key, query-before-retry, append-only quarantine | Unknown mutation outcome not reconciled exactly |
 | Owner key compromise | Versioned allowed signers, validity/rotation/revocation, detached signatures, revocation events | Signature-policy anomaly, key compromise report, or invalid signer |
-| Overbuilding infrastructure before Android value | Bounded tooling scope, no generator-image publication, one implementation plan split into testable tasks | Tooling expansion that does not advance a listed acceptance gate |
+| Overbuilding infrastructure before Android value | Bounded tooling scope, no generator-image publication, one program split into exactly eight independently reviewed plans | Tooling expansion that does not advance a listed acceptance gate |
 | Two-person maintenance burden | Explicit ownership, readable schemas, small focused modules, capability probe, documented recovery | Maintainers cannot independently perform verification/recovery |
 | Misread corpus success as product success | Explicit non-claims and device-claim tests | Any report/release language implies product/device proof |
 | Sensitive-data leakage | Synthetic-only preference, acquisition controls, redaction policy, logs/asset scanning | Any provider/private/tester/credential data appears |
 
-## 29. Implementation boundaries
+## 29. Exact eight-plan implementation boundary
 
-This document is intentionally focused enough for one implementation plan, but implementation should be decomposed into independently reviewable workstreams rather than a single large change:
+This is one playback-corpus program with exactly eight implementation plans, not eight unrelated architectures. Every plan is independently executable and independently reviewed, has its own plan document, exact acceptance commands/evidence, rollback boundary, and independent zero-Critical/Important review. There is no batch approval across trust boundaries.
 
-1. Registry extraction/migration and strict schemas.
-2. Deterministic container/toolchain and synthetic primitive/recipe generation.
-3. Closure resolver, oracle engine, archive packager, and local-live test server.
-4. Content lock/candidate/provenance/licence generation and validation.
-5. Capability probe, GitHub API adapter, workflow definitions, and attestations.
-6. Staging/approval/promotion/state-machine/recovery implementation.
-7. Independent verification, receipts/revocation, and full fault-injection test suite.
+### Plan 1 — Authority and normative integration
 
-All work remains under `tools/playback-corpus/`, `docs/android/`, `fixtures/playback-corpus/`, and `.github/workflows/` as specified in Section 6. It must not refactor `src/main.ts`, implement Android product behavior, alter provider handling, publish an image, or create public corpus artifacts before the gates permit it.
+**Input:** final written-design approval record.
 
-A later implementation plan may refine file names under each logical directory, but must not alter approved identity counts, artifact authority boundaries, privilege separation, hash domains, approval semantics, or publication safety rules without an owner-approved design revision.
+**Work:** atomically integrate decision statuses, plan v3, requirements, device policy, corpus registry, baseline wording, and authority hashes.
+
+**Green checkpoint:** one normative 24/13/32 root; no competing old 19-row authority; fresh-clone validation; independent zero-Critical/Important review. No later plan starts before Plan 1 is green.
+
+### Plan 2 — Registry, schemas, canonicalization, and hash contracts
+
+**Input:** Plan 1.
+
+**Work:** extraction; exact registry schemas; closed artifact-class registry; total hash registry; JCS/golden vectors; semantic-oracle schemas; executable-machine schemas; event proposal/finalization schemas; signing/revocation schemas.
+
+**Green checkpoint:** all contract, golden, and migration tests pass; independent zero-Critical/Important review.
+
+### Plan 3 — Pinned toolchain and fixture generation
+
+**Input:** Plan 2.
+
+**Work:** source-build `linux/amd64` image; x264/x265/libfdk/FFmpeg locks and capability checks; primitives, recipes, all media generation; deterministic controls; legal/tool inputs.
+
+**Green checkpoint:** tiny and full nonpublishing generation; deterministic-control rebuild; no unresolved fixture/tool/legal input; independent zero-Critical/Important review.
+
+### Plan 4 — Closures, oracles, archive, and replay machines
+
+**Inputs:** Plan 2 and stable fixture interfaces from Plan 3.
+
+**Work:** HLS/DASH closure; total live/delay machines; oracles; negative fixtures; canonical archive; resource bounds.
+
+It may develop against fixtures in parallel with Plan 3, but cannot finish green until Plan 3 output compatibility passes. Its green checkpoint is all closure/oracle/archive/machine golden and resource-bound tests passing plus independent zero-Critical/Important review.
+
+### Plan 5 — Candidate, proposed lock, provenance, and legal gates
+
+**Inputs:** Plans 2, 3, and 4 green.
+
+**Work:** candidate manifest; proposed lock; full run identity; reports/attestations; per-row provenance and redistribution states; archive budget and candidate workflow.
+
+**Green checkpoint:** protected nonpublishing candidate validates all 24 rows and fails closed; independent zero-Critical/Important review.
+
+### Plan 6 — GitHub capability probe and read-only API adapter
+
+**Inputs:** Plans 1 and 2.
+
+**Work:** actual-plan/repository capability probe; numeric identities; draft/public/immutable behavior; environments/reviewers; artifact/attestation; query-before-retry read-only adapter.
+
+It may run in parallel with Plans 3–5 and must be green before Plan 7. Its green checkpoint is all probe/adapter contract and fault-injection tests passing under actual settings plus independent zero-Critical/Important review.
+
+### Plan 7 — Staging, signing, promotion, and append-only state
+
+**Inputs:** Plans 5 and 6 green.
+
+**Work:** staging; E; genesis/rotation/revocation policy; A; event proposal/finalization; protected promotion; tag; concurrency/recovery.
+
+**Green checkpoint:** protected test-repository fault injection; exact identity/signature; no stale events, blind retry, or unauthorized mutation; independent zero-Critical/Important review.
+
+### Plan 8 — Public verification, receipt, revocation, and closure handoff
+
+**Input:** Plan 7.
+
+**Work:** public verification; proposed receipt; R; post-commit verification; current revocation discovery; public failure handling; end-to-end fault injection; handoff to broader Phase 1 closure.
+
+**Green checkpoint:** exact public receipt; revocation tests fail closed; independent zero-Critical/Important review.
+
+The dependency graph is exactly:
+
+```text
+1 -> 2 -> (3 || 4; both green) -> 5
+2 -> 6 in parallel with 3–5
+5 + 6 -> 7 -> 8
+```
+
+All work remains under `tools/playback-corpus/`, `docs/android/`, `fixtures/playback-corpus/`, and `.github/workflows/` as specified in Section 6. It must not refactor `src/main.ts`, implement Android product behavior, alter provider handling, publish an image, or create public corpus artifacts before the gates permit it. A plan may refine file names under each logical directory but cannot change identity counts, authority boundaries, privilege separation, hash domains, approval semantics, or publication safety without an owner-approved design revision.
 
 ## 30. Design approval record
 
