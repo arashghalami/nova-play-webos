@@ -105,9 +105,11 @@ The design has six authority planes:
 
 Authority moves forward only through validated, append-only evidence. A later plane cannot rewrite a prior plane:
 
-`future integrated registry -> candidate + proposed lock -> staging receipt -> evidence commit E + normative content lock -> owner approval -> published Release -> proposed receipt -> receipt commit R -> post-commit receipt verification`.
+`future integrated registry -> candidate core + proposed lock -> candidate-evidence-index -> staging receipt -> evidence commit E + normative content lock -> owner approval -> published Release -> proposed receipt -> receipt commit R -> post-commit receipt verification`.
 
-Source/spec/tooling commit S contains the integrated registry, schemas, oracles, recipes, tooling, policies, and workflows but no authoritative content lock for bytes that do not yet exist. Staging uploads the exact candidate bytes and proposed lock unchanged. Approval binds E, the committed lock Git blob, its raw hash, and candidate/staging identity. Any byte or lock change after E requires a new candidate, staging transaction, E, and approval. Generation must never be described as validation against a pre-existing committed lock.
+The candidate core is finalized and hashed as `candidateDigest` before any Actions artifact is uploaded. The reports, attestation, and payload Actions artifacts bind that `candidateDigest`; the separate `candidate-evidence-index` then binds `candidateDigest` together with those already-uploaded post-upload identities and is hashed externally as `candidateEvidenceDigest`. The identity of the later artifact that carries the index is external run/staging evidence, recorded by the staging observation/receipt rather than inside the index.
+
+Source/spec/tooling commit S contains the integrated registry, schemas, oracles, recipes, tooling, policies, and workflows but no authoritative content lock for bytes that do not yet exist. Staging uploads the exact candidate bytes and proposed lock unchanged. Approval binds E, the committed lock Git blob, its raw hash, and both `candidateDigest` and `candidateEvidenceDigest`. Any byte or lock change after E requires a new candidate, staging transaction, E, and approval. Generation must never be described as validation against a pre-existing committed lock.
 
 A Release is authoritative for immutable distributable bytes; Git is authoritative for committed control artifacts and their Git blob bytes. The archive itself stays ignored and is never added to Git.
 
@@ -312,11 +314,19 @@ The candidate output is `proposed-content-lock.json`; E copies its exact bytes t
 
 The proposed lock is non-authoritative during candidate generation and staging. It becomes normative content identity only when E commits the byte-for-byte copy after independent staging validation. Approval binds E, the lock Git blob ID, `lockRawSha256`, and candidate/staging identity.
 
-### 11.2 `candidate-manifest.json`
+### 11.2 `candidate-manifest.json` (candidate core)
 
-The candidate manifest and `candidateDigest` projection contain: GitHub server URL; repository owner/name and numeric repository ID; source SHA and protected-ref identity; candidate workflow path and Git blob hash; workflow run ID and attempt; every numeric Actions artifact ID, exact name, size, and digest; attestation subject name/digest, issuer, signer workflow identity, and attestation digest; runner OS/image/kernel/architecture; OCI index, selected manifest, config, and layer digests; toolchain, recipe, oracle, schema, and policy hashes; proposed-lock, archive, report, and evidence hashes; and transaction/attempt identity. It has no future Release location or self-hash. Every later object binds the exact externally computed `candidateDigest`.
+`candidate-manifest.json` is the **candidate core**. Its exact JCS and `candidateDigest` projection contain only identities that already exist before the core is finalized: GitHub server URL; repository owner/name and numeric repository ID; source SHA and protected-ref identity; candidate workflow path and Git blob hash; already-known workflow run ID and attempt; transaction/attempt identity; runner OS/image/kernel/architecture; OCI index, selected manifest, config, and layer digests; toolchain, recipe, oracle, schema, and policy hashes; and the proposed-lock and archive hashes and any other deterministic outputs already finalized before the core.
 
-It is produced by the protected candidate workflow and becomes authoritative candidate evidence only after all candidate validation gates pass.
+The candidate core must not contain: its own digest; any Actions artifact ID or digest assigned only after upload; the attestation envelope digest; any validation/report/evidence identity whose bytes bind `candidateDigest`; `candidateEvidenceDigest`; or the identity of the artifact that carries the evidence index. It has no future Release location and no self-hash. Every later object binds the exact externally computed `candidateDigest`.
+
+It is produced by the protected candidate workflow and becomes authoritative candidate-core evidence only after all candidate validation gates pass.
+
+### 11.2.1 `candidate-evidence-index`
+
+`candidate-evidence-index` is a single closed-registry artifact finalized after the candidate core, its reports, its attestation, and its payload Actions artifacts already exist. Its exact JCS binds: `candidateDigest`; the reports and evidence produced from that candidate; the attestation subject and envelope identities; and the numeric IDs, exact names, sizes, and API-declared digests of the already-uploaded candidate payload artifacts. It is hashed externally as `candidateEvidenceDigest`.
+
+The index must not identify or hash itself, must not contain `candidateEvidenceDigest`, and must not contain the later Actions identity of the artifact that carries the index. That carrier identity is external run/staging evidence: the staging receipt binds the verified index bytes and `candidateEvidenceDigest` to that external carrier identity. A rerun remains a distinct candidate through repository, workflow, run, attempt, and transaction bindings; no post-upload identity is ever admitted into the candidate core.
 
 ### 11.3 `staging-receipt.json`
 
@@ -366,6 +376,7 @@ For `deterministic-control`, the equality rule is `raw-byte` for exact files/bin
 | delay-machine definition | Full `nova-play-hls-delay-v1` strict JCS | JCS-byte | fixed machine policy, recipe, and objects | `machineDefinitionHash` |
 | canonical machine conformance trace | Full canonical trace JCS | JCS-byte | machine definition and canonical event input | `traceHash` |
 | signing policy artifact | Full strict policy JCS | JCS-byte | prior valid policy, protected transition authorization, fixed scope/keys | `signingPolicyDigest` |
+| signing-policy-transition proposal | Full strict transition-proposal JCS with no trailing newline | JCS-byte | repository owner/name/numeric ID, intended protected ref, expected protected parent commit, prior policy sequence/digest/blob identity, proposed policy sequence/raw-byte identity/`signingPolicyDigest`, policy schema/hash-registry versions, transition intent, prior-policy-required signer identity | `policyTransitionProposalDigest` |
 | publication policy artifact | Full strict publication-policy JCS | JCS-byte | approved immutable publication rules | `immutableReleasePolicyHash` |
 | incident policy artifact | Full strict S-bound incident-policy JCS | JCS-byte | approved pre-E proposal/finalization authorities | `incidentPolicyDigest` |
 | signing-policy schema | Exact UTF-8 schema file | raw-byte | approved schema source | `schemaHash` |
@@ -392,12 +403,14 @@ For `deterministic-public-fact`, JCS bytes are deterministic from one fixed exte
 | revocation record | Protected-tree record, selector facts, authority, and exact signature-bound policy sequence | JCS-byte after protected commit | `revocationDigest` |
 | immutable GitHub capability-probe fact record | Named API/probe evidence at repository numeric ID and configuration snapshot; normalize declared immutable result fields | JCS-byte after approval | `capabilityProbeDigest` |
 | public Release/tag/asset projection | Exact Git tag object and GitHub Release/asset API identity fields declared by publication schema | JCS-byte after publication | `publicReleaseProjectionDigest` |
+| signing-policy-transition Git/ref evidence | Post-commit repository/ref, expected parent, resulting commit/tree/blob identities, and exact policy/proposal/signature identities, computed only after the protected transition commit | JCS-byte after protected commit | `policyTransitionEvidenceDigest` |
 
 `run-evidence` bytes may differ. Each stable binding projection is strict JCS. Mandatory identity fields may never be omitted from that projection; permitted variation is limited to the row’s listed fields; every other exclusion is forbidden. Equivalence means byte equality of the complete stable binding projection, except that candidate identity is intentionally distinct for every rerun.
 
 | Artifact name (`run-evidence`) | Mandatory stable binding projection | Permitted run-varying fields | Equivalence rule |
 |---|---|---|---|
-| candidate manifest | Repository owner/name/numeric ID; source commit; workflow path/blob; run ID/attempt; numeric artifact IDs/names/sizes/digests; attestation subject/issuer/signer; runner/OCI/toolchain/recipe/oracle/schema/policy/proposed-lock/archive/report/evidence identities; transaction/attempt | observation times and bounded diagnostics only | Complete projection JCS equality; a rerun is never equivalent |
+| candidate manifest (candidate core) | Repository owner/name/numeric ID; source commit; workflow path/blob; run ID/attempt; runner/OCI/toolchain/recipe/oracle/schema/policy/proposed-lock/archive identities; transaction/attempt | observation times and bounded diagnostics only | Complete projection JCS equality; a rerun is never equivalent |
+| candidate-evidence-index | `candidateDigest`; report/evidence identities produced from the candidate; attestation subject/envelope identities; numeric Actions artifact IDs/names/sizes/API-declared digests of the already-uploaded candidate payload artifacts; transaction/attempt | observation times and bounded diagnostics only | Complete projection JCS equality; a rerun is never equivalent |
 | provenance attestation envelope | Candidate identity; subject names/digests; predicate type; issuer; signer workflow identity; deterministic materials | envelope signature bytes and informational signed/observed time | Complete projection JCS equality |
 | validation report | Candidate/transaction/attempt/run identity; validator/schema/oracle/policy versions; ordered checks/results; deterministic input/output identities | start/end/observation time and bounded diagnostics | Complete projection JCS equality |
 | candidate observation | Candidate/transaction/attempt/run identity and named observed artifact/GitHub facts | observation time and bounded diagnostics | Complete projection JCS equality |
@@ -408,11 +421,12 @@ For `deterministic-public-fact`, JCS bytes are deterministic from one fixed exte
 | finalized append-only event | Event/corpus/transaction/attempt identity plus final sequence/prior digest/filename and complete proposal evidence | informational observation time only | Complete finalized-event projection JCS equality |
 | incident | Corpus/transaction/attempt, actor/authority, subject identities, policy/check versions, findings and disposition | run/attempt observation time and bounded diagnostics | Complete projection JCS equality |
 | detached owner signature | Approval digest, exact signer principal/namespace/full key ID, signature algorithm and signature bytes | signature nonce/material inherent to a distinct approval | Exact signature bytes plus binding projection equality |
+| detached signing-policy-transition signature | `policyTransitionProposalDigest`, exact signer principal, namespace `nova-play-signing-policy-transition-v1`, full key ID authorized by the immediately prior valid policy, signature algorithm and signature bytes over the exact proposal JCS | signature nonce/material inherent to a distinct transition | Exact signature bytes plus binding projection equality |
 | owner approval informational signed time | Approval digest and `signedAt` value | `signedAt` between distinct approvals only | Exact signed approval JCS equality; time grants no authority |
 | workflow log | Repository/source/workflow/run/attempt/transaction and subject artifact identities | ordered log messages and timestamps subject to redaction | Binding projection equality; log bytes need not match |
 | diagnostic record | Repository/source/workflow/run/attempt/transaction, check ID and subject identities | bounded diagnostic detail and observation time | Binding projection equality |
 
-Candidate comparison must never exclude repository identity, source commit, workflow path/blob, run ID, run attempt, numeric artifact IDs, artifact digests, or attestation subject/issuer/signer identity. A rerun is a distinct candidate even when all deterministic content matches. No comparison may use a reduced projection that drops one of those fields.
+Candidate-core comparison must never exclude repository identity, source commit, workflow path/blob, run ID, run attempt, or transaction identity. Candidate-evidence-index comparison must never exclude `candidateDigest`, numeric Actions artifact IDs, artifact API-declared digests, or attestation subject/issuer/signer identity. A rerun is a distinct candidate even when all deterministic content matches. No comparison may use a reduced projection that drops one of those fields.
 
 ## 12. Canonicalization and hash domains
 
@@ -431,7 +445,8 @@ SHA-256 values use lowercase 64-character hexadecimal unless an external API exp
 | `supersedesDocumentSha256` | SHA-256, raw | Complete prior file bytes | lowercase hex |
 | `lockDigest` | SHA-256, `nova-play:lock:v1` | Exact lock JCS | lowercase hex |
 | `lockRawSha256` | SHA-256, raw | Exact proposed/committed lock file bytes | lowercase hex |
-| `candidateDigest` | SHA-256, `nova-play:candidate:v1` | Exact candidate JCS | lowercase hex |
+| `candidateDigest` | SHA-256, `nova-play:candidate:v1` | Exact candidate-core JCS, which contains no `candidateDigest` | lowercase hex |
+| `candidateEvidenceDigest` | SHA-256, `nova-play:candidate-evidence:v1` | Exact candidate-evidence-index JCS, which contains neither `candidateEvidenceDigest` nor the index carrier's later Actions identity | lowercase hex |
 | `stagingDigest` | SHA-256, `nova-play:staging:v1` | Exact staging JCS | lowercase hex |
 | `approvalDigest` | SHA-256, `nova-play:approval:v1` | Exact signed approval JCS | lowercase hex |
 | `receiptDigest` | SHA-256, `nova-play:receipt:v1` | Exact proposed-receipt JCS bytes | lowercase hex |
@@ -490,6 +505,8 @@ SHA-256 values use lowercase 64-character hexadecimal unless an external API exp
 | `patchHash` | SHA-256, raw | Exact pinned patch bytes | lowercase hex |
 | `capabilityRequirementsHash` | SHA-256, `nova-play:capability-requirements:v1` | Full strict capability-requirements JCS | lowercase hex |
 | `signingPolicyDigest` | SHA-256, `nova-play:signing-policy:v1` | Full strict signing-policy JCS without externally computed digest | lowercase hex |
+| `policyTransitionProposalDigest` | SHA-256, `nova-play:signing-policy-transition-proposal:v1` | Exact signing-policy-transition proposal JCS, which contains no `policyTransitionProposalDigest` | lowercase hex |
+| `policyTransitionEvidenceDigest` | SHA-256, `nova-play:signing-policy-transition-evidence:v1` | Exact normalized post-commit signing-policy-transition evidence JCS, which contains no `policyTransitionEvidenceDigest` | lowercase hex |
 | `incidentPolicyDigest` | SHA-256, `nova-play:incident-policy:v1` | Full strict S-bound incident-policy JCS | lowercase hex |
 | `publicReleaseFactsDigest` | SHA-256, `nova-play:public-release-facts:v1` | Normalized final public-fact snapshot JCS | lowercase hex |
 | `capabilityProbeDigest` | SHA-256, `nova-play:capability-probe:v1` | Immutable capability-probe fact-record JCS | lowercase hex |
@@ -760,7 +777,7 @@ The approval object binds, at minimum:
 - source/spec commit S and evidence commit E;
 - approved workflow paths and their Git blob hashes;
 - candidate workflow run ID, attempt ID, and artifact IDs;
-- candidate, lock, archive, licence, oracle, validation-report, and evidence hashes;
+- candidate-core `candidateDigest`, candidate-evidence-index `candidateEvidenceDigest`, lock, archive, licence, oracle, validation-report, and evidence hashes;
 - builder/container/attestation identity;
 - GitHub server, repository owner/name and numeric ID, numeric draft Release ID, and every staged asset numeric ID/name/label/content type/size/raw SHA-256;
 - exact annotated tag name, annotation UTF-8 bytes, tagger identity projection, and target S;
@@ -777,6 +794,28 @@ Promotion changes only signed fields. The bare word `latest` is never an unpinne
 The future written-design approval record and Plan 1 authority root must pin signing-policy sequence `0`, the genesis policy’s exact raw SHA-256 and Git blob ID, complete authorized public-key bytes, principal `corpus-owner-v1`, namespace `nova-play-corpus-approval-v1`, an explicit owner trust statement, and exact policy-schema and hash-registry versions. No chain is valid without byte and ancestry equality to this genesis root.
 
 Every strict policy contains corpus/project scope; monotonic `policySequence`; prior `signingPolicyDigest` (`null` only at genesis); active and retired key arrays; key IDs derived from exact complete public-key bytes; allowed principals/namespaces; transition-authority rules; and externally computed `signingPolicyDigest`. Policy history is contiguous. A transition is valid only when signed/authorized under the immediately prior valid policy and committed on protected ancestry. Unknown fields, gaps, duplicates, unpinned genesis, invalid transitions, or caller-selected policy tips fail closed.
+
+A non-genesis policy transition is constructed in exactly this order:
+
+```text
+proposed signing-policy bytes
+-> external signingPolicyDigest
+-> signing-policy-transition proposal bytes
+-> external policyTransitionProposalDigest
+-> detached transition signature
+-> protected commit
+-> external post-commit Git/ref evidence
+```
+
+The proposed signing-policy bytes may contain the prior policy digest, sequence, fixed scope, keys, and transition rules. They must not contain the proposal or signature identity/bytes, the resulting commit/tree/blob identity, the resulting protected-ref identity, or any post-commit evidence identity. Their exact JCS is hashed externally as `signingPolicyDigest`.
+
+The `signing-policy-transition proposal` is strict JCS with no trailing newline and binds only facts available before commit: repository owner/name and numeric ID; the intended protected ref; the expected protected parent commit; the prior policy sequence, digest, and blob identity; the proposed policy sequence, raw-byte identity, and `signingPolicyDigest`; the policy schema and hash-registry versions; the transition intent; and the signer identity required by the prior policy. Its exact JCS is hashed externally as `policyTransitionProposalDigest`.
+
+The `detached signing-policy-transition signature` signs the exact proposal JCS bytes under namespace `nova-play-signing-policy-transition-v1`. Signature authority comes only from the immediately prior valid policy at the expected protected parent; signer-supplied time has no authority.
+
+The protected transition commit is based on the expected parent and contains the proposed policy, the proposal, and the detached signature as separate sibling artifacts; none of them contains the resulting commit ID. The `signing-policy-transition Git/ref evidence` is computed only after commit and binds repository/ref, the expected parent, the resulting commit/tree/blob identities, and the exact policy/proposal/signature identities; its normalized JCS is hashed externally as `policyTransitionEvidenceDigest`.
+
+Verification rejects a wrong repository or ref, a stale parent, replay, sequence gaps, policy substitution, unauthorized signatures, and any ref/commit mismatch. GitHub/Git mechanics, exact storage paths, workflow implementation, retries, and generated schemas remain for implementation planning.
 
 Approval A validates against both the exact E-bound policy and the highest valid policy reachable at A’s parent. Its signer key must be active for the principal/namespace in both. A key retired by the A-parent policy therefore cannot create a new approval for an older unapproved E. Rotation overlap exists only when old and new keys are both active in both applicable policies. Signer-supplied `signedAt` is informational and never restores authority.
 
@@ -836,7 +875,7 @@ REVOKED
 | State/event | Actor | Guard | Evidence | Next state |
 |---|---|---|---|---|
 | `SPEC_COMMITTED` | Protected source maintainer | Normative registry migration and schemas validate | source commit S, registry/spec digest | `CANDIDATE_VALIDATED` |
-| `CANDIDATE_VALIDATED` | Protected candidate workflow | Full lock, archive, envelope, oracle, licence, and attestation validation | candidate manifest, reports, attestation | `DRAFT_STAGED` |
+| `CANDIDATE_VALIDATED` | Protected candidate workflow | Full lock, archive, envelope, oracle, licence, and attestation validation | candidate-core manifest, reports, attestation, candidate-evidence-index | `DRAFT_STAGED` |
 | `DRAFT_STAGED` | Protected stage workflow | Capability probe passed; stage preflight/revalidation passes | draft numeric Release/asset IDs, staging receipt | `EVIDENCE_POLICY_ACTIVATED` |
 | `EVIDENCE_POLICY_ACTIVATED` | Protected event finalizer | Atomically finalize this event inside E under S-bound authority, then verify E tree against its bound projection | S/E policy blobs/digests, proposed E tree projection/digest, resulting E tree/blob identities | `OWNER_APPROVED` |
 | `OWNER_APPROVED` | Corpus owner | Detached signature validates from A Git blobs; A is direct child of E and path-limited | approval digest and signature | `CORPUS_TAGGED` |
