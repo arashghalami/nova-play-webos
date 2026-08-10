@@ -55,3 +55,15 @@ docs/superpowers/
 # Python bytecode from the agent harness self-test.
 __pycache__/
 *.pyc
+
+# Android build output. An APK/AAB embeds the whole web bundle, so a committed
+# one is both a large binary and a credential exposure surface. Spike and app
+# *source* is tracked; only generated output is ignored.
+**/android/app/build/
+**/android/build/
+**/android/.gradle/
+**/android/local.properties
+*.apk
+*.aab
+*.keystore
+*.jks

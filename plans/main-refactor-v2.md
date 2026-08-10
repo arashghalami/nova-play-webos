@@ -1,6 +1,25 @@
 # Nova Play main refactor v2 — execution plan
 
-**Status:** proposed; execute in order. A failed decision gate stops later phases.
+> **Status: NOT APPROVED — superseded on 2026-08-09. Do not execute this plan.**
+>
+> **The plan of record is `plans/main-refactor-v3.md`.**
+>
+> An LLM council reviewed it against constraints it did not know (two engineers,
+> 40 hrs/week total, one Android TV box, one test phone, phone app required,
+> real users on the shipping webOS app) and rejected its ordering. The binding
+> decision is `plans/council-2026-08-09-main-refactor-v2.md`.
+>
+> What was rejected: Phase 0 guard work as the first change; Android TV before
+> the phone; the phone at Phase 7 behind a Phase 6 gate permitting
+> "Defer/stop phone"; Phase 5's move of the shipping app into `apps/webos`.
+>
+> What survives and is still worth reading: the per-target compatibility policy
+> (§1), the false-green guard analysis (§1), the feature-owned state table (§3),
+> the ten blocking Android questions (§4), the Phase 2 playback/lifecycle/track
+> evidence matrix, and the atomic source-contract migration table (Phase 3).
+> Phase 2 is the only phase to run now, as a disposable phone spike.
+
+**Original status (historical):** proposed; execute in order. A failed decision gate stops later phases.
 
 ## 1. Verified starting point
 
